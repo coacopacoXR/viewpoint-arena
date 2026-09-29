@@ -1,0 +1,40 @@
+# Nightly live-adapter contract tests (STUB)
+#
+# This workflow is a placeholder. Real adapter jobs — running the shared
+# PLMAdapter / CaptureProvider / TurnAdapter / NotificationSinkAdapter /
+# ModelImportAdapter contract suites against live Onshape, Teamcenter,
+# Cloudflare, and Teams sandbox credentials — will be added in Phase 3 as
+# each adapter lands (see docs/plan/08-task-breakdown.md T3.1–T3.5).
+#
+# The stub exists now so the workflow file is validated by GitHub's YAML
+# parser and so scheduled runs start producing "green" heartbeats rather
+# than being absent. It must not fail nightly.
+#
+# When Phase 3 adapters land, replace the placeholder job below with one
+# job per adapter, each gated on the corresponding sandbox credential
+# secret being present (e.g. `if: ${{ secrets.ONSHAPE_SANDBOX_TOKEN != '' }}`),
+# and each running the shared contract suite from
+# `lib/connectors/<category>/<category>.contract.test.ts` against the real
+# implementation.
+
+name: Nightly live adapters
+
+on:
+  schedule:
+    # Run nightly at a quiet minute; cron is UTC on GitHub Actions.
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+jobs:
+  # Placeholder job — succeeds trivially. Real adapter jobs replace this in
+  # Phase 3. Kept intentionally minimal so the scheduled run always passes
+  # until the real jobs are wired in.
+  placeholder:
+    name: placeholder (stub — real adapter jobs land in Phase 3)
+    runs-on: ubuntu-latest
+    steps:
+      - name: No-op heartbeat
+        run: |
+          echo "Nightly live-adapter workflow is a stub."
+          echo "Real adapter jobs will be added as Phase 3 adapters land."
+          echo "See .github/workflows/nightly-live-adapters.yml for details."

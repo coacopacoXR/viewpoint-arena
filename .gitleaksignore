@@ -1,0 +1,2 @@
+# Deliberately secret-SHAPED fake values in test files are marked inline with
+# "gitleaks:allow" on their own line, so a NEW secret anywhere is still flagged.

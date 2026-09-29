@@ -1,0 +1,24 @@
+# Real transcription: faster-whisper.
+#
+#   pip install -r requirements-whisper.txt
+#
+# Not installed by CI, and not needed by the test suite — see
+# requirements-dev.txt for why that absence is the point.
+#
+# What this pulls in:
+#   - ctranslate2 (the inference engine; CPU-only wheels by default)
+#   - av / PyAV, which bundles the ffmpeg libraries, so there is no separate
+#     system ffmpeg to install
+#   - tokenizers, onnxruntime, huggingface-hub
+#
+# The first /capture request DOWNLOADS the model named by CAPTURE_WHISPER_MODEL
+# from huggingface.co (~150 MB for base.en) into ~/.cache/huggingface. On an
+# air-gapped network, download it once on a connected machine and point
+# CAPTURE_WHISPER_MODEL at the local directory instead.
+#
+# GPU: install the CUDA build of ctranslate2 and set CAPTURE_WHISPER_DEVICE=cuda
+# with CAPTURE_WHISPER_COMPUTE_TYPE=float16.
+
+-r requirements.txt
+
+faster-whisper>=1.0,<2

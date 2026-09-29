@@ -1,0 +1,4 @@
+{
+  "name": "viewpoint-arena",
+  "main": "party/room.server.ts"
+}

@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - planning/**
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Gate on errors only. The repo carries ~100 tracked no-explicit-any /
+      # react-hooks warnings; do NOT add --max-warnings 0 here.
+      - run: npm run lint
+
+  test:
+    name: unit + contract tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test
+
+  capture-service:
+    name: capture-service (python)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: capture-service
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            capture-service/requirements.txt
+            capture-service/requirements-dev.txt
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements-dev.txt
+      # requirements-whisper.txt is deliberately NOT installed. The suite has to
+      # prove the service runs with no faster-whisper, no model download, no GPU
+      # and no Ollama: if a code path ever grows a top-level whisper import, this
+      # job fails with ModuleNotFoundError instead of quietly pulling 400 MB.
+      # The full checkout above is required — tests/test_typescript_parity.py
+      # reads lib/connectors/capture/*.ts to check the Python port has not
+      # drifted from the TypeScript contract.
+      - run: python -m pytest
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    needs: [typecheck, lint, test]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  e2e:
+    name: e2e (playwright)
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+
+  check-env:
+    name: public-env check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: node scripts/check-public-env.mjs
+
+  audit:
+    name: npm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Blocking: high/critical in what SHIPS (runtime dependencies, including
+      # partykit, which the self-hosted stack runs). Low/moderate transitive
+      # noise is not a build blocker.
+      - run: npm audit --omit=dev --audit-level=high
+      # Visible, not blocking: dev tooling. The remaining highs here are
+      # undici and path-to-regexp pinned inside @vercel/node, which this repo
+      # imports for TYPES only (every import is `import type`), and which is
+      # already at its latest major. Re-check when @vercel/node bumps them.
+      - run: npm audit --audit-level=high
+        continue-on-error: true
+
+  gitleaks:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

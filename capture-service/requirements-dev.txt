@@ -1,0 +1,14 @@
+# capture-service test dependencies.
+#
+# This is the COMPLETE list CI installs. Note what is absent: faster-whisper.
+# The suite must prove the service works with no ML dependency, no downloaded
+# model, no GPU, no Ollama and no network — so if any code path ever grows a
+# top-level `import faster_whisper`, CI fails with ModuleNotFoundError rather
+# than quietly downloading a model.
+#
+#   pip install -r requirements-dev.txt
+#   python -m pytest
+
+-r requirements.txt
+
+pytest>=8.0,<10

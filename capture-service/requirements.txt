@@ -1,0 +1,17 @@
+# capture-service runtime dependencies — the HTTP service only.
+#
+# faster-whisper is deliberately NOT listed here. It pulls ctranslate2,
+# onnxruntime, tokenizers and av (hundreds of MB, plus a model download on first
+# use), and the test suite is designed to run without any of it: Whisper sits
+# behind capture_service/transcribe.py's Transcriber interface and is imported
+# lazily. Install requirements-whisper.txt as well to transcribe real audio.
+#
+# CI installs this file plus requirements-dev.txt and nothing else.
+#
+# Python 3.11 or newer (the code uses StrEnum and `X | None` annotations).
+
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+httpx>=0.27,<1.0
+# Required by FastAPI for the multipart/form-data upload on POST /capture.
+python-multipart>=0.0.9,<1.0

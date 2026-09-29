@@ -1,0 +1,52 @@
+# Docker build context exclusions.
+#
+# Without this, `COPY . .` in deploy/app.Dockerfile ships the host's
+# node_modules into the build stage — hundreds of MB, slow, and on a Windows
+# host full of binaries the Linux image cannot use. The build stage runs its own
+# `npm ci` from the lockfile, which is the only node_modules that matters.
+
+node_modules
+dist
+dist-ssr
+coverage
+.git
+.github
+.gitignore
+
+# Per-deployment secrets and config. The app image must not bake either one in:
+# .env reaches the containers through compose's env_file, and
+# viewpoint.config.ts is read by the serverless api/* functions, not by the
+# static bundle.
+.env
+.env.local
+.env.production
+viewpoint.config.ts
+
+# Python
+capture-service/.venv
+capture-service/venv
+capture-service/.pytest_cache
+**/__pycache__
+**/*.py[cod]
+
+# Generated at install time, mounted at runtime — never baked into an image.
+deploy/certs
+
+# Tooling and test artefacts
+.vercel
+.partykit
+.qwen-tasks
+.qwen
+test-results
+playwright-report
+e2e
+**/*.test.ts
+**/*.test.tsx
+**/__tests__
+.vscode
+.idea
+.DS_Store
+*.log
+
+# Large sample assets the Vite build does not import from the repo root.
+Videos Post linkedin

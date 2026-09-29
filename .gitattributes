@@ -1,0 +1,18 @@
+# LF everywhere, on every OS. The Docker stack builds from the working tree,
+# and a Windows checkout with core.autocrlf=true would otherwise put CRLF into
+# install.sh, the Dockerfiles and the nginx template, which then fail inside
+# Linux containers ("$'\r': command not found").
+* text=auto eol=lf
+
+*.glb   binary
+*.gltf  binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.mp4   binary
+*.woff  binary
+*.woff2 binary
+*.pdf   binary

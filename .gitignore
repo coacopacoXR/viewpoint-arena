@@ -1,0 +1,61 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# PartyKit local dev state
+.partykit/state/
+.vercel
+
+# Personal video content (not project source)
+Videos Post linkedin/
+
+# Delegated-execution scratch (specs + agent run logs)
+.qwen-tasks/
+
+# Playwright
+test-results/
+playwright-report/
+
+# capture-service (Python) build artefacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+capture-service/.env
+capture-service/.env.local
+
+# Per-deployment config (contains *Env names pointing to secrets)
+viewpoint.config.ts
+
+# Qwen Code CLI scratch space
+.qwen/
+
+# Local and private material that never belongs in this public repo
+.claude/
+docs/plan/
+docs/paper/
+.env
+.env.*
+!.env.example

@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "properties": {
+    "cards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string", "enum": ["RISK", "RATIONALE", "ACTION"] },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "agentId": { "type": "string" },
+          "relatedPoiId": { "type": "string" },
+          "sourceMessageIds": { "type": "array", "items": { "type": "string" } },
+          "details": {
+            "type": "object",
+            "properties": {
+              "priority": { "type": "string", "enum": ["Critical", "High", "Medium", "Low"] },
+              "status": { "type": "string", "enum": ["Open"] },
+              "componentReference": { "type": "string" },
+              "impact": { "type": "string" },
+              "mitigationStrategy": { "type": "string" },
+              "designDriver": { "type": "string" },
+              "alternativesConsidered": { "type": "string" },
+              "tradeoffAnalysis": { "type": "string" },
+              "department": { "type": "string" },
+              "assignee": { "type": "string" },
+              "dueDate": { "type": "string" },
+              "dueDateText": { "type": "string" }
+            },
+            "required": ["priority"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["type", "title", "description", "details"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["cards"],
+  "additionalProperties": false
+}

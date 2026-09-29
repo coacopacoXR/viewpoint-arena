@@ -1,0 +1,15 @@
+# capture-service build context exclusions.
+#
+# Separate from the repo-root .dockerignore because this service builds with
+# `context: ./capture-service` — Docker reads the ignore file from the CONTEXT
+# directory, so the root one does not apply here.
+
+.venv
+venv
+.pytest_cache
+__pycache__
+**/__pycache__
+**/*.py[cod]
+.env
+.env.local
+tests

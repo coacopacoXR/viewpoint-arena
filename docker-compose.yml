@@ -1,0 +1,1088 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Viewpoint Arena — self-hosted stack
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# docs/plan/06-deployment-and-installation.md §2 and docs/local-capture-plan.md
+# §"Installation", with one change throughout: every service is configured from
+# `viewpoint.config.ts` + `.env`, the pair install.sh writes.
+#
+#     ./install.sh                       # interactive
+#     ./install.sh --defaults            # non-interactive (what CI runs)
+#     docker compose --profile capture-local up -d
+#
+# ── WHAT IS PUBLISHED TO THE HOST, AND WHY ───────────────────────────────────
+#
+#   nginx-proxy   80, 443, 8443   the only public entry point
+#   partykit      127.0.0.1:1999  loopback only; browsers reach it via 8443
+#   coturn        3478 udp+tcp, relay range (profile turn) — browsers need
+#                                 direct reachability for WebRTC; see the
+#                                 coturn service comment below.
+#   n8n           127.0.0.1:5678  loopback only, profile n8n
+#
+#   app, api, capture-service, whisper, db, rest, realtime, auth,
+#   ollama                                                  NO PORTS
+#
+#   Ollama used to publish 127.0.0.1:11434 for `ollama pull` from the host,
+#   but that clashes with a native Ollama on developer machines (port held on
+#   the Windows side under WSL2, invisible to /dev/tcp probes). Pull via
+#   `docker compose exec ollama ollama pull <model>` instead. To re-enable the
+#   mapping, add an override file:
+#
+#       # docker-compose.override.yml
+#       services:
+#         ollama:
+#           ports:
+#             - '127.0.0.1:11434:11434'
+#
+# ── WHY capture-service PUBLISHES NO PORT ────────────────────────────────────
+#
+# capture-service accepts complete meeting recordings. Audio of an engineering
+# review is among the most sensitive data an organisation has: it names parts,
+# suppliers, failure modes and who said what about them. The service has no
+# notion of a user, no rate limit and no audit trail, and it will transcribe and
+# run an LLM over anything posted to it. So:
+#
+#   1. It has no `ports:` entry. Not "bound to 127.0.0.1", not "behind the
+#      proxy" — nothing on the host can open a socket to it, and nothing on the
+#      network can either.
+#   2. It sits on `backend`, which is `internal: true`. Docker will not route
+#      between that network and any external interface, in either direction.
+#   3. It also sits on `models` (not internal, because Ollama and Whisper have
+#      to be able to fetch models). Reachability still comes only from
+#      containers on those two networks — `api`, `app` and `whisper`.
+#   4. It requires CAPTURE_SHARED_SECRET on EVERY route once that variable is
+#      set, which install.sh always sets. Network isolation is the primary
+#      control; the secret is the one that still holds if somebody publishes the
+#      port anyway or if another container on `models` is compromised.
+#
+# Reaching it from the host, when you genuinely need to:
+#
+#   docker compose exec capture-service curl -sS \
+#     -H "X-Capture-Token: $CAPTURE_SHARED_SECRET" http://127.0.0.1:8080/health
+#
+# Do not "fix" this by adding a port mapping. If an operator must expose it,
+# put it behind nginx-proxy with authentication in front — see
+# capture-service/README.md §7.
+#
+# ── PROFILES ─────────────────────────────────────────────────────────────────
+#
+#   capture-local   ollama. Activate when capture.provider is 'local' or
+#                   'ollamaDirect'. Off by default: a mock-capture install has
+#                   no reason to pull a multi-GB image or reserve RAM for a
+#                   model it will never load.
+#   whisper         a second capture-service instance dedicated to transcription.
+#                   Off by default because capture-service transcribes
+#                   in-process today; see the `whisper` service comment.
+#   n8n             the optional workflow engine (T4.8).
+#   turn            the bundled coturn relay. Activate when turn.provider is
+#                   'selfHostedCoturn' and the coturn runs in this stack (the
+#                   install.sh default). Off when using Cloudflare TURN or an
+#                   external coturn the operator manages separately.
+#   identity        `auth-init` and `auth` (Supabase Auth / GoTrue), which
+#                   together implement identity.mode 'accounts' and 'sso'
+#                   (docs/plan/13-identity.md). install.sh activates it only
+#                   when the operator chose accounts or sso, so a default
+#                   install runs no auth container at all and behaves exactly
+#                   as it did before identity existed.
+#
+#   GPU is a compose OVERRIDE, not a profile, because a profile cannot add a
+#   device reservation to an existing service:
+#
+#       docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
+#         --profile capture-local up -d
+#
+#   install.sh assembles that command for you.
+#
+# ── HOW /api/* IS SERVED ─────────────────────────────────────────────────────
+#
+# The api/*.ts files are Vercel functions. Here the `api` service runs the same
+# files with server/api-server.ts, and nginx in `app` proxies /api/* to it, so
+# /api/public-config, /api/health, TURN credentials, Onshape sign-in and Teams
+# notifications work exactly as on Vercel. That now includes every /api/capture/*
+# path: they used to be proxied straight to capture-service, which meant nginx —
+# not the deployment — decided which AI handled audio. lib/ai/router.ts decides
+# now, per job, from a setting an administrator can change without a redeploy.
+
+name: viewpoint-arena
+
+# One log config for everything. docs/plan/05-observability-and-metrics.md §2
+# asks for structured logs from every server-side surface and §6 says not to
+# build a dashboard; rotated json-file output is what an org's existing log
+# shipper can already read. Bounded, because an unrotated container log on a
+# box that also holds a 4 GB model is how a host runs out of disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
+networks:
+  # Public-facing: the proxy and the things it fronts.
+  edge:
+    driver: bridge
+
+  # internal: true means Docker provides no route between this network and any
+  # external interface. Containers on it cannot be reached from the host or the
+  # internet, and cannot reach out either. db, rest, realtime and
+  # capture-service live here; `app` is attached so it can call capture-service
+  # without any of them being reachable from outside.
+  backend:
+    driver: bridge
+    internal: true
+
+  # NOT internal, and that is deliberate: Ollama has to be able to pull a model
+  # and Whisper has to download weights on first use. Anything on this network
+  # has outbound internet, which is why capture-service's isolation comes from
+  # having no published port rather than from this network.
+  #
+  # A fully air-gapped install can close it: pre-seed the two model volumes on a
+  # connected machine, then add
+  #
+  #     networks: { models: { internal: true } }
+  #
+  # to an override file. CAPTURE_WHISPER_MODEL also accepts a path to a local
+  # CTranslate2 directory for exactly this case.
+  models:
+    driver: bridge
+
+volumes:
+  # Unused after the plain-postgres → supabase/postgres migration. The old
+  # postgres-data volume held data for the postgres:16 image, which must never
+  # be handed to the supabase image (different WAL format, different system
+  # catalogs). Safe to delete with `docker volume rm viewpoint-arena_postgres-data`.
+  postgres-data:
+  supabase-db-data:
+  db-config:
+  ollama-models:
+  whisper-models:
+  partykit-state:
+  n8n-data:
+  # Imported 3D model files, content-addressed by their SHA-256 and mounted on
+  # the `api` service at /data/models (DEFAULT_MODEL_STORAGE_DIR in
+  # lib/config/schema.ts). This is what makes a model outlive the container that
+  # stored it: an upgrade recreates `api`, and without a volume every room's
+  # geometry — and every curated review's — would go with it, leaving hashes
+  # that point at nothing.
+  models-data:
+  # Nightly backups of the database and the model files (batch BY), written by the
+  # db-backup service and read — only to report their age — by the api's health.
+  db-backups:
+  # The Tailscale machine's identity (profile `tailscale`). Losing it makes the
+  # next start join as a new machine, which needs a fresh auth key.
+  tailscale-state:
+
+services:
+  # ── The only public entry point ──────────────────────────────────────────
+  nginx-proxy:
+    image: nginx:${NGINX_IMAGE_TAG:-alpine}
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - '${HTTP_PORT:-80}:80'
+      - '${HTTPS_PORT:-443}:443'
+      # PartyKit WebSocket over TLS. See deploy/nginx/proxy.conf for why this is
+      # a separate port rather than a path: partysocket connects to
+      # `<host>/<room>`, so the room id occupies the first path segment and
+      # there is no prefix to mount it under.
+      - '${WSS_PORT:-8443}:8443'
+    volumes:
+      - ./deploy/nginx/proxy.conf:/etc/nginx/conf.d/default.conf:ro
+      # install.sh generates a self-signed pair here for the hostname you gave
+      # it. Replace these two files with a real certificate and nothing else
+      # changes. Git-ignored: a private key must never be committed.
+      - ./deploy/certs:/etc/nginx/certs:ro
+    networks:
+      - edge
+    depends_on:
+      - app
+      - partykit
+    healthcheck:
+      # `nginx -t` rather than a request: port 80 only redirects, and probing
+      # 443 needs --no-check-certificate against the self-signed default, which
+      # would then pass even with a certificate nginx cannot actually serve.
+      test: ['CMD', 'nginx', '-t']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ── A real address through Tailscale (profile `tailscale`) ──────────────
+  #
+  # docs/plan/19-trusted-address.md. Joins the operator's tailnet as
+  # TS_HOSTNAME, gets a real certificate for <TS_HOSTNAME>.<tailnet>.ts.net from
+  # Let's Encrypt through Tailscale, renews it by itself, and forwards 443 (the
+  # app) and 8443 (the room socket) to nginx-proxy over the edge network. Every
+  # device on the tailnet then opens the app with no certificate warning, from
+  # the office or from home.
+  #
+  # Publishes no port: it is reached over the tailnet, not through the host.
+  # nginx-proxy keeps its own self-signed pair for the same name; the hop from
+  # here to it stays inside Docker, which is why `https+insecure` is enough.
+  # Userspace networking (the image's default without /dev/net/tun) is all
+  # `serve` needs, so no extra privileges either.
+  tailscale:
+    profiles:
+      - tailscale
+    image: tailscale/tailscale:${TAILSCALE_IMAGE_TAG:-stable}
+    restart: unless-stopped
+    logging: *logging
+    hostname: ${TS_HOSTNAME:-viewpoint}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: ${TS_HOSTNAME:-viewpoint}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_USERSPACE: 'true'
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./deploy/tailscale/serve.json:/config/serve.json:ro
+    networks:
+      - edge
+    depends_on:
+      - nginx-proxy
+
+  # ── The app: nginx serving the Vite build ────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: deploy/app.Dockerfile
+      args:
+        # VITE_ values are inlined at BUILD time, so they are build args and a
+        # change means a rebuild. Only client-safe values may travel this way —
+        # see deploy/app.Dockerfile and scripts/check-public-env.mjs.
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:-}
+        VITE_PARTYKIT_HOST: ${VITE_PARTYKIT_HOST:-}
+    image: viewpoint-arena-app:${IMAGE_TAG:-local}
+    restart: unless-stopped
+    logging: *logging
+    # No ports. Reached only through nginx-proxy.
+    networks:
+      - edge
+      # Attached so the app CAN reach capture-service and the db layer.
+      # `internal: true` means that reachability never extends to the host.
+      - backend
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1/nginx-health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # No `environment:` block, and that is a change worth noticing. This service
+    # used to be given CAPTURE_SHARED_SECRET so its nginx could add X-Capture-Token
+    # to the two capture paths it proxied straight to capture-service. Those paths
+    # now go to `api` (see "HOW /api/* IS SERVED" above), which adds the header
+    # itself from its own env_file, so the secret has no business being in this
+    # container's environment at all. A secret present where nothing reads it is a
+    # secret one `docker compose exec app env` away.
+
+  # ── API: the api/*.ts functions, the same files Vercel runs ─────────────
+  # server/api-server.ts serves them over plain HTTP; nginx in `app` proxies
+  # /api/* here, so the browser still sees one same-origin site. This is what
+  # makes /api/public-config, /api/health, TURN credentials, Onshape sign-in
+  # and Teams notifications work in the self-hosted stack.
+  api:
+    build:
+      context: .
+      dockerfile: deploy/api.Dockerfile
+    image: viewpoint-arena-api:${IMAGE_TAG:-local}
+    restart: unless-stopped
+    logging: *logging
+    # No ports. Reached only through the app container's nginx.
+    networks:
+      # edge: outbound internet for Onshape, Cloudflare TURN, Teams, cloud AI.
+      - edge
+      # backend: capture-service and the db layer (db, rest, realtime).
+      - backend
+    # Every secret the handlers read (ONSHAPE_*, CF_TURN_*, TEAMS_*, capture
+    # keys, CAPTURE_SHARED_SECRET). Runtime only, never an image layer.
+    # Optional: `docker compose config` must work on a fresh clone before
+    # install.sh has written .env, so a missing file is not an error.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Where the built-in AI stack is, as THIS container reaches it. lib/ai/
+      # router.ts reads it first and falls back to capture.serviceUrl from
+      # viewpoint.config.ts, so an install that chose `capture.provider: 'local'`
+      # needs neither — but an install that chose a cloud provider and then picked
+      # "Built-in" for transcription in the admin console does, and without this
+      # the two ways of saying the same thing would disagree.
+      #
+      # Not from .env: it is a compose service name, not a deployment choice, and
+      # install.sh should not have to know it.
+      CAPTURE_SERVICE_URL: ${CAPTURE_SERVICE_URL:-http://capture-service:8080}
+      BACKUP_STATUS_DIR: /backups
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+    volumes:
+      # The per-deployment master config, written by install.sh. Read-only: the
+      # API reads it, nothing in the stack may change it.
+      - ./viewpoint.config.ts:/app/viewpoint.config.ts:ro
+      # Imported model files (POST /api/models writes, GET /api/models/<hash>
+      # reads). Read-write, and the only writable path this container has: a
+      # model is stored under its own SHA-256 and served by that hash for ever
+      # after, so the room socket, a curated review and a late joiner all refer
+      # to the same bytes without any of them carrying them.
+      #
+      # deploy/api.Dockerfile creates /data/models owned by `node` BEFORE this
+      # mount, because a fresh named volume inherits the ownership of the
+      # image's directory at the mount point.
+      - models-data:/data/models
+      # Read-only: the api only reports how old the newest backup is (/api/health).
+      - db-backups:/backups:ro
+
+  # ── Realtime room server ─────────────────────────────────────────────────
+  partykit:
+    build:
+      context: .
+      dockerfile: deploy/partykit.Dockerfile
+    image: viewpoint-arena-partykit:${IMAGE_TAG:-local}
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      # LOOPBACK ONLY by default. Browsers reach PartyKit through
+      # nginx-proxy:8443 (wss://), which is what an HTTPS deployment needs —
+      # a page served over TLS cannot open ws:// to a published 1999.
+      #
+      # Set PARTYKIT_BIND=0.0.0.0 for the plain-ws LAN URL that
+      # docs/local-capture-plan.md prints, accepting that the room server is
+      # then open to the whole network with no authentication of its own.
+      - '${PARTYKIT_BIND:-127.0.0.1}:${PARTYKIT_PORT:-1999}:1999'
+    volumes:
+      - partykit-state:/app/.partykit
+    environment:
+      # Audit log: the room server POSTs grant events (admit/decline/policy
+      # change) to PostgREST. REST_URL defaults to http://rest:3000, which is
+      # reachable because partykit and rest are both on the `edge` network.
+      # ANON_KEY is the same value the other services use to talk to PostgREST.
+      # A PartyKit CLOUD deployment has neither variable and therefore records
+      # nothing — the admin screen says so.
+      REST_URL: ${REST_URL:-http://rest:3000}
+      ANON_KEY: ${ANON_KEY:-}
+      # Identity (docs/plan/13-identity.md batch AZ). With IDENTITY_MODE set to
+      # anything but 'none' the room server verifies the access token a
+      # signed-in browser sends with its presence, and relays the name the
+      # ACCOUNT carries rather than the name that was typed — so a participant
+      # list, a transcript and an audit row all say who was actually there.
+      #
+      # JWT_SECRET is the same value GoTrue signs with (the `auth` service,
+      # below) and PostgREST and Realtime already verify. Server-only: no VITE_
+      # spelling of it exists, so it cannot reach a bundle, and the entrypoint
+      # passes it to workerd because room code sees no other environment.
+      #
+      # 'none' is the default and is what every install had before identity
+      # existed: the room server strips the token and changes nothing else.
+      IDENTITY_MODE: ${IDENTITY_MODE:-none}
+      JWT_SECRET: ${JWT_SECRET:-}
+    networks:
+      - edge
+    healthcheck:
+      # A TCP probe. The dev server's routes are `/<room>` and a bare GET / is
+      # not a 200, so an HTTP probe would report a healthy server as down.
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('net').connect(1999,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── Local meeting capture ────────────────────────────────────────────────
+  #
+  # NO PORTS. See the block comment at the top of this file: this service
+  # accepts meeting recordings and must not be reachable from the host or the
+  # internet. Read that before adding a `ports:` entry here.
+  capture-service:
+    build:
+      context: ./capture-service
+    image: viewpoint-arena-capture-service:${IMAGE_TAG:-local}
+    restart: unless-stopped
+    logging: *logging
+    networks:
+      - backend
+      - models
+    environment:
+      # The secret install.sh generated. Empty means authentication is off,
+      # which is only acceptable because this container has no published port —
+      # and install.sh never leaves it empty.
+      CAPTURE_SHARED_SECRET: ${CAPTURE_SHARED_SECRET:-}
+      CAPTURE_OLLAMA_BASE_URL: ${CAPTURE_OLLAMA_BASE_URL:-http://ollama:11434}
+      CAPTURE_OLLAMA_MODEL: ${CAPTURE_OLLAMA_MODEL:-qwen2.5:7b}
+      CAPTURE_WHISPER_MODEL: ${CAPTURE_WHISPER_MODEL:-base.en}
+      CAPTURE_WHISPER_DEVICE: ${CAPTURE_WHISPER_DEVICE:-cpu}
+      CAPTURE_WHISPER_COMPUTE_TYPE: ${CAPTURE_WHISPER_COMPUTE_TYPE:-int8}
+      CAPTURE_WHISPER_LANGUAGE: ${CAPTURE_WHISPER_LANGUAGE:-}
+      CAPTURE_TIMEOUT_SECONDS: ${CAPTURE_TIMEOUT_SECONDS:-600}
+      CAPTURE_MAX_UPLOAD_BYTES: ${CAPTURE_MAX_UPLOAD_BYTES:-209715200}
+      CAPTURE_HOST: 0.0.0.0
+      CAPTURE_PORT: '8080'
+      # Comma-separated browser origins for CORS (e.g. https://review.example.com).
+      # Empty (the default) adds no CORS middleware. A wildcard * is refused.
+      # CAPTURE_ALLOWED_ORIGINS:
+    volumes:
+      # The Whisper model download (~150 MB for base.en) survives a rebuild, and
+      # is what an air-gapped install pre-seeds on a connected machine.
+      - whisper-models:/home/capture/.cache/huggingface
+    # No depends_on: ollama and whisper are profile-gated, and depending on a
+    # service whose profile is inactive is an error rather than a no-op.
+    # Ordering does not matter here anyway — /health performs no I/O, and a
+    # /capture request that arrives before Ollama is up fails with
+    # capture_upstream_unreachable, which the client already handles.
+    deploy:
+      resources:
+        limits:
+          # docs/local-capture-plan.md §"Open questions": resource ceilings so a
+          # runaway model cannot take the host down. Transcription is roughly
+          # real-time on CPU, so this bounds one meeting without starving the
+          # box; raise it on a dedicated machine.
+          cpus: '${CAPTURE_CPUS:-4}'
+          memory: ${CAPTURE_MEMORY:-6g}
+
+  # ── Standalone transcription ─────────────────────────────────────────────
+  #
+  # The same image as capture-service, because that IS the transcription server:
+  # capture_service/transcribe.py wraps faster-whisper and POST /transcribe is
+  # already the "whisper only, no LLM call" endpoint
+  # (capture-service/README.md §3).
+  #
+  # It is NOT started by default, and this is worth being precise about rather
+  # than shipping a container that looks used: capture-service transcribes
+  # IN-PROCESS today. This service exists so an operator can give transcription
+  # its own CPU/GPU budget and scale it separately from extraction, and it is
+  # the endpoint T4.7's streaming path is written against. Point a second
+  # capture-service at it by setting CAPTURE_OLLAMA_BASE_URL per instance and
+  # scaling: `docker compose --profile whisper up -d --scale whisper=2`.
+  whisper:
+    profiles:
+      - whisper
+    build:
+      context: ./capture-service
+    image: viewpoint-arena-capture-service:${IMAGE_TAG:-local}
+    restart: unless-stopped
+    logging: *logging
+    networks:
+      - backend
+      - models
+    environment:
+      CAPTURE_SHARED_SECRET: ${CAPTURE_SHARED_SECRET:-}
+      CAPTURE_WHISPER_MODEL: ${CAPTURE_WHISPER_MODEL:-base.en}
+      CAPTURE_WHISPER_DEVICE: ${CAPTURE_WHISPER_DEVICE:-cpu}
+      CAPTURE_WHISPER_COMPUTE_TYPE: ${CAPTURE_WHISPER_COMPUTE_TYPE:-int8}
+      CAPTURE_WHISPER_LANGUAGE: ${CAPTURE_WHISPER_LANGUAGE:-}
+      CAPTURE_MAX_UPLOAD_BYTES: ${CAPTURE_MAX_UPLOAD_BYTES:-209715200}
+      CAPTURE_HOST: 0.0.0.0
+      CAPTURE_PORT: '8080'
+    volumes:
+      - whisper-models:/home/capture/.cache/huggingface
+    deploy:
+      resources:
+        limits:
+          cpus: '${WHISPER_CPUS:-4}'
+          memory: ${WHISPER_MEMORY:-6g}
+
+  # ── Local LLM ────────────────────────────────────────────────────────────
+  ollama:
+    profiles:
+      - capture-local
+    image: ollama/ollama:${OLLAMA_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    # No ports. Ollama has NO authentication whatsoever: publishing it on a
+    # network interface hands anyone on that network a free LLM and the ability
+    # to read every model you pulled. capture-service reaches it as
+    # `http://ollama:11434` over the compose network. Pulling models from the
+    # host: `docker compose --profile capture-local exec ollama ollama pull <model>`.
+    # To re-enable the host mapping (clashes with a native Ollama on port 11434,
+    # common on developer machines): add to docker-compose.override.yml:
+    #   services:
+    #     ollama:
+    #       ports:
+    #         - '127.0.0.1:11434:11434'
+    environment:
+      # 0.0.0.0 INSIDE the container, so the compose network can reach it. Not
+      # the same as being published — see the ports comment above.
+      OLLAMA_HOST: 0.0.0.0
+      # Empty means Ollama sends no Access-Control-Allow-Origin, which blocks
+      # browser requests. That is the correct default: capture.provider 'local'
+      # reaches Ollama through capture-service, never from a browser.
+      #
+      # ONLY capture.provider 'ollamaDirect' needs this set, because in that mode
+      # the browser talks to Ollama itself. Set it to the app's exact origin —
+      #   OLLAMA_ORIGINS=https://arena.internal.acme.com
+      # — and publish the port on a real interface. Never set it to `*`: that is
+      # an unauthenticated LLM open to any website any employee visits.
+      OLLAMA_ORIGINS: ${OLLAMA_ORIGINS:-}
+      # Keep the model resident between requests. A 7B model cold-loads in
+      # seconds and the extraction timeout assumes it is already warm.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+    volumes:
+      # The pulled model (~4.7 GB for qwen2.5:7b). This volume is the
+      # air-gapped install's payload: fill it on a connected machine, move it.
+      - ollama-models:/root/.ollama
+    networks:
+      - models
+    deploy:
+      resources:
+        limits:
+          memory: ${OLLAMA_MEMORY:-10g}
+    healthcheck:
+      # `ollama list` talks to the local server, so it fails while the runtime is
+      # still starting and succeeds once the API answers. The image has no curl
+      # or wget, and no built-in /health route.
+      test: ['CMD-SHELL', 'ollama list >/dev/null 2>&1 || exit 1']
+      interval: 60s
+      timeout: 15s
+      retries: 5
+      # A cold start loads the runtime and may restore a multi-GB model.
+      start_period: 60s
+
+  # ── Database (supabase/postgres) ──────────────────────────────────────────
+  #
+  # The supabase/postgres image, not plain postgres: it ships the roles
+  # (anon, authenticated, authenticator, supabase_admin), the default grants and
+  # the `supabase_realtime` publication that PostgREST and Realtime rely on.
+  # supabase-js cannot talk to Postgres directly; `rest` and `realtime` below
+  # are the two gateways it needs, and nginx-proxy serves both same-origin.
+  #
+  # Wiring follows Supabase's own self-host compose (supabase/supabase,
+  # docker/docker-compose.yml), trimmed to what this app uses: no auth, no
+  # storage, no pooler, no analytics.
+  #
+  # The data volume is supabase-db-data, NOT the old postgres-data: a plain
+  # postgres data directory must never be handed to this image.
+  db:
+    image: supabase/postgres:${SUPABASE_POSTGRES_IMAGE_TAG:-17.6.1.136}
+    restart: unless-stopped
+    logging: *logging
+    # No ports. `docker compose exec db psql -U postgres` is how an operator
+    # reaches it; publishing 5432 would put the review tracker on the network
+    # for a password guess.
+    networks:
+      - backend
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: '5432'
+      POSTGRES_PORT: '5432'
+      PGPASSWORD: ${POSTGRES_PASSWORD:-}
+      # Generated by install.sh. Every service role (authenticator for
+      # PostgREST, supabase_admin for Realtime) gets this password via
+      # deploy/db/roles.sql and the image's own init.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      PGDATABASE: postgres
+      POSTGRES_DB: postgres
+      JWT_EXP: '3600'
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      # Realtime polls the database constantly; without this every poll lands
+      # in the log.
+      - -c
+      - log_min_messages=fatal
+    volumes:
+      - supabase-db-data:/var/lib/postgresql/data
+      # pgsodium's key lives here; it must survive a container recreate.
+      - db-config:/etc/postgresql-custom
+      # First boot of a fresh volume only. The image runs init-scripts/ (as
+      # postgres) and then migrations/ (as supabase_admin), each in name order.
+      - ./deploy/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:ro
+      - ./deploy/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:ro
+      - ./deploy/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:ro
+      # The app's tables. Sorts after 99-realtime.sql. install.sh re-applies
+      # this same idempotent file on every run, which is how an upgrade gets
+      # new tables on an existing volume.
+      - ./docs/supabase-schema.sql:/docker-entrypoint-initdb.d/migrations/99-zz-viewpoint-schema.sql:ro
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'postgres', '-h', 'localhost']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      # The image's first init runs dozens of migrations.
+      start_period: 60s
+
+  # ── Backups (batch BY) ───────────────────────────────────────────────────
+  # The database (pg_dumpall) and the imported model files, every
+  # BACKUP_INTERVAL_HOURS and once at start, into the db-backups volume, keeping the
+  # newest BACKUP_KEEP. Same image as `db`, so the dump tool matches the server.
+  # Restore: deploy/backup/restore.sh <file> --yes (docs/INSTALL.md, "Backups").
+  db-backup:
+    image: supabase/postgres:${SUPABASE_POSTGRES_IMAGE_TAG:-17.6.1.136}
+    restart: unless-stopped
+    logging: *logging
+    networks:
+      - backend
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ['sh', '/backup/backup.sh']
+    # Its own check, not the postgres image's (which asks for a server this container
+    # does not run): healthy once a backup exists. /api/health reports its AGE.
+    healthcheck:
+      test: ['CMD-SHELL', 'ls /backups/db-*.sql.gz >/dev/null 2>&1']
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 5m
+    environment:
+      PGHOST: db
+      PGUSER: supabase_admin
+      PGPASSWORD: ${POSTGRES_PASSWORD:-}
+      PGDATABASE: postgres
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_KEEP: ${BACKUP_KEEP:-14}
+      BACKUP_MODELS: ${BACKUP_MODELS:-true}
+    volumes:
+      - ./deploy/backup:/backup:ro
+      - db-backups:/backups
+      - models-data:/models:ro
+
+  # ── PostgREST: /rest/v1/ ─────────────────────────────────────────────────
+  # The tables supabase-js reads and writes: tracker_* and review_curations.
+  # Row Level Security in docs/supabase-schema.sql decides what the anon key
+  # may do; this service only translates HTTP to SQL.
+  rest:
+    image: postgrest/postgrest:${POSTGREST_IMAGE_TAG:-v14.17}
+    restart: unless-stopped
+    logging: *logging
+    # No ports. Reached only through nginx-proxy.
+    networks:
+      - backend
+      - edge
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD:-}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_MAX_ROWS: '1000'
+      PGRST_DB_EXTRA_SEARCH_PATH: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET:-}
+      PGRST_DB_USE_LEGACY_GUCS: 'false'
+      PGRST_APP_SETTINGS_JWT_EXP: '3600'
+      # For the healthcheck only; loopback inside the container.
+      PGRST_ADMIN_SERVER_PORT: '3001'
+      PGRST_ADMIN_SERVER_HOST: localhost
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'postgrest', '--ready']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Supabase Realtime: /realtime/v1/ ─────────────────────────────────────
+  # Presence ("who is editing this review") and live sync of review_curations
+  # (lib/curationsRepo.ts). Optional in practice: without it the app falls
+  # back to polling every 5 s, and the tables above keep working.
+  #
+  # Realtime picks its tenant from the request's Host header. SEED_SELF_HOST
+  # creates one tenant, `realtime-dev`, so nginx-proxy sends
+  # `Host: realtime-dev` on /realtime/v1/ (deploy/nginx/proxy.conf).
+  realtime:
+    image: supabase/realtime:${REALTIME_IMAGE_TAG:-v2.134.10}
+    restart: unless-stopped
+    logging: *logging
+    # No ports. Reached only through nginx-proxy.
+    networks:
+      - backend
+      - edge
+    environment:
+      PORT: '4000'
+      DB_HOST: db
+      DB_PORT: '5432'
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-}
+      DB_NAME: postgres
+      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
+      # Encrypts tenant secrets at rest. AES-128: exactly 16 characters.
+      DB_ENC_KEY: ${REALTIME_DB_ENC_KEY:-}
+      API_JWT_SECRET: ${JWT_SECRET:-}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-}
+      METRICS_JWT_SECRET: ${JWT_SECRET:-}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: '10000'
+      APP_NAME: realtime
+      SEED_SELF_HOST: 'true'
+      RUN_JANITOR: 'true'
+      DISABLE_HEALTHCHECK_LOGGING: 'true'
+      # Read only by the healthcheck below. The anon key is client-safe.
+      ANON_KEY: ${ANON_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'curl -sSfL --head -o /dev/null -H "Authorization: Bearer $$ANON_KEY" http://localhost:4000/api/tenants/realtime-dev/health'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Identity, part 1: one-shot database preparation ──────────────────────
+  #
+  # GoTrue logs into Postgres as supabase_auth_admin and runs its OWN
+  # migrations inside the `auth` schema (embedded in the binary, applied on
+  # every start). Two things have to be true first, and neither is true by
+  # default on an EXISTING install:
+  #
+  #   * the role needs a password. deploy/db/roles.sql sets it, but that file
+  #     is mounted into docker-entrypoint-initdb.d/, which the image runs only
+  #     on the first boot of an EMPTY data volume. An install that switches
+  #     identity on later would hand GoTrue a role it cannot log in with, and
+  #     `auth` would restart-loop on "password authentication failed" against a
+  #     database that looks perfectly healthy.
+  #   * the `auth` schema must already exist. GoTrue's first migration creates
+  #     auth.users inside it and never creates the schema itself.
+  #
+  # So this service runs deploy/db/auth-init.sql on EVERY `up` with the profile
+  # on, as supabase_admin (a superuser in this image; `postgres` is demoted),
+  # and exits. The script is idempotent, so a fresh volume — where the image and
+  # roles.sql have already done the equivalent work — is unaffected. `auth`
+  # waits for it to exit 0 rather than racing it.
+  #
+  # Same image as db, so an install that already pulled the database pulls
+  # nothing new. The ENTRYPOINT is overridden because the image's own
+  # docker-entrypoint.sh expects to start a server.
+  auth-init:
+    profiles:
+      - identity
+    image: supabase/postgres:${SUPABASE_POSTGRES_IMAGE_TAG:-17.6.1.136}
+    # One-shot, and `no` rather than unless-stopped: a container whose job is to
+    # exit must not be restarted, and `service_completed_successfully` below
+    # only reports success for one that exited 0 and stayed exited.
+    restart: 'no'
+    logging: *logging
+    # backend only. It talks to db and nothing else; it has no reason to be
+    # reachable from the proxy, and no port is published.
+    networks:
+      - backend
+    environment:
+      # PGPASSWORD is what psql authenticates with; POSTGRES_PASSWORD is what
+      # auth-init.sql reads through a `\set` backtick to build the ALTER USER.
+      # Same value, two readers.
+      PGPASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - ./deploy/db/auth-init.sql:/auth-init.sql:ro
+    entrypoint:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -h
+      - db
+      - -p
+      - '5432'
+      - -U
+      - supabase_admin
+      - -d
+      - postgres
+      - -f
+      - /auth-init.sql
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ── Identity, part 2: Supabase Auth (GoTrue) ─────────────────────────────
+  #
+  # docs/plan/13-identity.md: how people sign in is a per-deployment choice,
+  # and this is the service that implements 'accounts' and 'sso' for a
+  # self-hosted install. It is not a home-grown login: password storage, reset
+  # flows, OIDC and SAML are exactly the code that should not be written by a
+  # project another company will audit.
+  #
+  # It signs its JWTs with the SAME JWT_SECRET that PostgREST (PGRST_JWT_SECRET)
+  # and Realtime (API_JWT_SECRET) already verify. That single shared secret is
+  # what makes a token from /auth/v1/token acceptable to /rest/v1/ with no glue
+  # code, and what will let Row Level Security say "reviews you took part in"
+  # with auth.uid() without a second trust boundary.
+  #
+  # NO PORTS. Browsers reach it through nginx-proxy at /auth/v1/
+  # (deploy/nginx/proxy.conf) — same origin as everything else, so no client
+  # secret ever has to reach a bundle and the service can be moved or replaced
+  # without rebuilding the app.
+  auth:
+    profiles:
+      - identity
+    image: supabase/gotrue:${GOTRUE_IMAGE_TAG:-v2.197.0}
+    restart: unless-stopped
+    logging: *logging
+    networks:
+      # backend: the database lives only there.
+      - backend
+      # edge: nginx-proxy is only on edge, so this is what makes /auth/v1/
+      # reachable at all — the same reason rest and realtime are on both. It is
+      # also the outbound route GoTrue needs for an SSO provider's token
+      # endpoint (login.microsoftonline.com, Google, a Keycloak host), and
+      # `backend` is internal:true with no route off this host.
+      - edge
+    environment:
+      # 0.0.0.0 INSIDE the container so the compose network can reach it. That
+      # is not the same as publishing a port: there is no `ports:` entry above,
+      # and there must not be one.
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: '9999'
+
+      # The public URL of this deployment, which GoTrue stamps into its own
+      # redirect and callback URLs. The name is API_EXTERNAL_URL and NOT
+      # GOTRUE_API_EXTERNAL_URL: v2.197 reads the unprefixed one, silently
+      # ignores the prefixed one, and then dies at boot with "required key
+      # API_EXTERNAL_URL missing value" because the field is mandatory. It must
+      # be an absolute URL — an empty value passes the presence check and then
+      # fails URL parsing.
+      API_EXTERNAL_URL: ${PUBLIC_URL:-https://localhost}/auth/v1
+      GOTRUE_SITE_URL: ${PUBLIC_URL:-https://localhost}
+      # Where a browser may be sent after signing in. Comma-separated with NO
+      # spaces after a comma (GoTrue splits without trimming, so " https://b"
+      # never matches), and every entry is compiled as a glob at boot where a
+      # malformed pattern PANICS rather than logging. Hence one exact origin.
+      GOTRUE_URI_ALLOW_LIST: ${PUBLIC_URL:-https://localhost}
+
+      GOTRUE_DB_DRIVER: postgres
+      # The role deploy/db/auth-init.sql gives a password on every `up`, which
+      # is what makes an existing volume work as well as a fresh one.
+      # POSTGRES_PASSWORD is 64 hex characters from `openssl rand -hex 32`, so
+      # it needs no URL escaping in the userinfo part.
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD:-}@db:5432/postgres
+
+      # The same secret as rest and realtime — see the comment above.
+      GOTRUE_JWT_SECRET: ${JWT_SECRET:-}
+      GOTRUE_JWT_EXP: '3600'
+      # No default in GoTrue for either of these two: without them a token
+      # carries an empty `aud` and no default group, and PostgREST's role
+      # resolution has nothing to work from.
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+
+      # ── EVERY boolean and number below carries an explicit default, and
+      # that is load-bearing rather than tidy. GoTrue reads its environment
+      # with envconfig, which applies a field's own default only when the
+      # variable is UNSET. A variable that is SET BUT EMPTY is parsed, and
+      # ParseBool("") fails, so a `${SOME_FLAG:-}` here would crash the
+      # container at boot instead of turning the feature off. Do not "clean up"
+      # one of these to an empty default.
+      GOTRUE_DISABLE_SIGNUP: ${GOTRUE_DISABLE_SIGNUP:-false}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: 'true'
+      # There is no mail server in this stack, so GoTrue confirms addresses
+      # itself and an account works the moment it is created. The cost is that
+      # "I lost my password" cannot email a reset link: point GoTrue at a real
+      # SMTP server (GOTRUE_SMTP_*) and set this to false if resets are needed.
+      GOTRUE_MAILER_AUTOCONFIRM: 'true'
+
+      # ── SSO providers ────────────────────────────────────────────────────
+      # GoTrue's naming is GOTRUE_EXTERNAL_<PROVIDER>_<FIELD>, with KEYCLOAK as
+      # one word. Only _ENABLED turns a provider on and every one defaults to
+      # false, so the empty client ids and secrets below are inert: GoTrue
+      # validates a provider when a request starts that provider's flow, not at
+      # boot, so a half-filled provider cannot crash the service.
+      GOTRUE_EXTERNAL_AZURE_ENABLED: ${GOTRUE_EXTERNAL_AZURE_ENABLED:-false}
+      GOTRUE_EXTERNAL_AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      GOTRUE_EXTERNAL_AZURE_SECRET: ${AZURE_CLIENT_SECRET:-}
+      GOTRUE_EXTERNAL_AZURE_REDIRECT_URI: ${PUBLIC_URL:-https://localhost}/auth/v1/callback
+      # The tenant, WITH its scheme: GoTrue appends /oauth2/v2.0/authorize and
+      # /oauth2/v2.0/token to this value verbatim. Empty means Microsoft's own
+      # multi-tenant 'common' endpoint, which lets ANY work or school account
+      # sign in — install.sh shows that default out loud rather than hiding it.
+      GOTRUE_EXTERNAL_AZURE_URL: ${AZURE_TENANT_URL:-}
+
+      GOTRUE_EXTERNAL_GOOGLE_ENABLED: ${GOTRUE_EXTERNAL_GOOGLE_ENABLED:-false}
+      GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOTRUE_EXTERNAL_GOOGLE_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI: ${PUBLIC_URL:-https://localhost}/auth/v1/callback
+      # GOTRUE_EXTERNAL_GOOGLE_URL is deliberately absent. v2.197 ignores it
+      # and logs a warning, because Google always resolves through OIDC
+      # discovery against a fixed issuer.
+
+      GOTRUE_EXTERNAL_KEYCLOAK_ENABLED: ${GOTRUE_EXTERNAL_KEYCLOAK_ENABLED:-false}
+      GOTRUE_EXTERNAL_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-}
+      GOTRUE_EXTERNAL_KEYCLOAK_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
+      GOTRUE_EXTERNAL_KEYCLOAK_REDIRECT_URI: ${PUBLIC_URL:-https://localhost}/auth/v1/callback
+      # The REALM url, not the server url: GoTrue appends
+      # /protocol/openid-connect/{auth,token,userinfo} to it, and refuses to
+      # start the flow at all when it is empty. A trailing slash is stripped.
+      GOTRUE_EXTERNAL_KEYCLOAK_URL: ${KEYCLOAK_REALM_URL:-}
+
+      # ── SAML ─────────────────────────────────────────────────────────────
+      # Off unless explicitly enabled, and the caution is specific: SAML is the
+      # one provider GoTrue validates AT BOOT, so GOTRUE_SAML_ENABLED=true with
+      # an unusable private key is a fatal configuration error rather than a
+      # feature that stays unused. The key must be standard (not URL-safe)
+      # base64 of a PKCS#1 DER RSA key with exponent 65537 and at least 2048
+      # bits. A provider must also be registered through the admin API before
+      # anyone can sign in with it; it lands in auth.saml_providers.
+      GOTRUE_SAML_ENABLED: ${GOTRUE_SAML_ENABLED:-false}
+      GOTRUE_SAML_PRIVATE_KEY: ${GOTRUE_SAML_PRIVATE_KEY:-}
+    depends_on:
+      # Ordering, not just preference: without the password and the schema in
+      # place, GoTrue's first migration fails and the container exits.
+      auth-init:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    healthcheck:
+      # GoTrue's own /health: HTTP 200 + JSON, no authentication and no
+      # Host-header requirement, so a spider is enough. wget is BusyBox's from
+      # the image's alpine base — this is the check Supabase's own self-host
+      # compose uses.
+      test:
+        - CMD
+        - wget
+        - --no-verbose
+        - --tries=1
+        - --spider
+        - http://localhost:9999/health
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # The first start runs 75 embedded migrations against the database.
+      start_period: 30s
+
+  # ── Optional workflow engine (T4.8) ──────────────────────────────────────
+  n8n:
+    profiles:
+      - n8n
+    image: n8nio/n8n:${N8N_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      # LOOPBACK ONLY. n8n's editor runs arbitrary workflows, which is a much
+      # larger prize than anything else in this stack. Reach it over an SSH
+      # tunnel (`ssh -L 5678:127.0.0.1:5678 <host>`) or put it behind
+      # nginx-proxy with authentication in front.
+      - '${N8N_BIND:-127.0.0.1}:${N8N_PORT:-5678}:5678'
+    environment:
+      N8N_HOST: ${PUBLIC_HOSTNAME:-localhost}
+      N8N_PORT: '5678'
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-https}
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-}
+      # Encrypts n8n's own stored credentials. Generated by install.sh; losing
+      # it makes every credential n8n already holds unreadable.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-}
+      # docs/plan/05-observability-and-metrics.md §5: no outbound telemetry by
+      # default. An enterprise adopter's security review looks for exactly this.
+      N8N_DIAGNOSTICS_ENABLED: 'false'
+      DO_NOT_TRACK: '1'
+    volumes:
+      - n8n-data:/home/node/.n8n
+    networks:
+      - edge
+      # `models`, not `backend`: n8n needs outbound internet for its nodes, and
+      # `backend` is internal. This is also what lets a workflow call
+      # capture-service by name.
+      - models
+    deploy:
+      resources:
+        limits:
+          memory: ${N8N_MEMORY:-1g}
+
+  # ── Bundled TURN relay (coturn) ──────────────────────────────────────────
+  #
+  # A self-hosted coturn so a default install needs no third-party TURN account.
+  # Profile-gated: only starts when install.sh chose the bundled TURN option
+  # (the --defaults choice), which adds --profile turn to the compose command.
+  #
+  # ── WHY THIS SERVICE PUBLISHES PORTS ─────────────────────────────────────
+  #
+  # Unlike every other service in this stack, coturn MUST be reachable directly
+  # by browsers on the network — WebRTC ICE candidates carry the relay address,
+  # and the browser opens UDP/TCP sockets to it without any proxy in front.
+  # nginx-proxy cannot front a TURN server: TURN is not HTTP.
+  #
+  # ── DOCKER DESKTOP NAT CAVEAT ────────────────────────────────────────────
+  #
+  # Under Docker Desktop (Windows/macOS), containers run behind a NAT. coturn
+  # sees its own container IP as the relay address, which is unreachable from
+  # other machines on the LAN. Set TURN_EXTERNAL_IP in .env to the Windows/macOS
+  # host's LAN IP (e.g. 192.168.1.100) so coturn advertises that instead.
+  # Leave it empty for a same-machine install (both browsers on localhost).
+  #
+  # ── LAN-ONLY DEPLOYMENTS ─────────────────────────────────────────────────
+  #
+  # The denied-peer-ip list below blocks relay to private ranges (standard
+  # coturn hardening — prevents the relay from being used to reach internal
+  # services). If BOTH browsers are on 192.168.x and there is no public-route
+  # coturn, set TURN_ALLOW_PRIVATE_PEERS=yes in .env to remove the deny lines.
+  # A deployment with browsers on mixed networks (some LAN, some internet)
+  # should leave the denies on and ensure at least one coturn has a public IP.
+  coturn:
+    profiles:
+      - turn
+    image: coturn/coturn:${COTURN_IMAGE_TAG:-4.6.3}
+    restart: unless-stopped
+    logging: *logging
+    # The wrapper writes a config file and starts turnserver from it, for two
+    # reasons found on the first live run:
+    #   * coturn takes ONE denied-peer-ip per range. A comma-separated list is
+    #     rejected ("Wrong address format") and the whole deny list is silently
+    #     dropped, which leaves the relay free to reach private networks.
+    #   * the shared secret stays out of the process command line (readable by
+    #     anything that can list processes in the container).
+    # /tmp because the image runs as the unprivileged `nobody`. No `-n`: that
+    # flag makes turnserver ignore every config file, including this one.
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        umask 077
+        conf=/tmp/turnserver.conf
+        {
+          echo "static-auth-secret=$${COTURN_SHARED_SECRET}"
+          echo "realm=$${PUBLIC_HOSTNAME}"
+          echo "min-port=$${TURN_MIN_PORT:-49160}"
+          echo "max-port=$${TURN_MAX_PORT:-49200}"
+          if [ -n "$${TURN_EXTERNAL_IP}" ]; then echo "external-ip=$${TURN_EXTERNAL_IP}"; fi
+          # Relay PEERS that are never allowed: loopback, link-local, and the
+          # private ranges, so a TURN credential cannot be used to reach
+          # machines behind this host. A LAN-only deployment whose browsers
+          # relay to each other on 192.168.x sets TURN_ALLOW_PRIVATE_PEERS=1
+          # (loopback and link-local stay denied either way).
+          for r in 0.0.0.0-0.255.255.255 127.0.0.0-127.255.255.255 \
+                   169.254.0.0-169.254.255.255 ::1 \
+                   fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff; do
+            echo "denied-peer-ip=$$r"
+          done
+          if [ -z "$${TURN_ALLOW_PRIVATE_PEERS}" ]; then
+            for r in 10.0.0.0-10.255.255.255 172.16.0.0-172.31.255.255 \
+                     192.168.0.0-192.168.255.255 \
+                     fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff; do
+              echo "denied-peer-ip=$$r"
+            done
+          fi
+        } > "$$conf"
+        exec turnserver -c "$$conf" --log-file=stdout --use-auth-secret \
+          --listening-port=3478 --no-cli --no-tls --no-dtls \
+          --fingerprint --no-multicast-peers
+    ports:
+      # TURN listening port, UDP and TCP. Browsers send ICE candidates here.
+      # Published on all interfaces (not loopback) — WebRTC requires direct
+      # reachability from the browser's network.
+      - '3478:3478/udp'
+      - '3478:3478/tcp'
+      # Relay port range. Narrow (41 ports by default) to limit the UDP surface
+      # while giving enough ports for several concurrent sessions.
+      - '${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp'
+    environment:
+      COTURN_SHARED_SECRET: ${COTURN_SHARED_SECRET:-}
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME:-localhost}
+      TURN_MIN_PORT: ${TURN_MIN_PORT:-49160}
+      TURN_MAX_PORT: ${TURN_MAX_PORT:-49200}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+      # Non-empty: the relay may forward to 10/8, 172.16/12, 192.168/16 and
+      # fc00::/7 peers (LAN-only deployments). See the wrapper above.
+      TURN_ALLOW_PRIVATE_PEERS: ${TURN_ALLOW_PRIVATE_PEERS:-}
+    networks:
+      # edge: browsers on the LAN / internet reach the published ports.
+      - edge
+      # backend: the api container's health probe reaches coturn by service
+      # name (`coturn`) on the internal network, so the probe works even when
+      # the public hostname resolves elsewhere.
+      - backend
+    deploy:
+      resources:
+        limits:
+          # coturn is lightweight — a few MB of RAM per active relay session.
+          # 256m bounds a runaway without starving the box.
+          memory: 256m

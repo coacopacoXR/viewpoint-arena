@@ -20,6 +20,8 @@ import React from 'react';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, cleanup, act } from '@testing-library/react';
 import * as THREE from 'three';
+import { MeshPartRegistry } from '../../../lib/scene/partRegistry';
+import type { SceneNode } from '../../../types';
 
 const ME = 'me';
 const HASH = 'a1'.repeat(32);
@@ -52,6 +54,14 @@ const MODEL_ID = sceneModelId(HASH);
 const PREFIX = sceneModelPrefix(HASH);
 const ROOT = `${PREFIX}_0`;
 const FLANGE = `${PREFIX}_1`;
+
+/** The tree the parse produced: a root group with one flange under it. */
+const TREE: SceneNode = {
+  id: ROOT,
+  name: 'bracket.step',
+  type: 'GROUP',
+  children: [{ id: FLANGE, name: 'Flange', type: 'MESH' }],
+};
 
 /** The canvas element, sized, because jsdom measures everything as zero. */
 let element: HTMLElement;
@@ -139,12 +149,11 @@ function mountRoom(options: {
       [MODEL_ID]: {
         id: MODEL_ID,
         group: root,
-        sceneTree: {
-          id: ROOT,
-          name: 'bracket.step',
-          type: 'GROUP' as const,
-          children: [{ id: FLANGE, name: 'Flange', type: 'MESH' as const }],
-        },
+        // The registry a real parse attaches, so the click is resolved the way the app
+        // resolves it rather than through the tag walk that stands in for a model with
+        // no entry at all (lib/scene/partRegistry.ts).
+        partRegistry: new MeshPartRegistry(root, TREE),
+        sceneTree: TREE,
         fileName: 'bracket.step',
         line: 'bracket',
         revision: 'A',

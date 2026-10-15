@@ -9,8 +9,12 @@ import { setLaserEntry, clearLaserEntry } from '../../lib/laserTargetRef';
 import { fingerPointerRef } from '../../lib/fingerPointerRef';
 import { pointingSourceRef } from '../../lib/pointingSourceRef';
 import { getModelCenter } from '../../lib/orbitPivot';
-import { pickSelectionId } from '../../lib/pickSelectionId';
+import { laserSelectionId } from '../../lib/scene/clickSelection';
+import { hitParts, isPointableHit, partRegistries, type HitParts } from '../../lib/scene/partRegistry';
 import { EDITING_HELPER_KEY } from '../../lib/scene/captureClean';
+
+/** The resolution of a ray that hit nothing this frame. */
+const NO_PARTS: HitParts = { chain: [], modelId: null, handle: null };
 
 // Project the active model's center to NDC. Returns true on success.
 function computeModelCenterNDC(scene: THREE.Scene, camera: THREE.Camera, out: Vector2): boolean {
@@ -180,6 +184,11 @@ const UserLaser: React.FC = () => {
 
     useFrame((state) => {
         const frameNow = Date.now();
+        // What turns a raycast hit into a part. Read once here because two raycasts
+        // below resolve through it — the hover-dwell check and the laser's own pick —
+        // and they have to agree, which is the whole reason the walk they each used to
+        // do by hand now lives in one place (lib/scene/partRegistry.ts).
+        const registries = partRegistries(useStore.getState().sceneEntries);
         const fingerFresh = frameNow - fingerPointerRef.lastUpdate < 200;
         const handPresent = fingerFresh && fingerPointerRef.pointerNDC !== null;
 
@@ -307,22 +316,11 @@ const UserLaser: React.FC = () => {
                 dwellRaycaster.current.setFromCamera(dwellVec.current, camera);
                 const hits = dwellRaycaster.current.intersectObjects(scene.children, true);
                 for (const hit of hits) {
-                    const obj: THREE.Object3D = hit.object;
-                    if (
-                        obj.userData?.skipRaycast ||
-                        obj.name?.startsWith?.('Agent') ||
-                        obj.type === 'Line' ||
-                        obj.type === 'Points'
-                    ) continue;
-                    let curr: THREE.Object3D | null = obj;
-                    let skip = false;
-                    while (curr) {
-                        if (curr.userData?.skipRaycast) { skip = true; break; }
-                        if (curr.userData?.modelId) { newDwellHeld = true; break; }
-                        curr = curr.parent ?? null;
+                    if (!isPointableHit(hit)) continue;
+                    if (hitParts(hit, registries).modelId !== null) {
+                        newDwellHeld = true;
+                        break;
                     }
-                    if (skip) continue;
-                    if (newDwellHeld) break;
                 }
             }
 
@@ -364,39 +362,33 @@ const UserLaser: React.FC = () => {
         let foundId: string | null = null;
         let foundMeshName: string | null = null;
         let foundPartName: string | null = null;
-        let hitObject: THREE.Object3D | null = null;
+        let found: HitParts = NO_PARTS;
         const hitPoint = new Vector3();
 
         for (let i = 0; i < intersects.length; i++) {
             const hit = intersects[i];
-            const obj: THREE.Object3D = hit.object;
             // Skip non-content (helpers, agent avatars, remote avatars, remote laser dots/beams)
-            if (
-                obj.userData?.skipRaycast ||
-                obj.name?.startsWith?.('Agent') ||
-                obj.type === 'Line' ||
-                obj.type === 'Points'
-            ) continue;
+            if (!isPointableHit(hit)) continue;
 
-            // Walk up looking for a tagged model — also bail if any ancestor is skipRaycast
-            let curr: THREE.Object3D | null = obj;
-            let skip = false;
-            while (curr) {
-                if (curr.userData?.skipRaycast) { skip = true; break; }
-                if (curr.userData?.modelId) { foundId = curr.userData.modelId; break; }
-                curr = curr.parent ?? null;
-            }
-            if (skip) { foundId = null; continue; }
+            const parts = hitParts(hit, registries);
+            // No model behind it — the floor, a wall, a mesh the file left untagged —
+            // so whatever is behind this hit is still a candidate.
+            if (parts.modelId === null) continue;
 
-            if (foundId) {
-                hitObject = obj;
-                hitPoint.copy(hit.point);
-                foundMeshName = obj.userData?.meshIndex != null
-                    ? String(obj.userData.meshIndex)
-                    : (obj.name || null);
-                foundPartName = obj.userData?.partName ?? null;
-                break;
-            }
+            found = parts;
+            foundId = parts.modelId;
+            hitPoint.copy(hit.point);
+            // The object's own name, which is what the wire's `targetMeshName` has
+            // always carried: the `userData.meshIndex` this used to prefer is written
+            // by nothing in the repo, so the branch that read it never ran.
+            foundMeshName = hit.object.name || null;
+            // The part's readable name, from the registry that owns it. This read
+            // `userData.partName` before, which no importer writes either — so the
+            // label beside the dot and the part name in the pointing timeline were
+            // both permanently empty, and the AI transcript never learned what
+            // anybody was pointing at.
+            foundPartName = parts.handle?.name ?? null;
+            break;
         }
 
         // Build beam start position (handheld feel — offset right, down, forward from camera)
@@ -444,7 +436,7 @@ const UserLaser: React.FC = () => {
 
         if (foundId !== lastHitId.current) {
              const granularity = useStore.getState().laserHighlightGranularity;
-             const selectionId = pickSelectionId(hitObject, granularity);
+             const selectionId = laserSelectionId(found, granularity);
              selectNode(selectionId);
              lastHitId.current = foundId;
         }

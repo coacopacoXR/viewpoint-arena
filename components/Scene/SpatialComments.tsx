@@ -3,6 +3,7 @@ import { Html } from '@react-three/drei';
 import { useFrame, useThree } from '@react-three/fiber';
 import { Vector3, Vector2, Raycaster, Group } from 'three';
 import { useStore, getCurrentSceneTree } from '../../store';
+import { hitParts, isPointableHit, partRegistries } from '../../lib/scene/partRegistry';
 import { MessageSquare, Check, GripVertical, Link2, Minimize2, Pencil, MapPin } from 'lucide-react';
 import { SceneNode, SpatialComment } from '../../types';
 
@@ -257,25 +258,17 @@ const PlacementPreview: React.FC = () => {
         const intersects = raycaster.current.intersectObjects(scene.children, true);
 
         let hitPoint: Vector3 | null = null;
-        let foundId: string | null = null;
+        const registries = partRegistries(useStore.getState().sceneEntries);
 
         for (const hit of intersects) {
-            if (hit.object.name.startsWith('Agent') || hit.object.type === 'Line' || hit.object.type === 'Points') continue;
-
-            let curr = hit.object;
-            while (curr) {
-                if (curr.userData && curr.userData.modelId) {
-                    foundId = curr.userData.modelId;
-                    break;
-                }
-                if (curr.parent) curr = curr.parent;
-                else break;
-            }
-
-            if (foundId) {
-                hitPoint = hit.point.clone();
-                break;
-            }
+            // `isPointableHit` adds the `skipRaycast` test this loop never made, so the
+            // preview marker can no longer sit on the gizmo's own picker meshes or on
+            // somebody's laser dot. The laser and the click below have always skipped
+            // those; the preview agreeing with them is the point of one shared filter.
+            if (!isPointableHit(hit)) continue;
+            if (hitParts(hit, registries).modelId === null) continue;
+            hitPoint = hit.point.clone();
+            break;
         }
 
         if (previewRef.current && hitPoint) {
@@ -314,37 +307,28 @@ const PlacementPreview: React.FC = () => {
 
             raycaster.current.setFromCamera(pointer, camera);
             const intersects = raycaster.current.intersectObjects(scene.children, true);
+            const registries = partRegistries(useStore.getState().sceneEntries);
 
             for (const hit of intersects) {
-                if (hit.object.name.startsWith('Agent') || hit.object.type === 'Line' || hit.object.type === 'Points') continue;
+                if (!isPointableHit(hit)) continue;
 
-                let curr = hit.object;
-                let foundId: string | null = null;
-                while (curr) {
-                    if (curr.userData && curr.userData.modelId) {
-                        foundId = curr.userData.modelId;
-                        break;
-                    }
-                    if (curr.parent) curr = curr.parent;
-                    else break;
+                const foundId = hitParts(hit, registries).modelId;
+                if (foundId === null) continue;
+
+                const foundName = findNodeName(foundId, currentTree) || 'Unknown';
+                setPendingComment(
+                    { x: hit.point.x, y: hit.point.y, z: hit.point.z },
+                    foundId,
+                    foundName
+                );
+
+                if (commentMode === 'placing-drawing') {
+                    setCapturedScreenshot(pendingScreenshotRef.current);
+                    pendingScreenshotRef.current = null;
+                    setCommentMode('drawing');
+                    setShowDrawingCanvas(true);
                 }
-
-                if (foundId) {
-                    const foundName = findNodeName(foundId, currentTree) || 'Unknown';
-                    setPendingComment(
-                        { x: hit.point.x, y: hit.point.y, z: hit.point.z },
-                        foundId,
-                        foundName
-                    );
-
-                    if (commentMode === 'placing-drawing') {
-                        setCapturedScreenshot(pendingScreenshotRef.current);
-                        pendingScreenshotRef.current = null;
-                        setCommentMode('drawing');
-                        setShowDrawingCanvas(true);
-                    }
-                    break;
-                }
+                break;
             }
         };
 

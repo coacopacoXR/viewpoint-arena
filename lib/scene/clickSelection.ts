@@ -16,9 +16,16 @@
 //
 // The raycast itself, the pointer events and the store writes live in
 // components/Scene/SceneClickSelect.tsx.
+//
+// WHAT IT RESOLVES AGAINST. Not the scene graph directly: a raycast hit goes to the
+// model's PartRegistry (lib/scene/partRegistry.ts), which is what answers "which part
+// is this" once a part is no longer necessarily an Object3D of its own. The laser's
+// granularity switch used to be a second copy of the same walk in
+// lib/pickSelectionId.ts and lives here now, because two copies of one resolution is
+// how the laser and the tree came to disagree in the first place.
 
-import type { Object3D } from 'three';
 import { sceneModelForNode, type SceneModel } from './roomScene';
+import { hitParts, type HitParts, type PartRegistry, type PickHit } from './partRegistry';
 import type { ReviewGizmoTarget } from '../../types';
 
 /**
@@ -81,6 +88,12 @@ export interface ClickSelectionContext {
   /** The room's scene, so a node id can be traced to the model it belongs to. */
   models: readonly SceneModel[];
   /**
+   * The parsed models' part registries, which is what turns a raycast hit into a part.
+   * `partRegistries(store.sceneEntries)` answers it; the bundled sample has none and is
+   * resolved from the tags on its own objects instead.
+   */
+  registries: readonly PartRegistry[];
+  /**
    * The id of a model's own root node, from its parsed tree — the id the Model Tree's
    * model row selects. Null while the file is still downloading, when there is no row
    * to select either.
@@ -90,43 +103,33 @@ export interface ClickSelectionContext {
   lists: (nodeId: string) => boolean;
 }
 
+/** The laser's own switch: point at one part, or at the whole model. */
+export type LaserGranularity = 'model' | 'part';
+
 /**
- * The tagged nodes from the hit object up, nearest first, and the model id the hit
- * belongs to.
+ * The node id the LASER selects for a hit, given its granularity — the second consumer
+ * of one resolution, and the reason `hitParts` answers a chain rather than an id.
  *
- * A chain rather than one id because the two switches want different ends of it, and
- * because a tagged object is not always a row in the tree: utils/modelLoader's
- * buildSceneTree tags EVERY object it walks, then components/UI/SceneTree's
- * collapseSingleChildGroups promotes a group's only child and drops the group's row.
- * Such a group still carries its id in userData, so "the nearest tagged ancestor" can
- * be an id nothing can highlight. Walking the chain until the tree recognises one is
- * what makes a click always land on something the person can see selected.
+ * 'part' wants the nearest part and 'model' wants the model it belongs to, which for an
+ * imported model are the same string: buildSceneTree stamps a node's own id into both
+ * `userData.modelId` and `userData.nodeId`. They differ only for the bundled sample,
+ * whose meshes carry the sample's root as their `modelId` and their own id as their
+ * `nodeId`, so 'model' has to keep answering the `modelId` rather than the chain's head.
  *
- * `modelId` is the NEAREST one, which is the id lib/pickSelectionId.ts answers for
- * 'model' granularity and so the id the laser has always selected: a built-in stamps
- * its own root on every mesh it walks (see components/Scene/Headphones.tsx), while an
- * imported model stamps each node with that node's own id. The two are told apart by
- * asking the scene, below.
+ * Null when the hit names no model at all — the floor, empty space, a helper — which
+ * the laser answers by clearing the selection.
+ *
+ * Moved here from lib/pickSelectionId.ts, deleted: it was the same parent walk as the
+ * click's, with the same skipRaycast bail and the same avatar/beam/point-cloud skip,
+ * and two copies of one resolution is exactly the divergence this file's header exists
+ * to prevent.
  */
-function taggedChain(hit: Object3D): { chain: string[]; modelId: string | null } {
-  const chain: string[] = [];
-  let modelId: string | null = null;
-  let current: Object3D | null = hit;
-  while (current) {
-    if (current.userData?.skipRaycast) return { chain: [], modelId: null };
-    // An agent's avatar, a laser beam and a point cloud are not the product: keep
-    // walking, the way the laser's own picker does, rather than answering "nothing".
-    const ignorable =
-      current.name?.startsWith?.('Agent') || current.type === 'Line' || current.type === 'Points';
-    if (!ignorable) {
-      const tagged = current.userData?.modelId;
-      if (typeof tagged === 'string' && modelId === null) modelId = tagged;
-      const id = current.userData?.nodeId ?? tagged;
-      if (typeof id === 'string' && !chain.includes(id)) chain.push(id);
-    }
-    current = current.parent ?? null;
-  }
-  return { chain, modelId };
+export function laserSelectionId(parts: HitParts, granularity: LaserGranularity): string | null {
+  if (parts.modelId === null) return null;
+  if (granularity === 'model') return parts.modelId;
+  // 'part': the nearest id, falling back to the model's when the hit object carried none
+  // of its own — a mesh the file left untagged inside a tagged group.
+  return parts.chain[0] ?? parts.modelId;
 }
 
 /**
@@ -138,14 +141,19 @@ function taggedChain(hit: Object3D): { chain: string[]; modelId: string | null }
  * has to put the gizmo down.
  *
  * In Part mode the answer is the clicked mesh's own node, or the nearest ancestor of
- * it that the tree lists. In Whole model mode it is the model's root — the id the
- * tree's model row selects — because that is what "selects that model" means to the
- * rest of the app: the gizmo attaches to the wrapper, the scale slider refers to it,
- * and the tree highlights one row rather than one mesh of it.
+ * it that the tree lists. Walking the chain until the tree recognises one is what makes
+ * a click always land on something the person can see selected: a tagged object is not
+ * always a row, because collapseSingleChildGroups promotes a group's only child and
+ * drops the group's row while the group keeps its id.
+ *
+ * In Whole model mode it is the model's root — the id the tree's model row selects —
+ * because that is what "selects that model" means to the rest of the app: the gizmo
+ * attaches to the wrapper, the scale slider refers to it, and the tree highlights one
+ * row rather than one mesh of it.
  */
-export function clickedNodeId(hit: Object3D | null, context: ClickSelectionContext): string | null {
+export function clickedNodeId(hit: PickHit | null, context: ClickSelectionContext): string | null {
   if (!hit) return null;
-  const { chain, modelId } = taggedChain(hit);
+  const { chain, modelId } = hitParts(hit, context.registries);
   if (chain.length === 0) return null;
 
   if (context.target === 'model') {

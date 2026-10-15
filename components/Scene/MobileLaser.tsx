@@ -4,6 +4,7 @@ import { Vector3, Raycaster, Vector2, Mesh } from 'three';
 import { mobileLaserRef } from '../../lib/mobileLaserRef';
 import { usePresence } from '../../lib/PresenceContext';
 import { EDITING_HELPER_KEY } from '../../lib/scene/captureClean';
+import { hitParts, isPointableHit, partRegistries } from '../../lib/scene/partRegistry';
 import { useStore } from '../../store';
 import { setLaserEntry, clearLaserEntry } from '../../lib/laserTargetRef';
 
@@ -37,38 +38,29 @@ const MobileLaser: React.FC = () => {
     raycaster.current.setFromCamera(new Vector2(ndc[0], ndc[1]), camera);
 
     const intersects = raycaster.current.intersectObjects(scene.children, true);
+    const registries = partRegistries(useStore.getState().sceneEntries);
     let foundId: string | null = null;
     let foundMeshName: string | null = null;
     let foundPartName: string | null = null;
     let hitPoint: Vector3 | null = null;
 
     for (const hit of intersects) {
-      const obj: any = hit.object;
-      if (
-        obj.userData?.skipRaycast ||
-        obj.name?.startsWith?.('Agent') ||
-        obj.type === 'Line' ||
-        obj.type === 'Points' ||
-        (dotRef.current && obj === dotRef.current)
-      ) continue;
+      // Covers the dot this component draws, which used to be excluded by an explicit
+      // `obj === dotRef.current` beside the same test: the dot is tagged skipRaycast in
+      // the JSX below, so it is not something a ray may land on and neither is anything
+      // above it.
+      if (!isPointableHit(hit)) continue;
 
-      let curr: any = obj;
-      let skip = false;
-      while (curr) {
-        if (curr.userData?.skipRaycast) { skip = true; break; }
-        if (curr.userData?.modelId) { foundId = curr.userData.modelId; break; }
-        curr = curr.parent ?? null;
-      }
-      if (skip) { foundId = null; continue; }
+      const parts = hitParts(hit, registries);
+      if (parts.modelId === null) continue;
 
-      if (foundId) {
-        hitPoint = hit.point;
-        foundMeshName = obj.userData?.meshIndex != null
-          ? String(obj.userData.meshIndex)
-          : (obj.name || null);
-        foundPartName = obj.userData?.partName ?? null;
-        break;
-      }
+      foundId = parts.modelId;
+      hitPoint = hit.point;
+      foundMeshName = hit.object.name || null;
+      // The part's readable name. `userData.partName` before, which no importer writes,
+      // so the touch laser had never named a part either.
+      foundPartName = parts.handle?.name ?? null;
+      break;
     }
 
     if (hitPoint) {

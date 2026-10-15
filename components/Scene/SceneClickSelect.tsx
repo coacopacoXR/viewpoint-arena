@@ -30,6 +30,7 @@ import * as THREE from 'three';
 import { useStore } from '../../store';
 import { usePresence } from '../../lib/PresenceContext';
 import { clickedNodeId, isClick, type ScreenPoint } from '../../lib/scene/clickSelection';
+import { partRegistries } from '../../lib/scene/partRegistry';
 import { sceneModelForNode } from '../../lib/scene/roomScene';
 
 const SceneClickSelect: React.FC<{
@@ -110,14 +111,20 @@ const SceneClickSelect: React.FC<{
       // things that are in front of the model — the mouse-tracking plane in World.tsx,
       // the gizmo's own picker meshes — and a ray that stopped at the first of those
       // would clear the selection every time somebody clicked a part.
+      //
+      // The hit goes whole, not as `hit.object`: a part is not necessarily an object of
+      // its own any more, and the registry that answers "which part is this" reads the
+      // instance indices off the intersection (lib/scene/partRegistry.ts).
       let nodeId: string | null = null;
+      const context = {
+        target: state.reviewGizmoTarget,
+        models: state.scene.models,
+        registries: partRegistries(state.sceneEntries),
+        rootIdOf: (modelId: string) => state.sceneEntries[modelId]?.sceneTree.id ?? null,
+        lists: (id: string) => Boolean(state.objectStates[id]),
+      };
       for (const hit of hits) {
-        nodeId = clickedNodeId(hit.object, {
-          target: state.reviewGizmoTarget,
-          models: state.scene.models,
-          rootIdOf: (modelId) => state.sceneEntries[modelId]?.sceneTree.id ?? null,
-          lists: (id) => Boolean(state.objectStates[id]),
-        });
+        nodeId = clickedNodeId(hit, context);
         if (nodeId !== null) break;
       }
 

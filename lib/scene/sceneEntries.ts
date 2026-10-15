@@ -12,6 +12,7 @@
 import type { Vector3, Group } from 'three';
 import type { SceneNode } from '../../types';
 import { parseModelFile, type ModelImportResult } from '../../utils/modelLoader';
+import { MeshPartRegistry, type PartRegistry } from './partRegistry';
 import { sceneModelPrefix, type SceneModel } from './roomScene';
 
 export interface SceneModelEntry {
@@ -20,6 +21,20 @@ export interface SceneModelEntry {
   group: Group;
   /** Its tree, with node ids prefixed so they cannot collide with another model's. */
   sceneTree: SceneNode;
+  /**
+   * Its parts, addressed by the same node ids the tree uses — the seam that lets the
+   * renderer stop being one Object3D per part (lib/scene/partRegistry.ts).
+   *
+   * OPTIONAL, and only because the parse is not the only way to get an entry: tests
+   * hand-build one around a bare Group to exercise a component that never looks at a
+   * part, and making the field required would have nine of them fabricate a registry
+   * for nothing. `sceneModelEntry` below always fills it, and a missing one is safe in
+   * this stage rather than silently wrong — `hitParts` falls back to reading the ids
+   * off the tagged objects, which is exactly what a MeshPartRegistry indexes. Stage 4
+   * is where the fallback stops being able to answer for a batched model, and where
+   * this becomes required.
+   */
+  partRegistry?: PartRegistry;
   fileName: string;
   line: string;
   revision: string;
@@ -55,6 +70,11 @@ export function sceneModelEntry(
     id: model.id,
     group: parsed.root,
     sceneTree: parsed.sceneTree,
+    // Built from the tree as well as the group so a handle's `name` is the name the
+    // Model Tree's row shows rather than whatever the file left on the Object3D, which
+    // is often nothing: collapseSingleChildGroups promotes a wrapped mesh and gives it
+    // the wrapper's name in the tree only.
+    partRegistry: new MeshPartRegistry(parsed.root, parsed.sceneTree),
     // The name the file was parsed under, which is the name the loader gave it
     // and the one utils/modelLoader.ts dispatched on — not whatever the scene
     // happens to call it.

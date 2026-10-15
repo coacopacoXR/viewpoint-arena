@@ -46,6 +46,7 @@ vi.mock('../../../utils/modelLoader', async () => {
   const { Group: ThreeGroup, Vector3: ThreeVector3 } = await import('three');
   return {
     validateModelFile: () => null,
+    largeCadWarningFor: () => null,
     parseModelFile: async (file: File): Promise<ModelImportResult> => ({
       root: new ThreeGroup(),
       sceneTree: {

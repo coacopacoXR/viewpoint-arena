@@ -52,6 +52,11 @@ vi.mock('../../../utils/modelLoader', async () => {
   const { Group: ThreeGroup, Vector3: ThreeVector3 } = await import('three');
   return {
     validateModelFile: () => null,
+    // Faked, and only the wiring is being tested: what the advisory returns for
+    // which size is pinned in utils/__tests__/modelFormats.test.ts. What matters
+    // here is that the tree shows it and carries on regardless.
+    largeCadWarningFor: (file: File) =>
+      file.name.endsWith('.step') ? 'This STEP file is large (150 MB).' : null,
     parseModelFile: async (file: File): Promise<ModelImportResult> => ({
       root: new ThreeGroup(),
       sceneTree: {
@@ -158,6 +163,32 @@ describe('SceneTree — a file handed over rather than picked', () => {
     await hand(modelFile());
 
     expect(screen.getByText(/Imported "onshape-part.glb"/)).toBeTruthy();
+  });
+
+  it('shows the large-CAD advisory while importing, imports anyway, and clears it once done', async () => {
+    // The upload is held open so the strip can be read mid-import: the advisory
+    // is about the wait, so the wait is when it has to be on screen.
+    let finishUpload!: () => void;
+    uploadModelFile.mockImplementationOnce(
+      (file: File) =>
+        new Promise((resolveUpload) => {
+          finishUpload = () => resolveUpload({ fileName: file.name, hash: HASH, size: file.size });
+        }),
+    );
+    renderTree();
+
+    await hand(modelFile('onshape-assembly.step'));
+    expect(screen.getByText(/This STEP file is large/)).toBeTruthy();
+
+    await act(async () => {
+      finishUpload();
+      for (let i = 0; i < 8; i += 1) await Promise.resolve();
+    });
+
+    // An advisory is not a refusal: the model still reaches the scene.
+    expect(sent().some((update) => update.op === 'add')).toBe(true);
+    expect(useStore.getState().scene.models).toHaveLength(1);
+    expect(screen.queryByText(/This STEP file is large/)).toBeNull();
   });
 
   it('asks where it goes when the scene already holds a model', async () => {

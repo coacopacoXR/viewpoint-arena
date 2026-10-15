@@ -51,16 +51,31 @@ export const MODEL_FILE_ACCEPT = SUPPORTED_EXTENSIONS
     .flatMap(ext => [ext, ext.toUpperCase()])
     .join(',');
 
-const MAX_MESH_FILE_BYTES = 50 * 1024 * 1024;
-/** A STEP assembly is mostly text and routinely outgrows 50 MB. */
-const MAX_CAD_FILE_BYTES = 200 * 1024 * 1024;
-
-export const isCadExtension = (extension: string): boolean => CAD_EXTENSIONS.includes(extension);
+/**
+ * One ceiling for every supported format, mesh and B-rep alike.
+ *
+ * It used to be 50 MB for mesh formats and 200 MB for CAD, because a STEP
+ * assembly is mostly text and routinely outgrows a GLB. The mesh half was left
+ * over from when an imported model travelled through the room socket as base64;
+ * sharing is by content hash now, and both the api (MAX_MODEL_UPLOAD_BYTES in
+ * api/_lib/models.ts) and nginx already accept 200 MB, so the lower number did
+ * nothing except refuse a 120 MB GLB that every layer downstream would have
+ * handled. Keeping one number here is what stops the three layers drifting
+ * apart again — lib/modelsClient.ts reads it for the 413 message.
+ *
+ * A big B-rep file is still a different proposition in the browser, but that is
+ * a warning to whoever is importing rather than a smaller cap: see
+ * largeCadWarningFor in utils/modelLoader.ts.
+ */
+export const MAX_MODEL_FILE_BYTES = 200 * 1024 * 1024;
 
 export const isNativeCadExtension = (extension: string): boolean => NATIVE_CAD_EXTENSIONS.includes(extension);
 
-export const maxFileSizeFor = (extension: string): number =>
-    isCadExtension(extension) ? MAX_CAD_FILE_BYTES : MAX_MESH_FILE_BYTES;
+/**
+ * Still takes the extension, and still exported, but no longer reads it: every
+ * format has the same ceiling now. Callers pass what they have.
+ */
+export const maxFileSizeFor = (_extension: string): number => MAX_MODEL_FILE_BYTES;
 
 export const maxFileSizeMessage = (extension: string): string =>
     `File too large. Maximum size is ${maxFileSizeFor(extension) / (1024 * 1024)}MB.`;

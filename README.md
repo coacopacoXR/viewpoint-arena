@@ -151,7 +151,11 @@ limit rule for `/api/capture/` in the project's Firewall settings as well.
 ## Tech stack
 
 *   **React 19**, **React Three Fiber (three.js)**, **Zustand**, **Tailwind CSS**
-*   **PartyKit** for live rooms (presence, follow and admission)
+*   **PartyKit** for live rooms: presence, follow/lead, admission and WebRTC
+    call signalling. Its open-source server runs locally in its own container,
+    bound to loopback behind the stack's nginx, with admissions and the scene
+    kept in a Docker volume — no Cloudflare account. Deploying it to your own
+    account, or using Cloudflare TURN instead of the bundled coturn, is opt-in.
 *   **Supabase / Postgres** for reviews, accounts and records
 *   **Whisper** and **Ollama** in a Python capture service
 *   **occt-import-js** (OpenCascade, WebAssembly) for STEP, IGES and BREP

@@ -17,7 +17,7 @@
 // `public, max-age=31536000, immutable`, so a second ask for the same hash
 // never reaches the network at all.
 
-import { INVALID_FILE_TYPE_MESSAGE, modelFileMime } from '../utils/modelFormats';
+import { INVALID_FILE_TYPE_MESSAGE, MAX_MODEL_FILE_BYTES, modelFileMime } from '../utils/modelFormats';
 
 /** Where both directions go. Same-origin, so the front-door cookie rides along. */
 export const MODELS_ENDPOINT = '/api/models';
@@ -59,7 +59,12 @@ export const MODEL_DOWNLOAD_FAILED_MESSAGE =
  * wanted to look at a bracket is not an explanation.
  */
 export function describeUploadFailure(status: number): string {
-  if (status === 413) return 'File too large to share with the room (maximum 200MB).';
+  // 413 is the api's MAX_MODEL_UPLOAD_BYTES saying no, which is the same ceiling
+  // the picker enforces — read from the shared constant so the two cannot drift
+  // and leave this message promising a size the server refuses.
+  if (status === 413) {
+    return `File too large to share with the room (maximum ${MAX_MODEL_FILE_BYTES / (1024 * 1024)}MB).`;
+  }
   if (status === 415) return INVALID_FILE_TYPE_MESSAGE;
   if (status === 401 || status === 403) return MODEL_LOCKED_MESSAGE;
   if (status === 503) return MODEL_STORAGE_UNAVAILABLE_MESSAGE;

@@ -6,7 +6,7 @@ import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { SceneNode, ObjectState } from '../types';
 import { cadResultToGroup } from './cadToThree';
-import { CAD_READER_BY_EXTENSION, readCadFile } from './cadImport';
+import { CAD_READER_BY_EXTENSION, CAD_READER_LABEL, readCadFile } from './cadImport';
 import {
     INVALID_FILE_TYPE_MESSAGE,
     NATIVE_CAD_MESSAGE,
@@ -364,6 +364,47 @@ export const validateModelFile = (file: File): string | null => {
     }
 
     return null;
+};
+
+/**
+ * Above this size, a B-rep import is slow enough to be worth announcing before
+ * it starts.
+ *
+ * Measured rather than guessed. OpenCascade is tessellating in each browser and
+ * holds roughly 6x the file size in WASM heap (hard cap 2 GB), and the
+ * three-minute CAD_IMPORT_TIMEOUT_MS in utils/cadImport.ts is hit around
+ * 150–170 MB on a 4-core machine. Up to ~100 MB works but takes a while, which
+ * is the window this draws the line under.
+ */
+export const CAD_SLOW_IMPORT_BYTES = 100 * 1024 * 1024;
+
+/**
+ * What to tell someone about to wait a long time for a big CAD file, or null
+ * when there is nothing to warn about.
+ *
+ * Deliberately a warning and not a refusal, which is why it sits beside
+ * validateModelFile instead of inside it: the file is within the 200 MB limit
+ * and will very likely open, so refusing it would be the app making a judgement
+ * about someone else's patience. Callers show it through the same status strip
+ * as an error and carry on importing.
+ *
+ * Lives here rather than in utils/modelFormats.ts because the message has to
+ * name the format the way the reader does — STEP, IGES or BREP — and that label
+ * is CAD_READER_LABEL. modelFormats.ts imports nothing that could pull in a
+ * loader; this file already imports both.
+ *
+ * Mesh formats get nothing: a GLB is already triangles, so there is no
+ * tessellation pass and a 200 MB one parses in seconds, not minutes.
+ */
+export const largeCadWarningFor = (file: File): string | null => {
+    const reader = CAD_READER_BY_EXTENSION[modelFileExtension(file.name)];
+    if (!reader || file.size <= CAD_SLOW_IMPORT_BYTES) {
+        return null;
+    }
+
+    const megabytes = Math.round(file.size / (1024 * 1024));
+    return `This ${CAD_READER_LABEL[reader]} file is large (${megabytes} MB). Opening it in the browser ` +
+        'can take several minutes and may fail. If you can, export it as GLB from your CAD system instead.';
 };
 
 export async function parseModelFile(file: File, options: ParseModelOptions = {}): Promise<ModelImportResult> {

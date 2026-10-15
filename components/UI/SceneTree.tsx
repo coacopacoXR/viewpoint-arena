@@ -8,9 +8,9 @@ import {
     useStore,
 } from '../../store';
 import { SceneNode } from '../../types';
-import { ChevronRight, ChevronDown, Eye, EyeOff, Box, Layers, CircleDot, Upload, FileBox, Loader2, AlertCircle, CheckCircle2, X, GitCompare, Trash2, Users, Lock, Globe, Sparkles } from 'lucide-react';
+import { ChevronRight, ChevronDown, Eye, EyeOff, Box, Layers, CircleDot, Upload, FileBox, Loader2, AlertCircle, AlertTriangle, CheckCircle2, X, GitCompare, Trash2, Users, Lock, Globe, Sparkles } from 'lucide-react';
 import { clsx } from 'clsx';
-import { parseModelFile, validateModelFile, type ModelImportResult } from '../../utils/modelLoader';
+import { largeCadWarningFor, parseModelFile, validateModelFile, type ModelImportResult } from '../../utils/modelLoader';
 import { MODEL_FILE_ACCEPT } from '../../utils/modelFormats';
 import { MODEL_UPLOAD_NETWORK_MESSAGE, uploadModelFile } from '../../lib/modelsClient';
 import { usePresence } from '../../lib/PresenceContext';
@@ -606,6 +606,10 @@ const SceneTree: React.FC = () => {
     const { record } = useSceneEditHistory();
 
     const [importError, setImportError] = useState<string | null>(null);
+    // The slow-CAD advisory for the file being imported, or null. Local state
+    // like importError rather than in the store: it belongs to this panel's
+    // status strip, and nothing else in the app has a use for it.
+    const [importWarning, setImportWarning] = useState<string | null>(null);
     const [pending, setPending] = useState<PendingImport | null>(null);
     const [compareLine, setCompareLine] = useState<string | null>(null);
     // Fraction of the file that has reached the server, or null when nothing is
@@ -722,11 +726,18 @@ const SceneTree: React.FC = () => {
         const error = validateModelFile(file);
         if (error) {
             setImportError(error);
+            setImportWarning(null);
             return;
         }
 
         setIsImporting(true);
         setImportError(null);
+        // Set before the upload so it is on screen for the whole import, and
+        // cleared by the same call when the file is a small one or a mesh. It
+        // advises, it does not block: tessellating a 150 MB STEP can take
+        // minutes, and the person who picked it is the one who decides whether
+        // to wait that out or go and re-export.
+        setImportWarning(largeCadWarningFor(file));
         setShareProgress(null);
 
         // Stored on the server FIRST, then parsed. Two steps on purpose, and the
@@ -776,6 +787,9 @@ const SceneTree: React.FC = () => {
         }
 
         setIsImporting(false);
+        // The wait it warned about is over. Kept on the failure paths above,
+        // where it is the likeliest explanation of the error beside it.
+        setImportWarning(null);
 
         if (useStore.getState().scene.models.length === 0) {
             // Nothing in the scene, so there is nothing to ask about: it goes in
@@ -1197,6 +1211,21 @@ const SceneTree: React.FC = () => {
                                 style={{ width: `${Math.round(shareProgress * 100)}%` }}
                             />
                         </div>
+                    </div>
+                )}
+
+                {/* Amber, not red: nothing has gone wrong, the import is still
+                    running and this is the reason it is taking a while. */}
+                {importWarning && (
+                    <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-[10px] text-amber-800 flex items-start gap-2 animate-in fade-in slide-in-from-top-2">
+                        <AlertTriangle size={14} className="text-amber-500 shrink-0 mt-0.5" />
+                        <div className="flex-1">{importWarning}</div>
+                        <button
+                            onClick={() => setImportWarning(null)}
+                            className="text-amber-400 hover:text-amber-600"
+                        >
+                            <X size={12} />
+                        </button>
                     </div>
                 )}
 

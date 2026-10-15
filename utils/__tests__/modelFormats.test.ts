@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { validateModelFile } from '../modelLoader';
+import { CAD_SLOW_IMPORT_BYTES, largeCadWarningFor, validateModelFile } from '../modelLoader';
 import { CAD_READER_BY_EXTENSION, CAD_READER_LABEL } from '../cadImport';
 import {
     CAD_EXTENSIONS,
     DEFAULT_UP_AXIS,
     INVALID_FILE_TYPE_MESSAGE,
+    MAX_MODEL_FILE_BYTES,
     MESH_EXTENSIONS,
     MODEL_FILE_ACCEPT,
     MODEL_MIME_TYPES,
@@ -121,16 +122,55 @@ describe('validateModelFile', () => {
         }
     });
 
-    it('allows a bigger file for CAD than for mesh formats', () => {
-        expect(maxFileSizeFor('.step')).toBe(200 * MB);
-        expect(maxFileSizeFor('.glb')).toBe(50 * MB);
+    it('holds every supported format to the same ceiling', () => {
+        // Pinned to the number rather than only to the constant, because the api
+        // (MAX_MODEL_UPLOAD_BYTES) and nginx's client_max_body_size are at 200 MB
+        // and a change here has to be a change there too.
+        expect(MAX_MODEL_FILE_BYTES).toBe(200 * MB);
+        for (const ext of SUPPORTED_EXTENSIONS) {
+            expect(maxFileSizeFor(ext), ext).toBe(MAX_MODEL_FILE_BYTES);
+        }
 
         expect(validateModelFile(fileSized('assembly.step', 199 * MB))).toBeNull();
         expect(validateModelFile(fileSized('assembly.stp', 51 * MB))).toBeNull();
-        expect(validateModelFile(fileSized('assembly.glb', 49 * MB))).toBeNull();
+        // The case that used to fail: a GLB this size was refused here and would
+        // have been accepted by every layer behind it.
+        expect(validateModelFile(fileSized('assembly.glb', 199 * MB))).toBeNull();
 
-        expect(validateModelFile(fileSized('assembly.glb', 51 * MB))).toMatch(/too large/i);
-        expect(validateModelFile(fileSized('assembly.glb', 51 * MB))).toContain('50MB');
+        expect(validateModelFile(fileSized('assembly.glb', 201 * MB))).toMatch(/too large/i);
+        expect(validateModelFile(fileSized('assembly.glb', 201 * MB))).toContain('200MB');
         expect(validateModelFile(fileSized('assembly.step', 201 * MB))).toContain('200MB');
+    });
+});
+
+describe('largeCadWarningFor', () => {
+    it('says nothing about a CAD file at or under the threshold', () => {
+        expect(largeCadWarningFor(fileSized('assembly.step', 99 * MB))).toBeNull();
+        expect(largeCadWarningFor(fileSized('assembly.step', CAD_SLOW_IMPORT_BYTES))).toBeNull();
+        expect(CAD_SLOW_IMPORT_BYTES).toBe(100 * MB);
+    });
+
+    it('warns about a big STEP, naming the format and its size', () => {
+        const warning = largeCadWarningFor(fileSized('assembly.step', 101 * MB));
+
+        expect(warning).toContain('STEP');
+        expect(warning).toContain('101 MB');
+        expect(warning).toMatch(/several minutes/i);
+        expect(warning).toMatch(/export it as GLB/i);
+    });
+
+    it('is a warning and not a refusal: the same file still validates', () => {
+        expect(largeCadWarningFor(fileSized('assembly.step', 150 * MB))).not.toBeNull();
+        expect(validateModelFile(fileSized('assembly.step', 150 * MB))).toBeNull();
+    });
+
+    it('says nothing about a large mesh file, which three.js just reads', () => {
+        expect(largeCadWarningFor(fileSized('scan.glb', 150 * MB))).toBeNull();
+        expect(largeCadWarningFor(fileSized('notes.zip', 150 * MB))).toBeNull();
+    });
+
+    it('names the reader rather than the extension, so .igs says IGES', () => {
+        expect(largeCadWarningFor(fileSized('surface.igs', 101 * MB))).toContain('IGES');
+        expect(largeCadWarningFor(fileSized('solid.brp', 101 * MB))).toContain('BREP');
     });
 });

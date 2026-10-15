@@ -20,16 +20,18 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, fireEvent, cleanup, act } from '@testing-library/react';
 import React from 'react';
+import { Group as ThreeGroup, Vector3 as ThreeVector3 } from 'three';
 import type { ModelImportResult } from '../../../utils/modelLoader';
 import type { SceneModel, SceneUpdate } from '../../../lib/scene/roomScene';
 
 /** What POST /api/models answers with, as far as an import is concerned. */
 interface StoredModelFile { fileName: string; hash: string; size: number }
 
-const { broadcastSceneUpdate, uploadModelFile } = vi.hoisted(() => ({
+const { broadcastSceneUpdate, uploadModelFile, parseModelFile } = vi.hoisted(() => ({
   broadcastSceneUpdate: vi.fn((_update: SceneUpdate) => true),
   // One line: esbuild reads a multi-line type argument in a .tsx file as JSX.
   uploadModelFile: vi.fn<(file: File, onProgress?: (fraction: number) => void) => Promise<StoredModelFile>>(),
+  parseModelFile: vi.fn<(file: File) => Promise<ModelImportResult>>(),
 }));
 
 vi.mock('../../../lib/PresenceContext', () => ({
@@ -46,32 +48,15 @@ vi.mock('../../../lib/modelsClient', () => ({
   MODEL_UPLOAD_NETWORK_MESSAGE: 'The model could not be shared.',
 }));
 
-// The parse is the expensive half and has nothing to do with the handoff: one
-// group, one part, a two-unit box, which is enough for placement to measure.
-vi.mock('../../../utils/modelLoader', async () => {
-  const { Group: ThreeGroup, Vector3: ThreeVector3 } = await import('three');
-  return {
-    validateModelFile: () => null,
-    // Faked, and only the wiring is being tested: what the advisory returns for
-    // which size is pinned in utils/__tests__/modelFormats.test.ts. What matters
-    // here is that the tree shows it and carries on regardless.
-    largeCadWarningFor: (file: File) =>
-      file.name.endsWith('.step') ? 'This STEP file is large (150 MB).' : null,
-    parseModelFile: async (file: File): Promise<ModelImportResult> => ({
-      root: new ThreeGroup(),
-      sceneTree: {
-        id: 'prefix_0',
-        name: file.name,
-        type: 'GROUP',
-        children: [{ id: 'prefix_1', name: 'Flange', type: 'MESH' }],
-      },
-      fileName: file.name,
-      baseScale: 1,
-      basePosition: new ThreeVector3(),
-      size: { x: 2, y: 2, z: 2 },
-    }),
-  };
-});
+vi.mock('../../../utils/modelLoader', () => ({
+  validateModelFile: () => null,
+  // Faked, and only the wiring is being tested: what the advisory returns for
+  // which size is pinned in utils/__tests__/modelFormats.test.ts. What matters
+  // here is that the tree shows it and carries on regardless.
+  largeCadWarningFor: (file: File) =>
+    file.name.endsWith('.step') ? 'This STEP file is large (150 MB).' : null,
+  parseModelFile,
+}));
 
 // Imported after the mocks are registered.
 const { default: SceneTree } = await import('../SceneTree');
@@ -130,6 +115,22 @@ beforeEach(() => {
     fileName: file.name,
     hash: HASH,
     size: file.size,
+    derived: 'unavailable',
+  }));
+  // The parse is the expensive half and has nothing to do with the handoff: one
+  // group, one part, a two-unit box, which is enough for placement to measure.
+  parseModelFile.mockReset().mockImplementation(async (file: File) => ({
+    root: new ThreeGroup(),
+    sceneTree: {
+      id: 'prefix_0',
+      name: file.name,
+      type: 'GROUP',
+      children: [{ id: 'prefix_1', name: 'Flange', type: 'MESH' }],
+    },
+    fileName: file.name,
+    baseScale: 1,
+    basePosition: new ThreeVector3(),
+    size: { x: 2, y: 2, z: 2 },
   }));
 });
 
@@ -166,13 +167,24 @@ describe('SceneTree — a file handed over rather than picked', () => {
   });
 
   it('shows the large-CAD advisory while importing, imports anyway, and clears it once done', async () => {
-    // The upload is held open so the strip can be read mid-import: the advisory
-    // is about the wait, so the wait is when it has to be on screen.
-    let finishUpload!: () => void;
-    uploadModelFile.mockImplementationOnce(
+    // The PARSE is held open so the strip can be read mid-import. It used to be
+    // the upload, and moving it is the point: what the advisory describes is
+    // tessellating in a Web Worker, which is the parse and not the upload — and
+    // since task 03c the importer does not even know whether there will be a
+    // browser tessellation until the upload has answered (`derived`).
+    let finishParse!: () => void;
+    parseModelFile.mockImplementationOnce(
       (file: File) =>
-        new Promise((resolveUpload) => {
-          finishUpload = () => resolveUpload({ fileName: file.name, hash: HASH, size: file.size });
+        new Promise((resolveParse) => {
+          finishParse = () =>
+            resolveParse({
+              root: new ThreeGroup(),
+              sceneTree: { id: 'prefix_0', name: file.name, type: 'GROUP' },
+              fileName: file.name,
+              baseScale: 1,
+              basePosition: new ThreeVector3(),
+              size: { x: 2, y: 2, z: 2 },
+            });
         }),
     );
     renderTree();
@@ -181,7 +193,7 @@ describe('SceneTree — a file handed over rather than picked', () => {
     expect(screen.getByText(/This STEP file is large/)).toBeTruthy();
 
     await act(async () => {
-      finishUpload();
+      finishParse();
       for (let i = 0; i < 8; i += 1) await Promise.resolve();
     });
 

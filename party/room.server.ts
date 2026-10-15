@@ -8,6 +8,7 @@ import {
   MAX_SCENE_MODELS,
   scenePermissions,
   type ModelEditors,
+  type ModelRepresentation,
   type RoomScene,
   type SceneAuthority,
   type SceneRefusalReason,
@@ -16,6 +17,7 @@ import {
 } from '../lib/scene/roomScene';
 import {
   asModelEditors,
+  asRepresentation,
   asRoomScene,
   asSceneUpdate,
   sceneFromLegacyReference,
@@ -52,6 +54,14 @@ export interface ModelReference {
   hash?: string;
   fileName?: string;
   size?: number;
+  /**
+   * Which encoding of `hash` everybody loads: the uploaded file, or the GLB
+   * convert-service tessellated from it. Optional, and absent on every message
+   * an older client sent, where 'source' is the only answer it could have
+   * meant — see ModelRepresentation in lib/scene/roomScene.ts for why this is a
+   * room-wide fact rather than each client's own choice.
+   */
+  representation?: ModelRepresentation;
 }
 
 /**
@@ -213,6 +223,11 @@ function asModelReference(value: unknown): ModelReference | null {
     hash,
     fileName: typeof record.fileName === 'string' ? record.fileName : undefined,
     size: typeof record.size === 'number' && Number.isFinite(record.size) ? record.size : undefined,
+    // Read by sceneWire's own reader, so the value that reaches
+    // sceneFromLegacyReference is one that reader already accepts. A string
+    // nobody wrote is dropped rather than relayed, which leaves the reference
+    // meaning 'source' — the file every client can already open.
+    representation: asRepresentation(record.representation) ?? undefined,
   };
 }
 

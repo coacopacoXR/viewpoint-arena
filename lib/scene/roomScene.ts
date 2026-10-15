@@ -66,6 +66,32 @@ export const MAX_SCENE_PARTS = 500;
 export const MAX_PART_NODE_ID = 200;
 
 /**
+ * Which ENCODING of a stored file every participant loads.
+ *
+ *   'source'       the bytes that were uploaded (/api/models/<hash>), parsed by
+ *                  whichever reader utils/modelLoader.ts dispatches on.
+ *   'derived-glb'  the GLB convert-service tessellated from them
+ *                  (/api/models/<hash>/derived/glb).
+ *
+ * Both are the same product, but they are NOT the same tree: OpenCascade in a
+ * browser and OpenCascade behind convert-service split faces, order meshes and
+ * name them by their own rules, so `buildSceneTree` mints different node ids for
+ * the two. A node id is what a pin, a comment, a selection and a moved part all
+ * name, which makes this a ROOM-WIDE fact rather than a per-client performance
+ * choice: one participant loading the derivative and another the source would
+ * have every pin in the room pointing at the wrong mesh on one of the two
+ * screens.
+ *
+ * So the IMPORTER decides it once, writes it into the reference it broadcasts,
+ * and every receiver — a live relay, a late joiner and a room restored from
+ * storage alike — loads exactly what the reference says.
+ */
+export type ModelRepresentation = 'source' | 'derived-glb';
+
+/** The representation a reference that does not name one means. */
+export const DEFAULT_REPRESENTATION: ModelRepresentation = 'source';
+
+/**
  * One model in the room's scene.
  *
  * `hash` is BA's content address: the bytes live in model storage and every
@@ -115,6 +141,17 @@ export interface SceneModel {
    * a writer that has never heard of them sends an update that leaves them alone.
    */
   parts?: PartTransforms;
+  /**
+   * Which encoding of `hash` everybody loads — see ModelRepresentation.
+   *
+   * Optional, and absent on every model written before a deployment could run
+   * convert-service, which is the only thing that produces a derivative. Absent
+   * means 'source': a scene an older build persisted, a payload an older client
+   * sent, and a mesh upload that never had anything to convert all have to keep
+   * meaning "fetch the file that was uploaded", which is what they meant before
+   * this field existed.
+   */
+  representation?: ModelRepresentation;
 }
 
 /** Where one model sits in the room, and how it is turned and sized. */
@@ -148,6 +185,20 @@ export function sceneModelTransform(model: SceneModel): SceneModelTransform {
     rotation: model.rotation ?? IDENTITY_SCENE_TRANSFORM.rotation,
     scale,
   };
+}
+
+/**
+ * Which encoding of a model's file to load, with the optional field filled in.
+ *
+ * The same rule sceneModelTransform applies to a transform: every reader goes
+ * through this rather than reaching for `model.representation ?? …`, so "absent
+ * means the source file" is written down in exactly one place. A value that is
+ * not one of the two — a hand-edited storage record, a future encoding an older
+ * build never heard of — reads as the source too, because that is the one every
+ * reader in utils/modelLoader.ts can already open.
+ */
+export function sceneModelRepresentation(model: Pick<SceneModel, 'representation'>): ModelRepresentation {
+  return model.representation === 'derived-glb' ? 'derived-glb' : DEFAULT_REPRESENTATION;
 }
 
 /**

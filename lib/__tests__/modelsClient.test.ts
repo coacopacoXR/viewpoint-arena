@@ -246,7 +246,23 @@ describe('uploadModelFile', () => {
     expect(sent?.body).toBe(file);
     // The name the caller gets back is the one they picked, not whatever the
     // server echoed: it is the name that goes into the broadcast reference.
-    expect(result).toEqual({ hash: HASH, size: BYTES.byteLength, fileName: 'Bügel — Rev B.step' });
+    // `derived` is the api's answer about converting the file, and an api that
+    // says nothing — or says 'unavailable' — both read as "there is no derivative
+    // to wait for", which is the only thing the importer does with the field.
+    expect(result).toEqual({
+      hash: HASH,
+      size: BYTES.byteLength,
+      fileName: 'Bügel — Rev B.step',
+      derived: 'unavailable',
+    });
+  });
+
+  it('passes through the one `derived` answer that asks the importer to wait', async () => {
+    FakeXMLHttpRequest.reply = {
+      status: 200,
+      response: { hash: HASH, size: 8, fileName: 'a.step', derived: 'pending' },
+    };
+    await expect(uploadModelFile(fileOf('a.step'))).resolves.toMatchObject({ derived: 'pending' });
   });
 
   it('reports progress, and ends at 1', async () => {

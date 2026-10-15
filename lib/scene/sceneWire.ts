@@ -20,6 +20,7 @@ import {
   sceneModelId,
   type BuiltInModel,
   type ModelEditors,
+  type ModelRepresentation,
   type PartTransform,
   type PartTransforms,
   type RoomScene,
@@ -39,6 +40,30 @@ export interface LegacyModelReference {
   hash?: string;
   fileName?: string;
   size?: number;
+  /**
+   * Which encoding of the hash to load. Optional, exactly as it is on a
+   * SceneModel, and absent on every reference an older client sent — where
+   * 'source' is the only answer such a client could have meant.
+   */
+  representation?: ModelRepresentation;
+}
+
+/**
+ * A representation this server can read, or null for anything else.
+ *
+ * Two values, and a third answer is refused rather than passed through: the
+ * field decides which reader a browser hands the bytes to, so a string nobody
+ * wrote would reach utils/modelLoader.ts as an unknown extension and cost the
+ * room a model. Read as absent rather than defaulted to 'derived-glb', because a
+ * derivative only exists where convert-service does.
+ *
+ * Exported for party/room.server.ts's asModelReference, which reads the same
+ * field off a MODEL_CHANGE from a client that has not been updated: one rule for
+ * the two shapes a reference arrives in, so the legacy path and the scene path
+ * cannot disagree about what a string means.
+ */
+export function asRepresentation(value: unknown): ModelRepresentation | null {
+  return value === 'source' || value === 'derived-glb' ? value : null;
 }
 
 const BUILT_IN_MODELS: BuiltInModel[] = ['synth', 'headphones', 'bicycle'];
@@ -191,6 +216,13 @@ export function asSceneModel(value: unknown): SceneModel | null {
   // see the setPartTransform case below — because there the sender is still there to
   // be told.
   const parts = asPartTransforms(record.parts);
+  // Which encoding to load. Left OUT rather than written as 'source' when the
+  // record has none, so a scene this function reads back out of the room server's
+  // own storage round-trips unchanged: every model persisted before a deployment
+  // could run convert-service has no representation, and adding one to all of them
+  // on read would be a write-shaped change on a read path. Readers go through
+  // sceneModelRepresentation, which is where "absent means the source file" lives.
+  const representation = asRepresentation(record.representation);
 
   return {
     id,
@@ -203,6 +235,7 @@ export function asSceneModel(value: unknown): SceneModel | null {
     ...(rotation ? { rotation } : {}),
     ...(scale === null ? {} : { scale }),
     ...(parts ? { parts } : {}),
+    ...(representation ? { representation } : {}),
   };
 }
 
@@ -385,6 +418,11 @@ export function sceneFromLegacyReference(reference: LegacyModelReference & { fil
     revision: FIRST_REVISION,
     visible: true,
     offset: [0, 0, 0],
+    // Carried through rather than dropped: an old client that has learned to send
+    // a representation is still an old client, and losing the field here would
+    // have it load the source while the sender loaded the derivative — two trees,
+    // and every pin in the room pointing at the wrong mesh on one of the screens.
+    representation: reference.representation,
   });
   if (!model) return null;
   return { models: [model], builtIn: null };

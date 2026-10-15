@@ -26,6 +26,7 @@ import {
     sceneModelLabel,
     sceneModelPrefix,
     type ModelEditors,
+    type ModelRepresentation,
     type SceneModel,
     type SceneUpdate,
 } from '../../lib/scene/roomScene';
@@ -35,6 +36,23 @@ import { useSampleModels } from '../../lib/scene/useSampleModels';
 import { claimImportPicker, claimSceneImports } from '../../lib/scene/importHandoff';
 import { compareOffsets, nextToOffset, type SceneExtent } from '../../lib/scene/placement';
 import { sceneModelEntry } from '../../lib/scene/sceneEntries';
+import { waitForDerivedGlb } from '../../lib/scene/derivedImport';
+
+/**
+ * A wait so far, as "M:SS".
+ *
+ * The shape the status strip already reads as a clock, and the reason the
+ * server-side conversion shows one at all: a 200 MB assembly takes minutes to
+ * tessellate and a spinner with no number next to it is indistinguishable from a
+ * hang, which is exactly what the upload's percentage bar exists to prevent.
+ */
+/** The abort reason the panel's unmount gives a running wait for the derivative. */
+const UNMOUNTED = 'unmounted';
+
+function formatElapsed(ms: number): string {
+    const seconds = Math.max(0, Math.floor(ms / 1000));
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
 
 // Find all ancestor ids of a node in the tree (excluding the node itself)
 function findAncestorIds(root: SceneNode, targetId: string): string[] {
@@ -582,6 +600,21 @@ interface PendingImport {
     /** The stored size in bytes, which is what model_revisions records. */
     size: number;
     parsed: ModelImportResult;
+    /**
+     * Which encoding of `hash` the room is to load, decided while this file was
+     * imported and written into the reference `finishImport` broadcasts.
+     *
+     * It describes `parsed` as much as it describes the model: the tree in there
+     * was built from the derivative's GLB or from the source file, and the two
+     * number their nodes differently. A reference that said one while the
+     * importer had parsed the other would put a different tree on every other
+     * screen than on this one.
+     *
+     * `fileName` stays the SOURCE's name in both cases — it is what the line is
+     * named after and what model_revisions records — while the entry's own name
+     * comes from what was parsed.
+     */
+    representation: ModelRepresentation;
 }
 
 /**
@@ -638,6 +671,15 @@ const SceneTree: React.FC = () => {
     // being shared. Kept out of the zustand store: it changes many times a
     // second during an upload and only this panel renders it.
     const [shareProgress, setShareProgress] = useState<number | null>(null);
+    // How long the server has been tessellating this upload, or null when it is
+    // not. Local for the same reason as shareProgress — it ticks once a second
+    // and nothing outside this strip reads it — and it doubles as the flag that
+    // decides whether the strip is on screen at all.
+    const [derivedElapsedMs, setDerivedElapsedMs] = useState<number | null>(null);
+    // Aborts the wait above. A ref rather than state because the only two things
+    // that touch it are the button that ends the wait and the unmount below, and
+    // neither has anything to render about it.
+    const derivedAbortRef = useRef<AbortController | null>(null);
 
     // Whether the import was started from "+ Revision" rather than from "Import".
     //
@@ -754,12 +796,15 @@ const SceneTree: React.FC = () => {
 
         setIsImporting(true);
         setImportError(null);
-        // Set before the upload so it is on screen for the whole import, and
-        // cleared by the same call when the file is a small one or a mesh. It
-        // advises, it does not block: tessellating a 150 MB STEP can take
-        // minutes, and the person who picked it is the one who decides whether
-        // to wait that out or go and re-export.
-        setImportWarning(largeCadWarningFor(file));
+        // NOT the slow-CAD advisory, which used to go up here before the upload.
+        // What it warns about is tessellating in the BROWSER, and whether that is
+        // going to happen is the server's answer to the upload rather than a
+        // property of the file: a CAD file this deployment has started converting
+        // comes back as a GLB in a fraction of the time, so warning about minutes
+        // of browser work would be a warning about work nobody is going to do. It
+        // is set below, once `derived` says which of the two paths this import is
+        // on — and only on the one that really does tessellate here.
+        setImportWarning(null);
         setShareProgress(null);
 
         // Stored on the server FIRST, then parsed. Two steps on purpose, and the
@@ -794,13 +839,75 @@ const SceneTree: React.FC = () => {
             return;
         }
 
+        // Which encoding of the stored file the room is going to load, and the
+        // bytes to parse to get it.
+        //
+        // Decided HERE, once, by the importer, and then written into the reference
+        // that goes on the socket — not left for each client to work out for
+        // itself. The server's tessellation and the browser's are both OpenCascade
+        // and both correct, but they split faces, order meshes and name them by
+        // their own rules, so the two trees one file can produce number their
+        // nodes differently. A node id is what a pin, a comment, a selection and a
+        // moved part all name: a participant that guessed 'derived-glb' while the
+        // importer had tessellated locally would render the right product and
+        // disagree with everybody else about which mesh is which.
+        //
+        // Waiting for the server is the default when it says a conversion is
+        // running, because the derivative is the whole point of the exercise — it
+        // is minutes of tessellation nobody has to do in a browser, and it arrives
+        // meshopt-compressed, so a 200 MB STEP becomes something a late joiner can
+        // fetch in seconds. 'unavailable' skips the wait entirely: there is no
+        // convert-service on this deployment, or the file is a mesh that never
+        // needed one.
+        let representation: ModelRepresentation = 'source';
+        let fileToParse = file;
+        if (stored.derived === 'pending') {
+            const controller = new AbortController();
+            derivedAbortRef.current = controller;
+            setDerivedElapsedMs(0);
+            const outcome = await waitForDerivedGlb(stored.hash, file.name, {
+                signal: controller.signal,
+                onElapsed: setDerivedElapsedMs,
+            });
+            derivedAbortRef.current = null;
+            // Aborted by the panel unmounting, not by the button: nobody is left
+            // to show the model to, and a browser tessellation of a big STEP for
+            // a panel that is gone is minutes of CPU spent on nothing.
+            if (controller.signal.reason === UNMOUNTED) return;
+            setDerivedElapsedMs(null);
+            if (outcome.status === 'derived') {
+                representation = 'derived-glb';
+                fileToParse = outcome.file;
+            } else if (outcome.reason !== 'cancelled') {
+                // `detail` is a code from convert_service/errors.py, forwarded by
+                // the api: ours, content-free, and the only thing here worth a log
+                // line. Not shown, because "the server could not convert it" is
+                // not something the person importing can act on and the model is
+                // about to appear anyway.
+                console.warn(
+                    `[scene] no server-made GLB for ${stored.hash} (${outcome.reason}` +
+                        `${outcome.detail ? `: ${outcome.detail}` : ''}), tessellating in the browser`,
+                );
+            }
+        }
+        // The warning belongs to the BROWSER path and to nothing else: what it
+        // describes is minutes of tessellation in a Web Worker that may not
+        // finish, and a derivative that arrived from the server is a GLB that
+        // parses in seconds. So it goes up on every route into that path — no
+        // convert-service configured, a conversion that failed, and the person who
+        // pressed "Open in browser instead" — and on none of the routes past it.
+        // It is cleared below as soon as the parse it warned about has happened.
+        if (representation === 'source') {
+            setImportWarning(largeCadWarningFor(file));
+        }
+
         let parsed: ModelImportResult;
         try {
             // Parsed here as well as by the loader, and not wasted: the width of
             // the parsed model is what "put it next to the others" measures
             // against, and handing the result to the store saves the loader
             // parsing the same bytes a second time.
-            parsed = await parseModelFile(file, { treePrefix: sceneModelPrefix(stored.hash) });
+            parsed = await parseModelFile(fileToParse, { treePrefix: sceneModelPrefix(stored.hash) });
         } catch (error) {
             console.error('Model import error:', error);
             setImportError(error instanceof Error ? error.message : 'Failed to import model file');
@@ -816,10 +923,13 @@ const SceneTree: React.FC = () => {
         if (useStore.getState().scene.models.length === 0) {
             // Nothing in the scene, so there is nothing to ask about: it goes in
             // at the origin, which is the only place there is.
-            finishImport({ fileName: stored.fileName, hash: stored.hash, size: stored.size, parsed }, 'beside');
+            finishImport(
+                { fileName: stored.fileName, hash: stored.hash, size: stored.size, parsed, representation },
+                'beside',
+            );
             return;
         }
-        setPending({ fileName: stored.fileName, hash: stored.hash, size: stored.size, parsed });
+        setPending({ fileName: stored.fileName, hash: stored.hash, size: stored.size, parsed, representation });
     };
 
     const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -860,6 +970,28 @@ const SceneTree: React.FC = () => {
         openImportPickerRef.current = () => handleImportClick(false);
     });
     useEffect(() => claimImportPicker(() => openImportPickerRef.current()), []);
+
+    // Stop polling for a server-side conversion this panel is no longer showing.
+    //
+    // The wait is the one phase of an import with no other end: an upload settles,
+    // a parse settles, but a conversion that never lands would be polled for as
+    // long as the tab was open. Walking out of the room — or the arena handing its
+    // tree over to the boardroom's — is enough to end it. The import itself then
+    // carries on down the browser path exactly as it would have, which is what
+    // already happens to an upload or a parse in flight when this panel goes away.
+    useEffect(() => () => derivedAbortRef.current?.abort(UNMOUNTED), []);
+
+    /**
+     * Stop waiting for the server and tessellate the file here instead.
+     *
+     * Offered for the WHOLE of the wait and not only once it has gone on a while,
+     * because it is the only way out of a conversion that is never going to
+     * finish — an api wedged in 'pending' has no deadline of its own to hit, and
+     * the person waiting is the one who knows how long they are prepared to. The
+     * browser path it chooses is the one that has always worked, so this costs
+     * speed and nothing else.
+     */
+    const openInBrowserInstead = () => derivedAbortRef.current?.abort();
 
     /**
      * Put an uploaded, parsed file into the scene, the way the user just asked.
@@ -906,6 +1038,14 @@ const SceneTree: React.FC = () => {
             revision: choice === 'revision' ? nextRevisionFor(models, line) : FIRST_REVISION,
             visible: true,
             offset,
+            // Written only when it is not the default, so a mesh upload and every
+            // scene an older build persisted stay byte-identical on the wire and
+            // in room storage. This is the field the whole rule rests on: it is
+            // what every other participant — including one who joins an hour from
+            // now and one who arrives after the room server restarts — reads to
+            // decide which encoding of `hash` to load, and therefore what makes
+            // `imported.parsed` the same tree everybody else builds.
+            ...(imported.representation === 'derived-glb' ? { representation: imported.representation } : {}),
         };
 
         const updates: SceneUpdate[] = [];
@@ -1233,6 +1373,29 @@ const SceneTree: React.FC = () => {
                                 style={{ width: `${Math.round(shareProgress * 100)}%` }}
                             />
                         </div>
+                    </div>
+                )}
+
+                {/* Blue like the upload above it and for the same reason: this is
+                    work happening, not work that failed. The clock is the part
+                    that matters — a server-side tessellation of a 200 MB assembly
+                    takes minutes, and a spinner with no number beside it is
+                    indistinguishable from a hang. */}
+                {derivedElapsedMs !== null && (
+                    <div className="mt-2 p-2 bg-blue-50 border border-blue-200 rounded text-[10px] text-blue-700">
+                        <div className="flex items-center gap-2">
+                            <Loader2 size={12} className="animate-spin text-blue-500 shrink-0" />
+                            <span className="flex-1">
+                                Preparing the model on the server… {formatElapsed(derivedElapsedMs)}
+                            </span>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={openInBrowserInstead}
+                            className="mt-1.5 text-[9px] font-semibold text-blue-600 underline hover:text-blue-800"
+                        >
+                            Open in browser instead
+                        </button>
                     </div>
                 )}
 

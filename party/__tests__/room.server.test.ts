@@ -1053,6 +1053,107 @@ describe('room.server — the model on screen, by reference', () => {
     expect(relayed.payload).toEqual(PAYLOAD);
   });
 
+  // ─── Which encoding of the file everybody loads (task 03c) ─────────────────
+  //
+  // A CAD file has two representations: the bytes that were uploaded, and the GLB
+  // convert-service tessellated from them. They are the same product and NOT the
+  // same tree — buildSceneTree numbers nodes positionally — so the choice belongs
+  // to the importer and travels on the reference. This server's job is to carry it
+  // without deciding anything about it.
+
+  /** SCENE, with the one model asked to be loaded from its derivative. */
+  const DERIVED_SCENE = {
+    models: [{ ...SCENE.models[0], representation: 'derived-glb' }],
+    builtIn: null,
+  };
+  const DERIVED_PAYLOAD = { ...DERIVED_SCENE, modelEditors: 'host', seeded: true };
+
+  it('carries a representation into the scene, into storage and out to the room', async () => {
+    const storage = fakeStorage();
+    const server = createServer(storage);
+    await server.onStart();
+    const hostConn = admittedHost(server);
+
+    await sendModel(server, hostConn, { ...REFERENCE, representation: 'derived-glb' });
+
+    expect(server.scene).toEqual(DERIVED_SCENE);
+    expect(storage._data.get(SCENE_KEY)).toEqual(DERIVED_PAYLOAD);
+    const relayed = JSON.parse(server.room.broadcast.mock.calls[0]?.[0] as string);
+    expect(relayed.payload).toEqual(DERIVED_PAYLOAD);
+  });
+
+  it('leaves the field out of a reference that has none, so an old scene is unchanged', async () => {
+    // Every reference written before a deployment could run convert-service has no
+    // representation, and all of them have to keep meaning "fetch the file that was
+    // uploaded". Filling in a default here would rewrite them on the first read.
+    const storage = fakeStorage();
+    const server = createServer(storage);
+    await server.onStart();
+
+    await sendModel(server, admittedHost(server), REFERENCE);
+
+    expect('representation' in server.scene.models[0]).toBe(false);
+    expect(server.scene).toEqual(SCENE);
+  });
+
+  it('drops a representation it does not recognise rather than relaying it', async () => {
+    const storage = fakeStorage();
+    const server = createServer(storage);
+    await server.onStart();
+    const hostConn = admittedHost(server);
+
+    // The field tells a browser which reader to hand the bytes to, so a string
+    // nobody wrote would arrive at utils/modelLoader.ts as an unknown extension
+    // and cost the room a model. Dropped, which reads as the source.
+    await sendModel(server, hostConn, { ...REFERENCE, representation: 'derived-obj' });
+
+    expect(server.scene).toEqual(SCENE);
+    expect(storage._data.get(SCENE_KEY)).toEqual(PAYLOAD);
+  });
+
+  it('replays the representation to a connection that joins after a restart', async () => {
+    // A late joiner is the case the whole rule exists for: they were not there to
+    // hear the importer decide, so the persisted scene is the only thing that can
+    // tell them which tree the room's pins are naming.
+    const storage = fakeStorage();
+    const before = createServer(storage);
+    await before.onStart();
+    await sendModel(before, admittedHost(before), { ...REFERENCE, representation: 'derived-glb' });
+
+    const after = createServer(storage);
+    await after.onStart();
+    expect(after.scene).toEqual(DERIVED_SCENE);
+
+    const conn = fakeConn('c-late');
+    admitUser(after, conn, 'late-1', 'Carol');
+    expect(sceneStates(sent(conn))[0].payload).toEqual(DERIVED_PAYLOAD);
+  });
+
+  it('keeps a representation through a SCENE_UPDATE that moves the model', async () => {
+    // The reducer's cases all spread the model they are changing, which is what
+    // makes this true; pinning it here is what stops a future case from rebuilding
+    // the record field by field and quietly dropping the one it has never heard of.
+    const storage = fakeStorage();
+    const server = createServer(storage);
+    await server.onStart();
+    const hostConn = admittedHost(server);
+    await sendModel(server, hostConn, { ...REFERENCE, representation: 'derived-glb' });
+    server.room.broadcast.mockClear();
+
+    await server.onMessage(
+      JSON.stringify({
+        type: 'SCENE_UPDATE',
+        payload: { op: 'setTransform', id: `model-${HASH}`, transform: { offset: [1, 0, 0], rotation: [0, 0, 0], scale: 2 } },
+      }),
+      hostConn as unknown as Party.Connection,
+    );
+
+    expect(server.scene.models[0]).toMatchObject({ representation: 'derived-glb', scale: 2 });
+    expect(storage._data.get(SCENE_KEY)).toMatchObject({
+      models: [{ representation: 'derived-glb', offset: [1, 0, 0] }],
+    });
+  });
+
   it('stores a built-in preset with no hash, which has nothing to fetch', async () => {
     const storage = fakeStorage();
     const server = createServer(storage);

@@ -12,9 +12,9 @@
 
 import { useEffect } from 'react';
 import { useStore } from '../../store';
-import { fetchModelFile } from '../modelsClient';
+import { fetchDerivedModelFile, fetchModelFile } from '../modelsClient';
 import { parseSceneModelFile } from './sceneEntries';
-import type { SceneModel } from './roomScene';
+import { sceneModelRepresentation, type SceneModel } from './roomScene';
 
 // Model ids whose download-and-parse is already running.
 //
@@ -30,9 +30,32 @@ function stillWanted(id: string): boolean {
   return useStore.getState().scene.models.some((model) => model.id === id);
 }
 
+/**
+ * The bytes this reference says to load, and only those.
+ *
+ * The choice of encoding is the IMPORTER's, made once and carried on the
+ * reference, rather than each client's own idea of what is fastest — because the
+ * two trees one CAD file can produce mint different node ids, and a node id is
+ * what a pin, a comment, a selection and a moved part all name. A client that
+ * second-guessed the reference here would render the same product as everybody
+ * else and disagree with all of them about which mesh is which.
+ *
+ * So a late joiner, a reload and a room restored from the server's storage all
+ * land in the same branch as the person who imported the file.
+ *
+ * Exported for the test that pins the choice: the branch is one line, and
+ * rendering a whole canvas to watch which URL it asked for would prove less than
+ * calling this directly does.
+ */
+export function fetchSceneModelFile(model: SceneModel): Promise<File> {
+  return sceneModelRepresentation(model) === 'derived-glb'
+    ? fetchDerivedModelFile(model.hash, model.fileName)
+    : fetchModelFile(model.hash, model.fileName);
+}
+
 async function load(model: SceneModel): Promise<void> {
   try {
-    const file = await fetchModelFile(model.hash, model.fileName);
+    const file = await fetchSceneModelFile(model);
     // The scene can move on while a big file downloads: the model may have been
     // removed, or replaced by a revision of itself. Parsing it anyway would put
     // geometry in the store that nothing in the scene refers to.

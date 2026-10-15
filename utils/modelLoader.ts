@@ -266,6 +266,12 @@ const loadGLTF = async (file: File): Promise<THREE.Object3D> => {
     // Meshopt-compressed GLBs (EXT_meshopt_compression, e.g. gltfpack output and
     // the bundled bicycle) fail outright without a decoder. The built-in models
     // get one from drei's useGLTF; imports have to wire it themselves.
+    //
+    // Which makes this load-bearing for the server-made derivative too: the GLB
+    // convert-service returns is gltfpack -cc output, so it is meshopt-compressed
+    // by construction, and every client that loads one comes through here — the
+    // importer that polled for it and every receiver whose reference says
+    // 'derived-glb' (lib/scene/useSceneModelLoader.ts).
     loader.setMeshoptDecoder(MeshoptDecoder);
     const arrayBuffer = await file.arrayBuffer();
 

@@ -381,7 +381,15 @@ const UserLaser: React.FC = () => {
             // The object's own name, which is what the wire's `targetMeshName` has
             // always carried: the `userData.meshIndex` this used to prefer is written
             // by nothing in the repo, so the branch that read it never ran.
-            foundMeshName = hit.object.name || null;
+            //
+            // The PART's name when a registry owns it, and the object's only as the
+            // fallback for what has none — the bundled synth, whose parts are React
+            // components. Task 04b stage 4 is why: above BATCH_MIN_PARTS a part is a
+            // slot in a batch, so the object a ray lands on is the BatchedMesh and its
+            // name is which batch it was, not which part was pointed at. Reading it
+            // straight off the hit would have put "BatchedParts 0" in the pointing
+            // timeline for every large model in the room.
+            foundMeshName = parts.handle?.name || hit.object.name || null;
             // The part's readable name, from the registry that owns it. This read
             // `userData.partName` before, which no importer writes either — so the
             // label beside the dot and the part name in the pointing timeline were

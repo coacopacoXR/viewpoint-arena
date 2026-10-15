@@ -195,6 +195,9 @@ type ViewerState =
 interface DisposableNode extends THREE.Object3D {
   geometry?: { dispose?: () => void };
   material?: { dispose?: () => void } | Array<{ dispose?: () => void } | undefined>;
+  /** Set on three's BatchedMesh, which owns more than the two fields above. */
+  isBatchedMesh?: boolean;
+  dispose?: () => void;
 }
 
 /**
@@ -207,6 +210,15 @@ interface DisposableNode extends THREE.Object3D {
  * reference; the lobby mounts a viewer per review, so a session spent scrolling the
  * lobby would otherwise hold every model it looked at.
  *
+ * A BatchedMesh is freed through its own `dispose` rather than through its geometry,
+ * and it is not a shortcut that happens to cover both: three allocates an
+ * instance-matrix DataTexture and an indirect-draw DataTexture in the BatchedMesh
+ * constructor, and neither is reachable from `.geometry` or `.material`, so a node
+ * that only knew about those two would free the merged buffer and leak the textures
+ * that make the batch drawable at all. Read by flag rather than by `instanceof` for
+ * the reason DisposableNode was written that way — a test can hand back a plain
+ * object shaped like one.
+ *
  * Textures are deliberately NOT disposed. utils/modelLoader's convertToStandardMaterial
  * copies `map`, `normalMap` and `alphaMap` across by reference, so one texture can
  * be sampled by two materials in the same file — and freeing a texture something is
@@ -215,7 +227,8 @@ interface DisposableNode extends THREE.Object3D {
 function disposeGroup(group: THREE.Object3D): void {
   group.traverse((child) => {
     const node = child as DisposableNode;
-    node.geometry?.dispose?.();
+    if (node.isBatchedMesh) node.dispose?.();
+    else node.geometry?.dispose?.();
     const material = node.material;
     if (Array.isArray(material)) {
       for (const one of material) one?.dispose?.();
@@ -223,6 +236,20 @@ function disposeGroup(group: THREE.Object3D): void {
       material?.dispose?.();
     }
   });
+}
+
+/**
+ * Free one parsed model: what its registry allocated, then what its graph holds.
+ *
+ * In that order, because a registry's `dispose` takes its batches OUT of the group — a
+ * `disposeGroup` run first would find them, free the merged buffer, and then the registry
+ * would free it again. Harmless twice over in three, but the order says which of the two
+ * owns what: the registry owns the batches, the overlays and the highlight clones, and the
+ * graph owns the geometry and the file's materials it was parsed with.
+ */
+function disposeEntry(entry: SceneModelEntry): void {
+  entry.partRegistry.dispose();
+  disposeGroup(entry.group);
 }
 
 // ─── Which models, and where ────────────────────────────────────────────────
@@ -469,11 +496,12 @@ const ReviewModelViewer: React.FC<ReviewModelViewerProps> = ({ reviewId, classNa
     // way, and the group it parsed would leak: nothing would ever dispose it,
     // because the teardown that would have already ran.
     let cancelled = false;
-    // Every group this load has parsed and not yet handed to React. The teardown
-    // disposes the lot, and anything parsed AFTER the teardown is disposed at the
-    // point it is noticed — between those two, no parsed group can outlive this
-    // effect.
-    const owned: THREE.Object3D[] = [];
+    // Every model this load has parsed and not yet handed to React. The teardown frees the
+    // lot, and anything parsed AFTER the teardown is freed at the point it is noticed —
+    // between those two, no parsed model can outlive this effect. Entries rather than groups,
+    // because a group is only half of what a parse allocates: the registry beside it owns the
+    // batches a big model is drawn as.
+    const owned: SceneModelEntry[] = [];
 
     /**
      * Download and parse one model, and place it the way the room places it.
@@ -490,10 +518,10 @@ const ReviewModelViewer: React.FC<ReviewModelViewerProps> = ({ reviewId, classNa
         if (cancelled) {
           // Parsed while the teardown was running. It is ours and nothing will ever
           // render it, so free it here rather than adding it to a list nobody reads.
-          disposeGroup(entry.group);
+          disposeEntry(entry);
           return null;
         }
-        owned.push(entry.group);
+        owned.push(entry);
         // The room's own centring and scaling, applied once here rather than in an
         // effect like SceneModelView's: that one has to re-run because its entry
         // arrives from a global store into a group R3F may re-parent, and this group
@@ -504,7 +532,7 @@ const ReviewModelViewer: React.FC<ReviewModelViewerProps> = ({ reviewId, classNa
           entry.group,
           entry.scale * entry.baseScale,
           entry.basePosition,
-          entry.partRegistry ?? null,
+          entry.partRegistry,
         );
         // The parts somebody pulled apart in the room's Edit mode, batch BR. Applied
         // here as well as in SceneModelView because this viewer draws the review's own
@@ -516,9 +544,7 @@ const ReviewModelViewer: React.FC<ReviewModelViewerProps> = ({ reviewId, classNa
         // Before `measure`, so the frame is composed around the model as it actually
         // stands: a part dragged out to show a clearance is exactly the part that would
         // otherwise be cut off by a box measured on the file's own geometry.
-        if (entry.partRegistry) {
-          applyPartTransforms(entry.partRegistry, entry.sceneTree.id, model.parts);
-        }
+        applyPartTransforms(entry.partRegistry, entry.sceneTree.id, model.parts);
         return { model, entry, box: measure(model, entry) };
       } catch (error) {
         console.error(`[lobby] could not load ${model.fileName} (${model.hash}):`, error);
@@ -569,7 +595,7 @@ const ReviewModelViewer: React.FC<ReviewModelViewerProps> = ({ reviewId, classNa
 
     return () => {
       cancelled = true;
-      for (const group of owned) disposeGroup(group);
+      for (const entry of owned) disposeEntry(entry);
       owned.length = 0;
     };
   }, [reviewId]);

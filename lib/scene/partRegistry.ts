@@ -282,8 +282,14 @@ function isPointedThrough(object: Object3D): boolean {
   return Boolean(object.userData?.skipRaycast) || isIgnorable(object);
 }
 
-/** An avatar, a laser beam or a point cloud: in the scene, but not the product. */
-function isIgnorable(object: Object3D): boolean {
+/**
+ * An avatar, a laser beam or a point cloud: in the scene, but not the product.
+ *
+ * Exported for lib/scene/batchedParts.ts, which walks the same chain for a hit that
+ * landed on one of the parts it left un-batched and must refuse the same objects: two
+ * answers to "is this the product" is the disagreement this file's header exists about.
+ */
+export function isIgnorable(object: Object3D): boolean {
   return Boolean(object.name?.startsWith?.('Agent')) || object.type === 'Line' || object.type === 'Points';
 }
 
@@ -397,8 +403,14 @@ export function modelBox(
   return registry ? registry.bounds(out) : out.setFromObject(group);
 }
 
-/** The names buildSceneTree gave each node, so a handle's name is the tree row's. */
-function treeNames(node: SceneNode, out: Map<string, string>): void {
+/**
+ * The names buildSceneTree gave each node, so a handle's name is the tree row's.
+ *
+ * Exported for lib/scene/batchedParts.ts, which indexes the same ids and has to answer
+ * the same name for the same part: a laser label and a pin must not read differently
+ * because the model they came from happened to be big enough to be batched.
+ */
+export function treeNames(node: SceneNode, out: Map<string, string>): void {
   out.set(node.id, node.name);
   for (const child of node.children ?? []) treeNames(child, out);
 }
@@ -420,8 +432,13 @@ function treeNames(node: SceneNode, out: Map<string, string>): void {
  * The app has one selection colour, so that is invisible; a second highlight — the laser's
  * pointer colour, say — would need this keyed on the colour as well, and the comment on
  * `of` below is where that would bite.
+ *
+ * Exported because lib/scene/batchedParts.ts draws a highlighted part through the same
+ * seam — one clone per source material, freed with the registry — and a second copy of
+ * this is exactly how the two implementations would drift apart on the one thing the
+ * audit's D1 was about.
  */
-class HighlightMaterials {
+export class HighlightMaterials {
   private readonly clones = new Map<Material, Material>();
 
   /** The glowing stand-in for `source`, built the first time it is asked for. */
@@ -600,6 +617,174 @@ const untouched = (): AppliedState => ({
 });
 
 /**
+ * The part hierarchy as DATA: every id, its nearest tagged ancestor, its tagged children,
+ * and the state last applied to it.
+ *
+ * Shared by both registries rather than copied, and it is `syncStates` that makes sharing
+ * worth the indirection. The algorithm in `sync` is the subtle half of stage 2 — diff the
+ * tree's own two booleans rather than object identity, fold in what a part inherits from
+ * above it, descend only from what moved, and stop the descent where the effective value
+ * did not — and the render audit's R9 is precisely that two copies of one resolution
+ * drift until the laser and the tree disagree about what is selected. A batched model and
+ * an un-batched one are the same model at two sizes, so they answer a state change the
+ * same way or the app behaves differently depending on how many parts a file happened to
+ * have.
+ *
+ * What it does NOT know is how a part is drawn. `sync` answers the parts whose effective
+ * value moved and hands each one to a `write` callback, which is where the two
+ * implementations differ: one sets `Object3D.visible` and swaps a material, the other sets
+ * a batch slot's visibility and raises an overlay mesh.
+ */
+export class PartGraph {
+  private readonly applied = new Map<string, AppliedState>();
+
+  /**
+   * Tagged children per id, in tree order.
+   *
+   * A DATA descent and not `object.children`, because a batched part has no object to
+   * descend into: its geometry is a range inside a buffer and its slot is a number. Both
+   * registries answer from this, which is also what makes them agree — a MeshPartRegistry
+   * walking `object.children` would visit untagged objects on the way and a batched one
+   * could not.
+   */
+  readonly childrenOf = new Map<string, string[]>();
+
+  constructor(
+    /** Every id, pre-order: the order buildSceneTree minted them in. */
+    readonly ids: readonly string[],
+    /** Nearest tagged ancestor, so what a part inherits is a walk UP and not a descent. */
+    readonly parentOf: ReadonlyMap<string, string | null>,
+  ) {
+    for (const id of ids) {
+      this.childrenOf.set(id, []);
+      this.applied.set(id, untouched());
+    }
+    for (const id of ids) {
+      const parent = parentOf.get(id) ?? null;
+      if (parent !== null) this.childrenOf.get(parent)?.push(id);
+    }
+  }
+
+  /** Whether this id is one of the graph's parts. */
+  has(id: string): boolean {
+    return this.applied.has(id);
+  }
+
+  /** The tagged ids below this one, this one excluded, in tree order. */
+  subtreeOf(id: string, out: string[] = []): string[] {
+    for (const child of this.childrenOf.get(id) ?? []) {
+      out.push(child);
+      this.subtreeOf(child, out);
+    }
+    return out;
+  }
+
+  /**
+   * What a part inherits from the ids above it, before its own value is folded in.
+   *
+   * A walk UP rather than a descent from the root, because a pass starts at whichever
+   * part changed and the root may be forty thousand parts away: depth is a handful of
+   * steps, the model is not.
+   */
+  inheritedFrom(id: string): { visible: boolean; selected: boolean } {
+    let visible = true;
+    let selected = false;
+    for (let parent = this.parentOf.get(id) ?? null; parent; parent = this.parentOf.get(parent) ?? null) {
+      const applied = this.applied.get(parent);
+      if (!applied) break;
+      visible = visible && applied.rawVisible;
+      selected = selected || applied.rawSelected;
+    }
+    return { visible, selected };
+  }
+
+  /**
+   * Diff the tree's state against what was last applied, and write the parts whose
+   * EFFECTIVE value moved. Answers how many that was.
+   *
+   * Both halves of what a state change means live here rather than in the caller, because
+   * both need the part hierarchy:
+   *
+   *   • visibility and selection inherit DOWNWARD — hiding an assembly hides every bolt
+   *     in it, and selecting one selects everything inside it. So a change to a group is
+   *     a change to its whole subtree.
+   *   • a part that was hidden on its own stays hidden when the group above it is shown
+   *     again. `setVisibleSubtree` cannot express that, and a caller that reached for it
+   *     per changed id would un-hide exactly the parts somebody had turned off.
+   *
+   * That is what makes the cost of a click proportional to the click: `selectNode`
+   * (store.ts) rewrites every entry in `objectStates` to clear the old selection, so a
+   * diff on object identity would see the whole scene as changed, while a diff on the two
+   * booleans sees the two ids that actually moved.
+   */
+  sync(
+    states: Record<string, PartState | undefined>,
+    write: (id: string, visible: boolean, selected: boolean) => void,
+  ): number {
+    // Pass 1: find the ids whose OWN value moved, and record the new value before any
+    // descent reads it — a descent folds in its ancestors, and an ancestor later in the
+    // list would otherwise be folded in with its old value.
+    const changed: string[] = [];
+    for (const id of this.ids) {
+      const applied = this.applied.get(id);
+      if (!applied) continue;
+      const state = states[id];
+      const rawVisible = state?.visible ?? true;
+      const rawSelected = state?.selected ?? false;
+      if (applied.rawVisible === rawVisible && applied.rawSelected === rawSelected) continue;
+      applied.rawVisible = rawVisible;
+      applied.rawSelected = rawSelected;
+      changed.push(id);
+    }
+
+    // Pass 2: descend from each of them. Only a changed id can change its descendants'
+    // effective value, so nothing else is visited at all.
+    let touched = 0;
+    for (const id of changed) {
+      const { visible, selected } = this.inheritedFrom(id);
+      touched += this.applyDown(id, visible, selected, write);
+    }
+    return touched;
+  }
+
+  clear(): void {
+    this.applied.clear();
+    this.childrenOf.clear();
+  }
+
+  /**
+   * Write this part and everything below it, stopping where nothing moved.
+   *
+   * Stopping is safe and is the whole of the O(changed): a subtree is only re-entered
+   * when the part above it changed, and a part whose OWN value changed is in pass 1's
+   * list and gets a descent of its own. So a node whose effective value is the same as
+   * last time can only have descendants whose effective value is also the same, unless
+   * one of them changed on its own account — and that one is already scheduled.
+   */
+  private applyDown(
+    id: string,
+    inheritedVisible: boolean,
+    inheritedSelected: boolean,
+    write: (id: string, visible: boolean, selected: boolean) => void,
+  ): number {
+    const applied = this.applied.get(id);
+    if (!applied) return 0;
+    const visible = inheritedVisible && applied.rawVisible;
+    const selected = inheritedSelected || applied.rawSelected;
+    if (applied.effVisible === visible && applied.effSelected === selected) return 0;
+    applied.effVisible = visible;
+    applied.effSelected = selected;
+    write(id, visible, selected);
+
+    let touched = 1;
+    for (const child of this.childrenOf.get(id) ?? []) {
+      touched += this.applyDown(child, visible, selected, write);
+    }
+    return touched;
+  }
+}
+
+/**
  * The registry for a model that is still drawn the way it was parsed: one Object3D per
  * part. Built once, at parse time, from the group and the tree buildSceneTree made
  * from it.
@@ -620,9 +805,8 @@ export class MeshPartRegistry implements PartRegistry {
   private readonly handles: MeshPartHandle[] = [];
   private readonly byId = new Map<string, MeshPartHandle>();
   private readonly idByObject = new Map<Object3D, string>();
-  /** Nearest tagged ancestor, so a part's inherited state can be read without a walk down. */
-  private readonly parentOf = new Map<string, string | null>();
-  private readonly applied = new Map<string, AppliedState>();
+  /** The part hierarchy as data: parents, children, and the state last applied to each. */
+  private readonly graph: PartGraph;
   private readonly highlighted = new HighlightMaterials();
   /** Written by the handles themselves, in the one place a transform can be written. */
   private readonly moved = new Set<string>();
@@ -633,6 +817,8 @@ export class MeshPartRegistry implements PartRegistry {
     this.root = root;
     const names = new Map<string, string>();
     if (tree) treeNames(tree, names);
+    const ids: string[] = [];
+    const parentOf = new Map<string, string | null>();
     root.traverse((object) => {
       const id = object.userData?.modelId;
       // buildSceneTree writes that key onto every object it keeps and prunes the
@@ -652,9 +838,10 @@ export class MeshPartRegistry implements PartRegistry {
       this.byId.set(id, handle);
       this.idByObject.set(object, id);
       // Pre-order, so every ancestor of this object has already been indexed.
-      this.parentOf.set(id, this.taggedAncestorId(object));
-      this.applied.set(id, untouched());
+      ids.push(id);
+      parentOf.set(id, this.taggedAncestorId(object));
     });
+    this.graph = new PartGraph(ids, parentOf);
   }
 
   get(id: string): PartHandle | null {
@@ -695,6 +882,16 @@ export class MeshPartRegistry implements PartRegistry {
     let current: Object3D | null = hit.object;
     while (current) {
       if (current.userData?.skipRaycast) return [];
+      // A part somebody turned off in the Model Tree is not there to point at, and this
+      // is the one place that can say so: three's Raycaster never looks at `visible` —
+      // `intersectObject` tests layers and calls `raycast`, and neither reads the flag —
+      // so hiding a mesh has never taken it out of a pick on its own. What hid a whole
+      // MODEL was React unmounting it (components/Scene/ImportedModel.tsx), which is why
+      // the invariant at the foot of that file held while this one did not. It matters
+      // more now than it did: a batched part is hidden by clearing a slot flag, which
+      // three's BatchedMesh raycast DOES honour, so without this line the same click would
+      // answer differently on either side of the batching threshold.
+      if (current.visible === false) return [];
       if (!isIgnorable(current)) {
         const id = this.idByObject.get(current);
         if (id !== undefined && !chain.includes(id)) chain.push(id);
@@ -719,34 +916,19 @@ export class MeshPartRegistry implements PartRegistry {
     });
   }
 
+  // The diff, the downward inheritance and the "a part hidden on its own stays hidden"
+  // rule all live in PartGraph, shared with the batched registry: see its comment for why
+  // one copy of this algorithm is the point.
   syncStates(
     states: Record<string, PartState | undefined>,
     highlight: EmissiveHighlight | null,
   ): number {
-    // Pass 1: find the ids whose OWN value moved, and record the new value before any
-    // descent reads it — a descent folds in its ancestors, and an ancestor later in the
-    // list would otherwise be folded in with its old value.
-    const changed: MeshPartHandle[] = [];
-    for (const handle of this.handles) {
-      const applied = this.applied.get(handle.id);
-      if (!applied) continue;
-      const state = states[handle.id];
-      const rawVisible = state?.visible ?? true;
-      const rawSelected = state?.selected ?? false;
-      if (applied.rawVisible === rawVisible && applied.rawSelected === rawSelected) continue;
-      applied.rawVisible = rawVisible;
-      applied.rawSelected = rawSelected;
-      changed.push(handle);
-    }
-
-    // Pass 2: descend from each of them. Only a changed id can change its descendants'
-    // effective value, so nothing else is visited at all.
-    let touched = 0;
-    for (const handle of changed) {
-      const { visible, selected } = this.inheritedFrom(handle.id);
-      touched += this.applyDown(handle.object, visible, selected, highlight);
-    }
-    return touched;
+    return this.graph.sync(states, (id, visible, selected) => {
+      const handle = this.byId.get(id);
+      if (!handle) return;
+      handle.setVisible(visible);
+      handle.setHighlight(selected ? highlight : null);
+    });
   }
 
   movedPartIds(): readonly string[] {
@@ -788,8 +970,7 @@ export class MeshPartRegistry implements PartRegistry {
     this.handles.length = 0;
     this.byId.clear();
     this.idByObject.clear();
-    this.parentOf.clear();
-    this.applied.clear();
+    this.graph.clear();
     this.moved.clear();
     this.highlighted.dispose();
     // Taken back out of the group it was attached to: the parsed group outlives the
@@ -820,64 +1001,5 @@ export class MeshPartRegistry implements PartRegistry {
       if (id !== undefined) return id;
     }
     return null;
-  }
-
-  /**
-   * What a part inherits from the ids above it, before its own value is folded in.
-   *
-   * A walk UP rather than a descent from the root, because a pass starts at whichever
-   * part changed and the root may be forty thousand parts away: depth is a handful of
-   * steps, the model is not.
-   */
-  private inheritedFrom(id: string): { visible: boolean; selected: boolean } {
-    let visible = true;
-    let selected = false;
-    for (let parent = this.parentOf.get(id) ?? null; parent; parent = this.parentOf.get(parent) ?? null) {
-      const applied = this.applied.get(parent);
-      if (!applied) break;
-      visible = visible && applied.rawVisible;
-      selected = selected || applied.rawSelected;
-    }
-    return { visible, selected };
-  }
-
-  /**
-   * Write this part and everything below it, stopping where nothing moved.
-   *
-   * Stopping is safe and is the whole of the O(changed): a subtree is only re-entered
-   * when the part above it changed, and a part whose OWN value changed is in pass 1's
-   * list and gets a descent of its own. So a node whose effective value is the same as
-   * last time can only have descendants whose effective value is also the same, unless
-   * one of them changed on its own account — and that one is already scheduled.
-   */
-  private applyDown(
-    object: Object3D,
-    inheritedVisible: boolean,
-    inheritedSelected: boolean,
-    highlight: EmissiveHighlight | null,
-  ): number {
-    const id = this.idByObject.get(object);
-    let visible = inheritedVisible;
-    let selected = inheritedSelected;
-    let touched = 0;
-
-    if (id !== undefined) {
-      const applied = this.applied.get(id);
-      const handle = this.byId.get(id);
-      if (!applied || !handle) return 0;
-      visible = inheritedVisible && applied.rawVisible;
-      selected = inheritedSelected || applied.rawSelected;
-      if (applied.effVisible === visible && applied.effSelected === selected) return 0;
-      applied.effVisible = visible;
-      applied.effSelected = selected;
-      handle.setVisible(visible);
-      handle.setHighlight(selected ? highlight : null);
-      touched = 1;
-    }
-
-    for (const child of object.children) {
-      touched += this.applyDown(child, visible, selected, highlight);
-    }
-    return touched;
   }
 }

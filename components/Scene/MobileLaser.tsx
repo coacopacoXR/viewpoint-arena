@@ -56,7 +56,12 @@ const MobileLaser: React.FC = () => {
 
       foundId = parts.modelId;
       hitPoint = hit.point;
-      foundMeshName = hit.object.name || null;
+      // The part's name when a registry owns it, and the object's only as the fallback for
+      // what has none — the bundled synth, whose parts are React components. See
+      // components/Scene/UserLaser.tsx, which is the near-duplicate of this walk: above
+      // BATCH_MIN_PARTS the object a ray lands on is the BatchedMesh, so its name says which
+      // batch it was and not which part was pointed at.
+      foundMeshName = parts.handle?.name || hit.object.name || null;
       // The part's readable name. `userData.partName` before, which no importer writes,
       // so the touch laser had never named a part either.
       foundPartName = parts.handle?.name ?? null;

@@ -16,6 +16,7 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/react';
 import React from 'react';
 import { Group, Vector3 } from 'three';
 import type { SceneModelEntry } from '../../../lib/scene/sceneEntries';
+import { MeshPartRegistry } from '../../../lib/scene/partRegistry';
 import type { ModelEditors, SceneModel, SceneUpdate } from '../../../lib/scene/roomScene';
 
 const { broadcastSceneUpdate, broadcastSetModelEditors } = vi.hoisted(() => ({
@@ -60,15 +61,19 @@ function sceneModel(id: string, hash: string, overrides: Partial<SceneModel> = {
 
 /** A parsed model: a root group and one part under it, both ids prefixed. */
 function entryFor(model: SceneModel, prefix: string, partName: string): SceneModelEntry {
+  const group = new Group();
   return {
     id: model.id,
-    group: new Group(),
+    group,
     sceneTree: {
       id: `${prefix}_0`,
       name: model.fileName,
       type: 'GROUP',
       children: [{ id: `${prefix}_1`, name: partName, type: 'MESH' }],
     },
+    // Required now that SceneModelEntry.partRegistry is, and empty: this fixture parses no
+    // geometry, and the Model Tree renders from the SceneNode data and never touches a part.
+    partRegistry: new MeshPartRegistry(group),
     fileName: model.fileName,
     line: model.line,
     revision: model.revision,

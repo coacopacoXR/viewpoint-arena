@@ -283,6 +283,51 @@ describe('picking', () => {
     expect(fixture.registry.partIdForHit({ object: fixture.left })).toBeNull();
   });
 
+  it('answers an empty chain for a part somebody hid, and gives it back when shown', () => {
+    // ADDED BY TASK 04b STAGE 4, which changed this behaviour on purpose. Hiding a part used
+    // to leave it answering clicks: three's Raycaster never reads `visible` — `intersectObject`
+    // tests layers and calls `raycast`, and neither looks at the flag — so `object.visible =
+    // false` took a part out of the picture and left it in the pick. What hid a whole MODEL was
+    // React unmounting it (components/Scene/ImportedModel.tsx), which is why the invariant at
+    // the foot of that file held while this one did not.
+    //
+    // It has to hold now, because a batched part is hidden by clearing a slot flag that three's
+    // BatchedMesh raycast DOES honour, and the same click would otherwise answer differently on
+    // either side of the batching threshold — the disagreement this file's header exists about.
+    const fixture = scene();
+    const leftId = fixture.registry.partIdForHit({ object: fixture.left });
+    expect(leftId).not.toBeNull();
+
+    fixture.left.visible = false;
+    expect(fixture.registry.partChainForHit({ object: fixture.left })).toEqual([]);
+    // A real ray answers more than one hit for a box — the face it entered and the face it
+    // left — and every one of them has to be refused, or SceneClickSelect's "first hit that
+    // resolves" would take the second and select a part nobody can see.
+    const resolved = cast(fixture, new THREE.Vector3(-2, 0, 5))
+      .map((hit) => hitParts(hit, [fixture.registry]).chain)
+      .filter((chain) => chain.length > 0);
+    expect(resolved).toEqual([]);
+    // The other part is untouched, which is what makes this a per-part rule and not a mute.
+    expect(fixture.registry.partIdForHit({ object: fixture.right })).not.toBeNull();
+
+    fixture.left.visible = true;
+    expect(fixture.registry.partIdForHit({ object: fixture.left })).toBe(leftId);
+  });
+
+  it('refuses a part under a group somebody hid, which is how the tree hides a subtree', () => {
+    const fixture = scene();
+    const boltId = fixture.registry.partIdForHit({ object: fixture.left });
+
+    fixture.root.visible = false;
+    // The walk goes up from the hit, so it meets the hidden group on the way and refuses
+    // there — the same answer the batched registry gives, where the group's hide reaches
+    // every slot below it.
+    expect(fixture.registry.partChainForHit({ object: fixture.left })).toEqual([]);
+
+    fixture.root.visible = true;
+    expect(fixture.registry.partIdForHit({ object: fixture.left })).toBe(boltId);
+  });
+
   it('walks up from an untagged object to the part that holds it', () => {
     const fixture = scene();
     // Nothing in a parsed model is untagged — buildSceneTree tags every object it keeps

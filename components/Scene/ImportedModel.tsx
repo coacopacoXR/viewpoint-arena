@@ -155,7 +155,7 @@ const SceneModelView: React.FC<{ model: SceneModel; entry: SceneModelEntry; labe
             groupRef.current,
             entry.scale * entry.baseScale,
             entry.basePosition,
-            entry.partRegistry ?? null,
+            entry.partRegistry,
         );
     }, [entry]);
 
@@ -180,9 +180,7 @@ const SceneModelView: React.FC<{ model: SceneModel; entry: SceneModelEntry; labe
      * the reference alone and this does not run.
      */
     useEffect(() => {
-        const registry = entry.partRegistry;
-        if (!registry) return;
-        applyPartTransforms(registry, entry.sceneTree.id, model.parts);
+        applyPartTransforms(entry.partRegistry, entry.sceneTree.id, model.parts);
     }, [entry, model.parts]);
 
     /**
@@ -199,9 +197,7 @@ const SceneModelView: React.FC<{ model: SceneModel; entry: SceneModelEntry; labe
      */
     useEffect(() => {
         if (!groupRef.current) return;
-        const registry = entry.partRegistry;
-        if (!registry) return;
-        registerPOIs(modelPointsOfInterest(registry, entry.sceneTree));
+        registerPOIs(modelPointsOfInterest(entry.partRegistry, entry.sceneTree));
     }, [registerPOIs, entry, model.parts]);
 
     /**
@@ -229,7 +225,7 @@ const SceneModelView: React.FC<{ model: SceneModel; entry: SceneModelEntry; labe
      */
     useEffect(() => {
         if (!groupRef.current) return;
-        entry.partRegistry?.syncStates(objectStates, SELECTION_HIGHLIGHT);
+        entry.partRegistry.syncStates(objectStates, SELECTION_HIGHLIGHT);
     }, [objectStates, entry]);
 
     // Above the model, in scene units: the geometry is scaled inside the group,

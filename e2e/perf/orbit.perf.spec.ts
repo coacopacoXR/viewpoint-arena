@@ -74,6 +74,20 @@ const VIEWPORT = { width: 1600, height: 900 };
  */
 const MODEL_VISIBLE_TRIANGLES = 1000;
 
+/**
+ * How many draw calls one orbiting frame may cost, at any fixture size.
+ *
+ * Chosen before the batched run was measured, from what the model should cost rather than
+ * from what it did cost: task 04b stage 4 draws a model above BATCH_MIN_PARTS as one
+ * BatchedMesh per material, and scripts/perf/make-assembly.mjs gives its parts six
+ * finishes, so the product is a handful of calls and the rest is the room's own. Two
+ * hundred leaves room for every material to differ, for the parts batching has to refuse,
+ * and for the scene — and it still fails the pre-batching baseline (3 202 calls at 3 200
+ * parts, 10 002 at 10 000) by more than an order of magnitude, which is the regression it
+ * is here to catch.
+ */
+const DRAW_CALL_BUDGET = 200;
+
 const fixturePath = (parts: number) => join(FIXTURE_DIR, `assembly-${parts}.glb`);
 
 const git = (args: string[]): string => {
@@ -380,12 +394,22 @@ test.describe("orbit a large assembly", () => {
           `[perf]   → ${resultsFile}\n`,
       );
 
-      // What makes this fixture the right thing to measure: every part is its own
-      // mesh with its own geometry, so nothing is shared and nothing is batched.
-      // Checked on the geometry count rather than the draw-call count, because
-      // frustum culling legitimately hides parts from an orbit while it cannot
-      // hide their geometries from the renderer's memory.
-      expect(result.geometries).toBeGreaterThanOrEqual(parts);
+      // CHANGED BY TASK 04b STAGE 4, and the change is the point of the task rather than a
+      // convenience. This asserted `geometries >= parts` — "every part is its own mesh with
+      // its own geometry, so nothing is shared and nothing is batched" — which was a check
+      // that the fixture was a fair thing to measure. Batching is what stage 4 adds, so that
+      // is now exactly what must NOT hold: a model above BATCH_MIN_PARTS is drawn as one
+      // BatchedMesh per material, its source geometries are merged into a few buffers and
+      // freed, and `geometries` collapses towards the batch count. The baseline this replaced
+      // is recorded in perf/results/2026-10-15-8481b9b.json — 10 013 geometries at 10 000
+      // parts, one per part plus the room's own.
+      //
+      // What replaces it is the assertion the fixture was always really for: that a big
+      // assembly costs a big-model NUMBER of draw calls and not one per part. Still read off
+      // the renderer rather than off anything the app knows about itself, so it fails if
+      // batching silently stops happening — and unlike a geometry count it cannot be satisfied
+      // by frustum culling, which legitimately hides parts from an orbit.
+      expect(result.drawCalls).toBeLessThan(DRAW_CALL_BUDGET);
       expect(result.triangles).toBeGreaterThan(MODEL_VISIBLE_TRIANGLES);
     });
   }

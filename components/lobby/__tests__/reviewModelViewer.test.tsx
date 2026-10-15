@@ -39,6 +39,7 @@ import type { ModelRevision } from '../../../lib/reviews/revisionsRepo';
 import type { StoredPlacement } from '../../../lib/scene/placement';
 import type { RoomScene, SceneModel } from '../../../lib/scene/roomScene';
 import type { SceneModelEntry } from '../../../lib/scene/sceneEntries';
+import { MeshPartRegistry } from '../../../lib/scene/partRegistry';
 
 // ─── Stubs ──────────────────────────────────────────────────────────────────
 
@@ -246,10 +247,17 @@ function parsedEntry(model: SceneModel) {
   const group = new THREE.Group();
   group.add(new THREE.Mesh(geometry, material));
 
+  // Real, and required now that SceneModelEntry's registry is: the viewer places and
+  // measures through it and frees it in its teardown, which is what the dispose tests below
+  // are about. Empty, because this fixture stamps no `userData.modelId` — so `bounds` answers
+  // `Box3.setFromObject(group)`, the same box the viewer measured before a registry was
+  // mandatory.
+  const partRegistry = new MeshPartRegistry(group);
   const entry: SceneModelEntry = {
     id: model.id,
     group,
     sceneTree: { id: `${model.id}_0`, name: model.fileName, type: 'MESH', children: [] },
+    partRegistry,
     fileName: model.fileName,
     line: model.line,
     revision: model.revision,
@@ -263,6 +271,7 @@ function parsedEntry(model: SceneModel) {
     entry,
     geometryDispose: vi.spyOn(geometry, 'dispose'),
     materialDispose: vi.spyOn(material, 'dispose'),
+    registryDispose: vi.spyOn(partRegistry, 'dispose'),
   };
 }
 
@@ -519,11 +528,17 @@ describe('ReviewModelViewer — the lobby looking inside a design review', () =>
     expect(parsed).toHaveLength(1);
     expect(parsed[0].geometryDispose).not.toHaveBeenCalled();
     expect(parsed[0].materialDispose).not.toHaveBeenCalled();
+    expect(parsed[0].registryDispose).not.toHaveBeenCalled();
 
     view.unmount();
 
     expect(parsed[0].geometryDispose).toHaveBeenCalledTimes(1);
     expect(parsed[0].materialDispose).toHaveBeenCalledTimes(1);
+    // The registry as well as the graph, and first: a model big enough to be batched keeps
+    // its merged buffers and its instance-matrix texture in the registry, and three frees
+    // neither on a dropped reference. The lobby mounts a viewer per review, so a session
+    // spent scrolling it would otherwise hold every model it looked at (the audit's R10).
+    expect(parsed[0].registryDispose).toHaveBeenCalledTimes(1);
   });
 
   it("frees the first review's models when the panel is pointed at another", async () => {
@@ -535,8 +550,10 @@ describe('ReviewModelViewer — the lobby looking inside a design review', () =>
 
     expect(parsed[0].geometryDispose).toHaveBeenCalledTimes(1);
     expect(parsed[0].materialDispose).toHaveBeenCalledTimes(1);
+    expect(parsed[0].registryDispose).toHaveBeenCalledTimes(1);
     // The review now on screen keeps its own.
     expect(parsed[1].geometryDispose).not.toHaveBeenCalled();
+    expect(parsed[1].registryDispose).not.toHaveBeenCalled();
   });
 
   it('drops a parse that lands after the panel has gone, and frees it', async () => {
@@ -559,6 +576,7 @@ describe('ReviewModelViewer — the lobby looking inside a design review', () =>
 
     await waitFor(() => expect(parsed[0].geometryDispose).toHaveBeenCalledTimes(1));
     expect(parsed[0].materialDispose).toHaveBeenCalledTimes(1);
+    expect(parsed[0].registryDispose).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId('r3f-canvas')).toBeNull();
   });
 

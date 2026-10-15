@@ -12,7 +12,8 @@
 import type { Vector3, Group } from 'three';
 import type { SceneNode } from '../../types';
 import { parseModelFile, type ModelImportResult } from '../../utils/modelLoader';
-import { MeshPartRegistry, type PartRegistry } from './partRegistry';
+import { partRegistryFor } from './batchedParts';
+import type { PartRegistry } from './partRegistry';
 import { sceneModelPrefix, type SceneModel } from './roomScene';
 
 export interface SceneModelEntry {
@@ -22,19 +23,22 @@ export interface SceneModelEntry {
   /** Its tree, with node ids prefixed so they cannot collide with another model's. */
   sceneTree: SceneNode;
   /**
-   * Its parts, addressed by the same node ids the tree uses — the seam that lets the
-   * renderer stop being one Object3D per part (lib/scene/partRegistry.ts).
+   * Its parts, addressed by the same node ids the tree uses — the seam that lets the renderer
+   * stop being one Object3D per part (lib/scene/partRegistry.ts).
    *
-   * OPTIONAL, and only because the parse is not the only way to get an entry: tests
-   * hand-build one around a bare Group to exercise a component that never looks at a
-   * part, and making the field required would have nine of them fabricate a registry
-   * for nothing. `sceneModelEntry` below always fills it, and a missing one is safe
-   * rather than silently wrong: `hitParts` falls back to reading the ids off the tagged
-   * objects and `modelBox` to measuring the group, both of which are exactly what a
-   * MeshPartRegistry indexes. Stage 4 is where the fallbacks stop being able to answer
-   * for a batched model, and where this becomes required.
+   * REQUIRED as of task 04b stage 4, which is the stage the fallbacks stopped being able to
+   * answer: `hitParts` reading ids off tagged objects and `modelBox` measuring the group are
+   * both exactly right for a model drawn the way it was parsed and both exactly wrong for one
+   * drawn as batches, where the tags have been pruned out of the graph and the group's
+   * geometry is a merged buffer in the batch's own space. Every construction path builds one
+   * — `sceneModelEntry` below is the only producer in the app — so a missing registry is now
+   * a compile error rather than a silently unaddressable model.
+   *
+   * It OWNS GPU buffers once the model is big enough to be batched, so it has to be disposed
+   * with the entry: see store.ts's `pruneEntriesToScene` and `upsertSceneModel`, and
+   * components/lobby/ReviewModelViewer's teardown.
    */
-  partRegistry?: PartRegistry;
+  partRegistry: PartRegistry;
   fileName: string;
   line: string;
   revision: string;
@@ -74,7 +78,11 @@ export function sceneModelEntry(
     // Model Tree's row shows rather than whatever the file left on the Object3D, which
     // is often nothing: collapseSingleChildGroups promotes a wrapped mesh and gives it
     // the wrapper's name in the tree only.
-    partRegistry: new MeshPartRegistry(parsed.root, parsed.sceneTree),
+    //
+    // Which of the two implementations it is comes from the part count, not from here:
+    // a model big enough to be worth merging is drawn as batches and everything else is
+    // drawn the way it was parsed. See lib/scene/batchedParts.ts's BATCH_MIN_PARTS.
+    partRegistry: partRegistryFor(parsed.root, parsed.sceneTree),
     // The name the file was parsed under, which is the name the loader gave it
     // and the one utils/modelLoader.ts dispatched on — not whatever the scene
     // happens to call it.

@@ -33,6 +33,7 @@ import {
   type SceneModel,
 } from '../../../lib/scene/roomScene';
 import type { SceneModelEntry } from '../../../lib/scene/sceneEntries';
+import { MeshPartRegistry } from '../../../lib/scene/partRegistry';
 import type { SceneNode, ObjectState } from '../../../types';
 
 const { presenceMock } = vi.hoisted(() => ({
@@ -85,9 +86,10 @@ function model(parts?: PartTransforms): SceneModel {
 }
 
 function entry(): SceneModelEntry {
+  const group = new THREE.Group();
   return {
     id: MODEL_ID,
-    group: new THREE.Group(),
+    group,
     sceneTree: {
       id: ROOT,
       name: 'bracket.step',
@@ -97,6 +99,10 @@ function entry(): SceneModelEntry {
         { id: BOLT, name: 'M8 bolt', type: 'MESH' },
       ],
     },
+    // Required now that SceneModelEntry.partRegistry is, and empty: this fixture parses no
+    // geometry, so `registry.get(FLANGE)` answers null and the gizmo stays off — which is
+    // what an undefined registry answered before, by a different route.
+    partRegistry: new MeshPartRegistry(group),
     fileName: 'bracket.step',
     line: 'bracket',
     revision: 'A',

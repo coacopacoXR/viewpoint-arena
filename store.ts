@@ -444,6 +444,30 @@ function pruneToScene<T>(record: Record<string, T>, scene: RoomScene): Record<st
 }
 
 /**
+ * The same prune, for the one record whose values own something on the GPU.
+ *
+ * A separate function rather than a hook on `pruneToScene`, because that one is shared with
+ * three records of plain data — a Group, and two booleans — and none of them has anything to
+ * free. An entry's part registry does: a model big enough to be drawn as batches keeps its
+ * merged vertex and index buffers, its instance-matrix texture and its highlight clones until
+ * somebody calls `dispose`, and three frees none of that on a dropped reference.
+ *
+ * This is the render audit's R10. The room prunes its entries on every scene update, so a
+ * model the room removes would otherwise hold its buffers for the life of the page, and a
+ * session spent swapping revisions would accumulate one batched model per swap.
+ */
+function pruneEntriesToScene(
+    record: Record<string, SceneModelEntry>,
+    scene: RoomScene,
+): Record<string, SceneModelEntry> {
+    const next = pruneToScene(record, scene);
+    for (const id of Object.keys(record)) {
+        if (next[id] === undefined) record[id].partRegistry.dispose();
+    }
+    return next;
+}
+
+/**
  * The four fields that follow from the scene: which model type the app is in,
  * the combined tree, and the node states and agent targets derived from it.
  */
@@ -483,7 +507,11 @@ function derivedFromScene(
  * step with everybody else's.
  */
 function adoptScene(scene: RoomScene, state: AppState, fresh: boolean): Partial<AppState> {
-    const entries = pruneToScene(state.sceneEntries, scene);
+    // Not just a prune: the entries being dropped own their registries' GPU buffers, and this
+    // is the only moment anybody knows which ones are going. A side effect inside a `set`
+    // updater, which is normally a smell — here it is the alternative to threading the dropped
+    // ids back out through three callers that each have their own reason to prune.
+    const entries = pruneEntriesToScene(state.sceneEntries, scene);
     const last = scene.models[scene.models.length - 1];
     // Keep pointing at whatever the scale slider was on while it is still in the
     // scene, so a model arriving does not move the slider somebody is dragging.
@@ -1343,6 +1371,14 @@ export const useStore = create<AppState>((set, get) => ({
       // measure it, and the loader parses whatever the scene says is missing.
       // Keep the scale the user dialled in rather than resetting it under them.
       const merged: SceneModelEntry = previous ? { ...entry, scale: previous.scale } : entry;
+      // The entry this one replaces is dropped as surely as a pruned one is, and its registry
+      // owns the same buffers: a re-parse of a model already in the scene builds a second set
+      // of batches and leaves the first with nothing pointing at it. The identity check is
+      // what keeps an upsert of the entry already there — which `merged` is when there was no
+      // previous — from disposing the registry it is about to publish.
+      if (previous && previous.partRegistry !== merged.partRegistry) {
+          previous.partRegistry.dispose();
+      }
       const entries = { ...state.sceneEntries, [entry.id]: merged };
       return {
           sceneEntries: entries,
@@ -1352,7 +1388,7 @@ export const useStore = create<AppState>((set, get) => ({
   }),
 
   pruneSceneEntries: () => set((state) => {
-      const entries = pruneToScene(state.sceneEntries, state.scene);
+      const entries = pruneEntriesToScene(state.sceneEntries, state.scene);
       if (Object.keys(entries).length === Object.keys(state.sceneEntries).length) return state;
       return { sceneEntries: entries, ...derivedFromScene(state.scene, state, entries, false) };
   }),

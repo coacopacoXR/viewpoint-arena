@@ -31,6 +31,7 @@ import {
   type SceneModel,
 } from '../../../lib/scene/roomScene';
 import type { SceneModelEntry } from '../../../lib/scene/sceneEntries';
+import { MeshPartRegistry } from '../../../lib/scene/partRegistry';
 import type { SceneNode, ObjectState } from '../../../types';
 
 const { presenceMock, noop } = vi.hoisted(() => ({
@@ -140,9 +141,10 @@ function model(parts?: PartTransforms): SceneModel {
 }
 
 function entry(): SceneModelEntry {
+  const group = new THREE.Group();
   return {
     id: MODEL_ID,
-    group: new THREE.Group(),
+    group,
     sceneTree: {
       id: ROOT,
       name: 'gear.step',
@@ -152,6 +154,9 @@ function entry(): SceneModelEntry {
         { id: HINGE, name: LONG_NAME, type: 'MESH' },
       ],
     },
+    // Required now that SceneModelEntry.partRegistry is, and empty: this fixture parses no
+    // geometry, and the strip reads the tree and the wire rather than ever addressing a part.
+    partRegistry: new MeshPartRegistry(group),
     fileName: 'gear.step',
     line: 'gear',
     revision: 'A',

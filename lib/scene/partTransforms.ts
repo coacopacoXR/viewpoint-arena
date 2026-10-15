@@ -13,25 +13,30 @@
 // nothing the second time, a client that missed one SCENE_STATE converges on the
 // next one, and "Reset part" is a delete rather than an arithmetic inverse.
 //
-// Replacing rather than adding needs the ORIGINAL to compare against, and the
-// original is only knowable before anything has moved the node — so it is stamped
-// into `userData` the first time this module is about to touch that node, and read
-// from there for ever after. Stamped lazily rather than for every node of every
-// model because a STEP assembly can have tens of thousands of them and at most
-// MAX_SCENE_PARTS of them can ever be overridden.
+// Replacing rather than adding needs the ORIGINAL to compare against, and the original
+// is only knowable before anything has moved the part. That used to be a `userData` stamp
+// this module wrote lazily onto whichever Object3D it was about to move, with the gizmo
+// having to remember to ask for it at pointer-down rather than at pointer-up. Task 04b
+// moved it into the part handle, where the write path itself takes it and no caller can
+// forget (`PartHandle.bindPose`), and with it went the walk that found the objects: the
+// registry indexes them by id. What is left here is the rule, the guard on a scale dragged
+// through zero, and the resolution of the one selection into a part.
 
 import type { Object3D } from 'three';
+import type { PartRegistry } from './partRegistry';
 import {
   sceneModelForNode,
-  type PartTransform,
   type PartTransforms,
   type SceneModel,
 } from './roomScene';
 
-/** Where the file's own local transform is kept once something has overridden it. */
-const ORIGINAL_KEY = 'originalLocalTransform';
-
-/** Three numbers per field, as plain arrays: it lives in userData, not in a class. */
+/**
+ * A part's own local transform, as three triples of plain numbers.
+ *
+ * The shape `PartTransform` carries on the wire, so the two convert by copying rather
+ * than by translating — which is what makes an override readable straight off a dragged
+ * gizmo and writable straight back onto a part.
+ */
 export interface StoredLocalTransform {
   position: [number, number, number];
   rotation: [number, number, number];
@@ -44,23 +49,6 @@ function readLocal(object: Object3D): StoredLocalTransform {
     rotation: [object.rotation.x, object.rotation.y, object.rotation.z],
     scale: [object.scale.x, object.scale.y, object.scale.z],
   };
-}
-
-/**
- * The transform this node's FILE gave it, remembered the first time it is asked for.
- *
- * Called by applyPartTransforms before it overwrites anything, and by the gizmo on
- * pointer-down — which is the moment that matters, because TransformControls moves
- * the object on the pointer-move that follows, and an original captured after that
- * would be the dragged value and "Reset part" would put the node where the drag
- * happened to end.
- */
-export function rememberOriginalLocalTransform(object: Object3D): StoredLocalTransform {
-  const stored = object.userData[ORIGINAL_KEY] as StoredLocalTransform | undefined;
-  if (stored) return stored;
-  const original = readLocal(object);
-  object.userData[ORIGINAL_KEY] = original;
-  return original;
 }
 
 /**
@@ -84,64 +72,82 @@ export function usablePartScale(
 }
 
 /** What the gizmo writes after a drag: this node's local transform, all three fields. */
-export function partTransformFromObject(object: Object3D): PartTransform {
+export function partTransformFromObject(object: Object3D): StoredLocalTransform {
   return readLocal(object);
 }
 
-function sameNumbers(
-  object: { x: number; y: number; z: number },
+function sameTriple(
+  current: readonly [number, number, number],
   next: readonly [number, number, number],
 ): boolean {
-  return object.x === next[0] && object.y === next[1] && object.z === next[2];
+  return current[0] === next[0] && current[1] === next[1] && current[2] === next[2];
+}
+
+function sameTransform(current: StoredLocalTransform, next: StoredLocalTransform): boolean {
+  return sameTriple(current.position, next.position)
+    && sameTriple(current.rotation, next.rotation)
+    && sameTriple(current.scale, next.scale);
 }
 
 /**
- * Put every override in `parts` onto the node it names, and put every node that no
+ * Put every override in `parts` onto the part it names, and put every part that no
  * longer has one back where its file had it.
  *
- * Idempotent and total: a node with no override and no remembered original is left
- * completely alone, which is why a model nobody has moved a part of costs one
- * traverse and no writes. `root` itself is skipped, because the root IS the whole
- * model — placeImportedGroup owns its local transform (it is the centring and the
- * baseScale), the model's own offset/rotation/scale sit on the wrapper above it, and
- * an override on it would be a third opinion about the same object.
- */
-export function applyPartTransforms(root: Object3D, parts: PartTransforms | undefined): void {
-  const overrides = parts ?? {};
-  root.traverse((object) => {
-    if (object === root) return;
-    const nodeId = object.userData.modelId as string | undefined;
-    if (typeof nodeId !== 'string') return;
-    const override = overrides[nodeId];
-    const remembered = object.userData[ORIGINAL_KEY] as StoredLocalTransform | undefined;
-    // Neither moved nor moveable-back: nothing to do, and nothing to remember.
-    if (!override && !remembered) return;
-    const original = remembered ?? rememberOriginalLocalTransform(object);
-    const position = override?.position ?? original.position;
-    const rotation = override?.rotation ?? original.rotation;
-    const scale = override ? usablePartScale(override.scale ?? original.scale, original.scale) : original.scale;
-    if (!sameNumbers(object.position, position)) object.position.set(position[0], position[1], position[2]);
-    if (!sameNumbers(object.rotation, rotation)) object.rotation.set(rotation[0], rotation[1], rotation[2]);
-    if (!sameNumbers(object.scale, scale)) object.scale.set(scale[0], scale[1], scale[2]);
-  });
-}
-
-/**
- * The object a node id names inside one model's parsed group, or null.
+ * Idempotent and total, which is THE ONE RULE above: the same override applied twice is
+ * the same pose, so a SCENE_STATE echo landing mid-drag cannot move the part a second
+ * time, and "Reset part" is a delete rather than an arithmetic inverse.
  *
- * A walk rather than a lookup because the parsed group is the only index there is:
- * the tree the store holds (SceneModelEntry.sceneTree) is data describing these
- * objects, and it is the objects that TransformControls needs. Node ids are unique
- * within one model — buildSceneTree mints them from a counter — so the first match
- * is the only match.
+ * A part with no override that has never been moved is left completely alone, and the
+ * index that says which parts those are belongs to the registry — so a model nobody has
+ * moved a part of costs one empty pass and no writes at all. That is the change from the
+ * traverse this replaced, which walked every node of the model on every `model.parts`
+ * change to find the handful the wire allows an override for.
+ *
+ * `rootId` is skipped, because the root IS the whole model — placeImportedGroup owns its
+ * local transform (it is the centring and the baseScale), the model's own
+ * offset/rotation/scale sit on the wrapper above it, and an override on it would be a
+ * third opinion about the same object. It is a parameter rather than something the
+ * registry answers because the rule is this module's, and because the root's local
+ * transform is the one a bind pose cannot describe: by the time anything asks, placement
+ * has already written to it.
  */
-export function findPartNode(root: Object3D, nodeId: string): Object3D | null {
-  let found: Object3D | null = null;
-  root.traverse((object) => {
-    if (found || object === root) return;
-    if ((object.userData.modelId as string | undefined) === nodeId) found = object;
-  });
-  return found;
+export function applyPartTransforms(
+  registry: PartRegistry,
+  rootId: string,
+  parts: PartTransforms | undefined,
+): void {
+  const overrides = parts ?? {};
+
+  // Back to the file's own transform first. A part whose override was deleted — "Reset
+  // part", an undo, a review whose stored placements never had one — has nothing in
+  // `overrides` to be found by, and `movedPartIds` is the only index of which parts are
+  // standing somewhere other than where their file put them.
+  for (const id of registry.movedPartIds()) {
+    if (id === rootId || overrides[id]) continue;
+    const handle = registry.get(id);
+    if (!handle) continue;
+    const bind = handle.bindPose();
+    if (sameTransform(handle.getLocalTransform(), bind)) continue;
+    handle.setLocalTransform(bind);
+  }
+
+  for (const id of Object.keys(overrides)) {
+    if (id === rootId) continue;
+    const handle = registry.get(id);
+    if (!handle) continue;
+    const override = overrides[id];
+    const bind = handle.bindPose();
+    const next: StoredLocalTransform = {
+      position: override.position ?? bind.position,
+      rotation: override.rotation ?? bind.rotation,
+      // Kept per axis: drei's scale gizmo can be dragged through zero and out the other
+      // side, the wire refuses the result, and falling back to the file's own number on
+      // that one axis keeps the other two — which is what the drag was about.
+      scale: usablePartScale(override.scale ?? bind.scale, bind.scale),
+    };
+    if (sameTransform(handle.getLocalTransform(), next)) continue;
+    handle.setLocalTransform(next);
+  }
 }
 
 // ─── Which part the gizmo is pointing at ─────────────────────────────────────

@@ -36,6 +36,9 @@ const wire = vi.hoisted(() => ({
   reviewConfigs: [] as ReviewDraft[],
 }));
 
+// useFrame needs a Canvas, and nothing this file asserts runs per frame.
+vi.mock('@react-three/fiber', () => ({ useFrame: () => {} }));
+
 vi.mock('@react-three/drei', () => ({
   TransformControls: (props: CapturedGizmo) => {
     gizmo.current = props;

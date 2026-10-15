@@ -2,10 +2,12 @@ import React, { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { Html } from '@react-three/drei';
 import { useStore, sceneModelVisible, type SceneModelEntry } from '../../store';
+import type { PointOfInterest, SceneNode } from '../../types';
 import type { SceneModel } from '../../lib/scene/roomScene';
 import { sceneModelTransform } from '../../lib/scene/roomScene';
 import { applyPartTransforms } from '../../lib/scene/partTransforms';
 import { modelBox, type PartRegistry } from '../../lib/scene/partRegistry';
+import { DEFAULT_MAX_COMPONENTS } from '../../lib/componentIndex';
 
 /**
  * The selection glow for an imported model, as one object rather than per-mesh values.
@@ -50,6 +52,72 @@ export function placeImportedGroup(
 }
 
 /**
+ * The ids the Model Tree lists as PARTS of a model, in tree order.
+ *
+ * The same test `countParts` (store.ts) makes, and the same set the mesh walk this replaces
+ * produced: buildSceneTree writes `type: 'MESH'` for exactly the objects that ARE a
+ * THREE.Mesh and 'GROUP' for everything else, so "is a part" and "has geometry of its own"
+ * are one question. Filtering matters because a group's box is the union of everything
+ * inside it, and a cap that ranked the registry's own `parts()` by volume would have
+ * answered the model's root first and every sub-assembly after it — 200 containers for an
+ * agent to stand and look at the middle of, and not one fastener.
+ */
+function partIdsOf(node: SceneNode, out: string[] = []): string[] {
+    if (node.type === 'PART' || node.type === 'MESH') out.push(node.id);
+    for (const child of node.children ?? []) partIdsOf(child, out);
+    return out;
+}
+
+/**
+ * The places inside a model an agent can be sent to inspect, one per part.
+ *
+ * Measured through the registry rather than by walking the parsed group, because
+ * `Box3.setFromObject` over a hierarchy is the measurement that stops existing once a part
+ * is a slot in a batch (the render audit's R1) and a handle's box is the same answer either
+ * way. Called AFTER applyPartTransforms — see the ordering contract on the effect below —
+ * so a part somebody pulled out to show a clearance is aimed at where it now stands.
+ *
+ * CAPPED, and by volume rather than by tree order, which is the other half of D3. A
+ * 40 000-part assembly has 40 000 places to stand, and the app already decided how many
+ * components it is willing to reason about at once when it capped the extraction prompt at
+ * DEFAULT_MAX_COMPONENTS, so the same number is used here. Largest first because size is
+ * the only signal available at parse time that correlates with "the part somebody means
+ * when they say the product": the housing and the base plate before the 3 000 identical
+ * washers. A cap in tree order would have kept whichever branch the exporter wrote first.
+ *
+ * Under the cap nothing is sorted and nothing is dropped, so the list comes out in tree
+ * order and is exactly the list the mesh walk produced.
+ */
+export function modelPointsOfInterest(
+    registry: PartRegistry,
+    tree: SceneNode,
+    max: number = DEFAULT_MAX_COMPONENTS,
+): PointOfInterest[] {
+    const box = new THREE.Box3();
+    const size = new THREE.Vector3();
+    const measured: Array<{ volume: number; poi: PointOfInterest }> = [];
+    for (const id of partIdsOf(tree)) {
+        const part = registry.get(id);
+        if (!part) continue;
+        part.getBoundingBox(box);
+        box.getSize(size);
+        measured.push({
+            volume: size.x * size.y * size.z,
+            poi: {
+                id,
+                // An empty box answers the origin, which is what the mesh walk answered for
+                // a part with no geometry in it either.
+                position: box.getCenter(new THREE.Vector3()),
+                label: part.name || id,
+                type: 'GENERAL',
+            },
+        });
+    }
+    if (measured.length > max) measured.sort((a, b) => b.volume - a.volume);
+    return measured.slice(0, max).map((one) => one.poi);
+}
+
+/**
  * One model of the scene, at its offset.
  *
  * Its own component rather than a loop body because each one carries three
@@ -65,7 +133,7 @@ const SceneModelView: React.FC<{ model: SceneModel; entry: SceneModelEntry; labe
     label,
 }) => {
     const objectStates = useStore(state => state.objectStates);
-    const registerPOI = useStore(state => state.registerPOI);
+    const registerPOIs = useStore(state => state.registerPOIs);
     const registerSceneModelGroup = useStore(state => state.registerSceneModelGroup);
     const groupRef = useRef<THREE.Group>(null);
     // The wrapper, which is the object carrying this model's own transform and
@@ -73,7 +141,6 @@ const SceneModelView: React.FC<{ model: SceneModel; entry: SceneModelEntry; labe
     // gizmo — a sibling of this component inside the canvas, with no prop path to
     // it — can find it by model id.
     const wrapperRef = useRef<THREE.Group>(null);
-    const registeredIds = useRef<Set<string>>(new Set());
 
     useEffect(() => {
         const group = wrapperRef.current;
@@ -95,42 +162,47 @@ const SceneModelView: React.FC<{ model: SceneModel; entry: SceneModelEntry; labe
     /**
      * The parts of this model somebody moved on their own — batch BR.
      *
-     * Declared AFTER the placement above and BEFORE the point-of-interest walk below,
-     * and the order is the whole of the contract: placement scales and centres the
+     * Declared AFTER the placement above and BEFORE the point-of-interest registration
+     * below, and the order is the whole of the contract: placement scales and centres the
      * group and computes where the floor is from the geometry as the FILE has it, so
      * a moved part must not change that (pulling one flange out would otherwise slide
      * the whole product sideways); and the POIs are world-space centres the agents and
      * the laser aim at, so they have to be measured after the parts have moved or the
      * laser would point at where a part used to be.
      *
+     * Through the registry, which is the index of parts by id — a traverse over the parsed
+     * group is the cost this exists to remove, and a batched part has no object to find.
+     * The root id is handed over rather than read off the group because the root is the one
+     * part an override must never move: see applyPartTransforms.
+     *
      * `model.parts` is a fresh object only when the reducer actually changed it, which
      * is what makes this effect cheap: a SCENE_STATE relayed for something else leaves
      * the reference alone and this does not run.
      */
     useEffect(() => {
-        applyPartTransforms(entry.group, model.parts);
+        const registry = entry.partRegistry;
+        if (!registry) return;
+        applyPartTransforms(registry, entry.sceneTree.id, model.parts);
     }, [entry, model.parts]);
 
+    /**
+     * Where an agent can be sent to look inside this model — one store write, not one per
+     * part.
+     *
+     * This used to traverse the group and call `registerPOI` for every mesh in it, and
+     * `registerPOI` is one zustand `set()` per call: a 40 000-part STEP therefore performed
+     * 40 000 writes and re-rendered every POI subscriber 40 000 times, per model, on every
+     * change to the model's moved parts. That is the render audit's D3, and it is
+     * independent of batching — arguably worse than the draw-call problem 04b exists for.
+     * The list is measured first and written once, and it is capped: see
+     * modelPointsOfInterest.
+     */
     useEffect(() => {
         if (!groupRef.current) return;
-        registeredIds.current.clear();
-
-        groupRef.current.traverse(child => {
-            if (child instanceof THREE.Mesh) {
-                const id = child.userData.modelId as string | undefined;
-                if (!id || registeredIds.current.has(id)) return;
-                const box = new THREE.Box3().setFromObject(child);
-                const center = box.getCenter(new THREE.Vector3());
-                registerPOI({
-                    id,
-                    position: center,
-                    label: child.name || id,
-                    type: 'GENERAL'
-                });
-                registeredIds.current.add(id);
-            }
-        });
-    }, [registerPOI, entry, model.parts]);
+        const registry = entry.partRegistry;
+        if (!registry) return;
+        registerPOIs(modelPointsOfInterest(registry, entry.sceneTree));
+    }, [registerPOIs, entry, model.parts]);
 
     /**
      * Node visibility and the selection glow, as writes to the parts whose state moved.

@@ -22,9 +22,8 @@
 // onto the interface now, while the answer is still the object they used to walk, so
 // that the batching commit is a renderer change and not a nine-site picking change.
 //
-// Stage 1 wired up picking. `getMatrix`/`setMatrix` and the transform half of a handle
-// are implemented but not yet called: they are the seam stage 3 hangs off, and building
-// them here is what keeps that stage to its own consumers.
+// Stage 1 wired up picking, and built the transform half of a handle for the stage that
+// would call it.
 //
 // STAGE 2 hangs three more off it. `bounds`/`visibleBounds` replace every
 // `Box3().setFromObject(group)` that runs AFTER the parse, which is the audit's R1: a
@@ -36,14 +35,26 @@
 // file's material, which is the fix for the audit's D1 — the glow used to be written
 // onto a Material, and materials are shared, so selecting one bolt of an assembly whose
 // 400 bolts share one lit all 400.
+//
+// STAGE 3 hands the transform half over. `bindPose` is the transform the FILE gave a
+// part, and it replaces the `userData.originalLocalTransform` stamp
+// lib/scene/partTransforms.ts used to write lazily onto whichever Object3D it was about
+// to move: an override REPLACES the file's transform rather than adding to it, so the
+// file's own numbers have to be knowable after the part has moved, and the only safe
+// moment to take them is the moment before something writes. That moment is now inside
+// the handle's own write path, so no caller has to remember it — the gizmo used to have
+// to stamp at pointer-down and not at pointer-up, and getting the moment wrong made
+// "Reset part" put a part where the drag happened to end. `movedPartIds` is the index
+// that makes resetting O(moved) rather than O(parts), and `gizmoProxyFor` answers the
+// one Object3D drei's TransformControls still needs, in the frame a PartTransform is in.
 
 import {
   Box3,
   Matrix4,
+  Object3D,
   type Intersection,
   type Material,
   type Mesh,
-  type Object3D,
 } from 'three';
 import type { SceneNode } from '../../types';
 import { highlightClone, setEmissiveHighlight, type EmissiveHighlight } from './materialHighlight';
@@ -77,6 +88,23 @@ export interface PartHandle {
   /** The three fields the gizmo writes to the wire, in the shape it writes them. */
   getLocalTransform(): StoredLocalTransform;
   setLocalTransform(transform: StoredLocalTransform): void;
+  /**
+   * The transform the FILE gave this part, in the same space `getLocalTransform` answers
+   * in. A copy, so nothing can write through it.
+   *
+   * The number an override is measured against and the one "Reset part" restores. An
+   * override REPLACES the file's transform rather than adding to it (the ONE RULE at the
+   * head of lib/scene/partTransforms.ts), which is only possible if the file's own numbers
+   * survive the part being moved — and only correct if they were taken BEFORE it was.
+   * Every write through a handle takes them first, so no caller has to know that.
+   *
+   * For a part nothing has written yet this is the same answer as `getLocalTransform`,
+   * which is exactly right: a part that has never been moved is still standing where its
+   * file put it. The one exception is a model's own root, whose local transform belongs to
+   * `placeImportedGroup` — it is the centring and the baseScale — and which
+   * `applyPartTransforms` therefore never writes to and never reads a bind pose from.
+   */
+  bindPose(): StoredLocalTransform;
   setVisible(visible: boolean): void;
   /**
    * The selection glow, or null to give the part back its own emissive.
@@ -177,6 +205,43 @@ export interface PartRegistry {
     states: Record<string, PartState | undefined>,
     highlight: EmissiveHighlight | null,
   ): number;
+  /**
+   * The ids of the parts this registry has written a transform to, in the order they were
+   * first moved.
+   *
+   * One caller needs it and it is `applyPartTransforms`: an override REPLACES the file's
+   * transform, so deleting one has to put the part back where the file had it, and finding
+   * which parts those are by walking all of them is the O(parts) cost this whole refactor
+   * exists to remove. A part that has never been written is by definition still at its bind
+   * pose and has nothing to be put back to.
+   *
+   * Bounded by MAX_SCENE_PARTS (lib/scene/roomScene.ts) plus whatever a gizmo drag touched,
+   * which is the same bound the wire already puts on the overrides themselves. A part put
+   * back where it started stays in the list — dropping it would need a second write path
+   * knowing when a part has landed exactly on its bind pose, and re-writing a part that is
+   * already there costs nothing.
+   */
+  movedPartIds(): readonly string[];
+  /**
+   * The Object3D drei's `TransformControls` drags on this part's behalf, positioned in the
+   * part's own frame and parented so that its local transform IS the part's — or null when
+   * this model has no such part.
+   *
+   * The one place the "nothing above a registry ever sees an Object3D" rule is deliberately
+   * broken, and the render audit is explicit about why: three's gizmo needs a real object
+   * to attach to, it needs exactly one, and it needs it for the selected part only. So the
+   * registry owns ONE proxy per model and moves it to whichever part is selected, rather
+   * than every part keeping an object of its own just in case a handle lands on it.
+   *
+   * Reading the proxy's local transform gives the numbers a `PartTransform` carries, and
+   * writing them back through `setLocalTransform` moves the part — the two are the same
+   * frame because the proxy shares the part's parent. Under batching the parent is the
+   * batch rather than a group, and the frame is still the one `getMatrix`/`setMatrix` use.
+   *
+   * Idempotent, so a render that runs twice attaches the same proxy to the same parent
+   * twice and answers the same object.
+   */
+  gizmoProxyFor(id: string): Object3D | null;
   /** Drop what this registry owns. Stage 4's implementation owns GPU buffers. */
   dispose(): void;
 }
@@ -379,7 +444,14 @@ class HighlightMaterials {
   }
 }
 
-/** A part that is still one Object3D, which in stage 2 is every part. */
+/** A copy of three numbers, so a stored pose cannot be written to through the copy. */
+const triple = (value: readonly [number, number, number]): [number, number, number] => [
+  value[0],
+  value[1],
+  value[2],
+];
+
+/** A part that is still one Object3D, which in stage 3 is every part. */
 class MeshPartHandle implements PartHandle {
   /**
    * The file's own material, held only while a highlight is on.
@@ -390,12 +462,21 @@ class MeshPartHandle implements PartHandle {
    */
   private ownMaterial: Material | Material[] | undefined;
 
+  /**
+   * Where the file had this part, taken the first time anything wrote to it and never
+   * written again. Undefined while the part is still standing where the file put it,
+   * because then its own transform IS the answer and copying it would only allocate.
+   */
+  private bind: StoredLocalTransform | undefined;
+
   constructor(
     readonly id: string,
     readonly name: string,
     /** Package-private on purpose: the registry walks subtrees through it. */
     readonly object: Object3D,
     private readonly highlighted: HighlightMaterials,
+    /** Package-private too: the registry's index of which parts have been moved. */
+    private readonly moved: Set<string>,
   ) {}
 
   // Composed from position/quaternion/scale rather than copied from `.matrix`, because
@@ -406,6 +487,7 @@ class MeshPartHandle implements PartHandle {
   }
 
   setMatrix(matrix: Matrix4): void {
+    this.rememberBind();
     matrix.decompose(this.object.position, this.object.quaternion, this.object.scale);
   }
 
@@ -419,9 +501,39 @@ class MeshPartHandle implements PartHandle {
   }
 
   setLocalTransform(transform: StoredLocalTransform): void {
+    this.rememberBind();
     this.object.position.set(...transform.position);
     this.object.rotation.set(...transform.rotation);
     this.object.scale.set(...transform.scale);
+  }
+
+  bindPose(): StoredLocalTransform {
+    const bind = this.bind ?? this.getLocalTransform();
+    return {
+      position: triple(bind.position),
+      rotation: triple(bind.rotation),
+      scale: triple(bind.scale),
+    };
+  }
+
+  /**
+   * Take the file's own numbers before this write replaces them, and say the part moved.
+   *
+   * In the write path rather than in a caller's hands, which is what the function it
+   * replaces got wrong by being easy to forget: `rememberOriginalLocalTransform` had to be
+   * called at pointer-DOWN and not at pointer-up, because TransformControls moves the
+   * object on the pointer-move that follows, and an original taken after that was the
+   * dragged value. Nothing can move a part without coming through here now.
+   *
+   * Still lazy, and for the reason lib/scene/partTransforms.ts's header used to give: a
+   * STEP assembly can have tens of thousands of parts and at most MAX_SCENE_PARTS of them
+   * can ever be overridden, so a buffer filled for all of them would allocate for parts
+   * nobody will move. Stage 4's batched registry is the one that fills its bind buffer at
+   * build, because building the batches touches every part once anyway.
+   */
+  private rememberBind(): void {
+    if (!this.bind) this.bind = this.getLocalTransform();
+    this.moved.add(this.id);
   }
 
   setVisible(visible: boolean): void {
@@ -498,9 +610,10 @@ const untouched = (): AppliedState => ({
  * pin contract in lib/scene/sceneEntries.ts: a pin names the part it was placed on, and
  * every participant derives the same ids from the same file.
  *
- * Owns the highlight clones and nothing else — the geometry and the file's materials
- * belong to the parsed group — so `dispose` frees the clones and drops the maps. Stage
- * 4's batched implementation is the one that allocates buffers.
+ * Owns the highlight clones, the one gizmo proxy and the index of moved parts — and
+ * nothing else: the geometry and the file's materials belong to the parsed group. So
+ * `dispose` frees the clones, takes the proxy back out of the group it was attached to,
+ * and drops the maps. Stage 4's batched implementation is the one that allocates buffers.
  */
 export class MeshPartRegistry implements PartRegistry {
   private readonly root: Object3D;
@@ -511,6 +624,10 @@ export class MeshPartRegistry implements PartRegistry {
   private readonly parentOf = new Map<string, string | null>();
   private readonly applied = new Map<string, AppliedState>();
   private readonly highlighted = new HighlightMaterials();
+  /** Written by the handles themselves, in the one place a transform can be written. */
+  private readonly moved = new Set<string>();
+  /** Built the first time a part is selected in Part mode, and reused for every one after. */
+  private proxy: Object3D | null = null;
 
   constructor(root: Object3D, tree?: SceneNode | null) {
     this.root = root;
@@ -524,7 +641,13 @@ export class MeshPartRegistry implements PartRegistry {
       // collapseSingleChildGroups dropped a row for, which stay pickable ancestors.
       if (typeof id !== 'string') return;
       const ownName = object.name?.trim() ?? '';
-      const handle = new MeshPartHandle(id, names.get(id) ?? (ownName || id), object, this.highlighted);
+      const handle = new MeshPartHandle(
+        id,
+        names.get(id) ?? (ownName || id),
+        object,
+        this.highlighted,
+        this.moved,
+      );
       this.handles.push(handle);
       this.byId.set(id, handle);
       this.idByObject.set(object, id);
@@ -626,13 +749,53 @@ export class MeshPartRegistry implements PartRegistry {
     return touched;
   }
 
+  movedPartIds(): readonly string[] {
+    return [...this.moved];
+  }
+
+  gizmoProxyFor(id: string): Object3D | null {
+    const handle = this.byId.get(id);
+    if (!handle) return null;
+    if (!this.proxy) {
+      const proxy = new Object3D();
+      proxy.name = 'PartGizmoProxy';
+      // Never a target of its own: it stands in for a part, and a ray that landed on the
+      // stand-in would resolve to nothing. It has no geometry so it cannot be hit today,
+      // and the flag is what keeps that true if it ever grows one.
+      proxy.userData.skipRaycast = true;
+      this.proxy = proxy;
+    }
+    const proxy = this.proxy;
+    // The part's own parent, so the proxy's LOCAL transform is in the frame a
+    // PartTransform carries. Attaching it to the model's root instead would read root-space
+    // numbers off a part nested three groups deep and then write them back as parent-space
+    // ones, which is the same mistake twice over.
+    const parent = handle.object.parent ?? this.root;
+    if (proxy.parent !== parent) parent.add(proxy);
+    proxy.position.copy(handle.object.position);
+    // The Euler and not the quaternion, and the order with it: `Euler.setFromQuaternion`
+    // goes through a rotation matrix, and `atan2` on an identity matrix answers -0 for some
+    // of its terms. Nothing could see the difference in a rendered frame — JSON serialises
+    // -0 as 0, so the wire never carried it either — but the override applied locally does
+    // hold it, and "applying an override replaces the file's transform" is a rule about
+    // numbers, so a drag that turned nothing should not be a drag that turned -0.
+    proxy.rotation.copy(handle.object.rotation);
+    proxy.scale.copy(handle.object.scale);
+    return proxy;
+  }
+
   dispose(): void {
     this.handles.length = 0;
     this.byId.clear();
     this.idByObject.clear();
     this.parentOf.clear();
     this.applied.clear();
+    this.moved.clear();
     this.highlighted.dispose();
+    // Taken back out of the group it was attached to: the parsed group outlives the
+    // registry when a lobby viewer disposes one and keeps drawing the other.
+    this.proxy?.removeFromParent();
+    this.proxy = null;
   }
 
   /**

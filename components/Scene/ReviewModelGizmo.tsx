@@ -27,6 +27,7 @@
 // that room is gone. See lib/scene/keepPlacements.ts.
 
 import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useFrame } from '@react-three/fiber';
 import { TransformControls } from '@react-three/drei';
 import * as THREE from 'three';
 import { selectedNodeId, useStore } from '../../store';
@@ -34,12 +35,11 @@ import { usePresence } from '../../lib/PresenceContext';
 import { keepReviewPlacements } from '../../lib/scene/keepPlacements';
 import { markEditingHelper } from '../../lib/scene/captureClean';
 import {
-  findPartNode,
   partTargetFor,
   partTransformFromObject,
-  rememberOriginalLocalTransform,
   usablePartScale,
 } from '../../lib/scene/partTransforms';
+import type { PartHandle } from '../../lib/scene/partRegistry';
 import { sceneModelLabel, sceneModelTransform, type SceneModel, type SceneUpdate } from '../../lib/scene/roomScene';
 import { useSceneEditHistory } from '../../lib/scene/useSceneEditHistory';
 
@@ -100,31 +100,56 @@ const ReviewModelGizmo: React.FC<{
   // changing which model the scale slider refers to.
   const modelId = gizmoTarget === 'part' ? partTarget?.modelId ?? null : activeSceneModelId;
   const wrapper = modelId ? groups[modelId] : undefined;
+  const registry = modelId ? entries[modelId]?.partRegistry : undefined;
 
   /**
-   * The node itself, found in the model's parsed group.
+   * The part the drag will move, and the object the handles attach to.
    *
-   * A walk rather than a lookup because the parsed group is the only index of the
-   * objects there is; see findPartNode. Memoised on the wrapper and the target so a
-   * drag that changes nothing about either does not re-walk a 400-part assembly on
-   * every socket echo.
+   * NOT the part's own object. drei's TransformControls needs a real Object3D and is the
+   * one consumer the render audit admits does, so the registry keeps ONE per model and
+   * parks it in the selected part's own parent carrying the part's own local transform.
+   * Sharing a parent is what makes the numbers read off the proxy exactly the numbers a
+   * PartTransform puts on the wire, and the numbers written back through the handle exactly
+   * the part's new pose — a proxy attached to the model's root instead would read root-space
+   * numbers off a part nested three groups deep and write them back as parent-space ones.
+   *
+   * Attaching is idempotent, so a render React runs twice asks twice and gets the same
+   * object. Memoised on the registry and the target so a drag that changes nothing about
+   * either does not re-ask on every socket echo.
    */
-  const partObject = useMemo(() => {
+  const part = useMemo((): { handle: PartHandle; proxy: THREE.Object3D } | null => {
     const nodeId = partTarget?.nodeId;
-    if (!wrapper || !nodeId) return null;
-    return findPartNode(wrapper, nodeId);
-  }, [wrapper, partTarget]);
+    if (!wrapper || !registry || !nodeId) return null;
+    const handle = registry.get(nodeId);
+    const proxy = handle ? registry.gizmoProxyFor(nodeId) : null;
+    return handle && proxy ? { handle, proxy } : null;
+  }, [wrapper, registry, partTarget]);
 
   /**
    * The object the gizmo is attached to, or undefined for "there is nothing to move".
    *
-   * A part id that resolves to no object — a model still downloading, a node id from
-   * a file that has since been replaced — gives NO gizmo rather than quietly falling
-   * back to the whole model. Moving a product when somebody meant to move one bolt
-   * of it is the kind of mistake that is expensive to notice.
+   * A part id that resolves to no part — a model still downloading, a node id from a file
+   * that has since been replaced, an entry hand-built without a registry — gives NO gizmo
+   * rather than quietly falling back to the whole model. Moving a product when somebody
+   * meant to move one bolt of it is the kind of mistake that is expensive to notice.
    */
+  /**
+   * Keep the proxy standing on the part between drags.
+   *
+   * The memo above parks it on the part during RENDER, and the part only moves afterwards,
+   * in SceneModelView's applyPartTransforms effect — so an undo, a "Reset part" or a remote
+   * edit landing while a part is selected would leave the handles where the part used to
+   * be, and the next drag would push that stale pose onto the part and make it jump.
+   * Re-parked every frame the hand is off the handles; during a drag the proxy is the
+   * source of truth and must be left alone. One map lookup and three copies a frame.
+   */
+  const held = useRef(false);
+  useFrame(() => {
+    if (part && !held.current && partTarget?.nodeId) registry?.gizmoProxyFor(partTarget.nodeId);
+  });
+
   let object: THREE.Object3D | undefined = wrapper;
-  if (partTarget && partTarget.nodeId !== null) object = partObject ?? undefined;
+  if (partTarget && partTarget.nodeId !== null) object = part?.proxy;
 
   // The gizmo is a tool of edit mode, and edit mode belongs to one person. A
   // participant who is watching somebody else edit sees the model move; they do
@@ -144,26 +169,27 @@ const ReviewModelGizmo: React.FC<{
     if (!modelId) return;
     const nodeId = partTarget?.nodeId;
 
-    if (nodeId && partObject) {
-      // The file's own transform, remembered BEFORE anything else touches this node
-      // — which on a drag has already happened at pointer-down, so this is a read.
-      // An override REPLACES it rather than adding to it, so the value sent is the
-      // node's local transform as it now stands and applying it twice is a no-op.
-      const original = rememberOriginalLocalTransform(partObject);
-      const local = partTransformFromObject(partObject);
+    if (nodeId && part) {
+      // The proxy carries the part's own local transform, so what is read off it is what
+      // the override means. An override REPLACES the file's transform rather than adding
+      // to it, so the value sent is the part's local transform as it now stands and
+      // applying it twice is a no-op.
+      const local = partTransformFromObject(part.proxy);
       const update: SceneUpdate = {
         op: 'setPartTransform',
         id: modelId,
         nodeId,
         transform: {
-          position: local.position ?? original.position,
-          rotation: local.rotation ?? original.rotation,
+          position: local.position,
+          rotation: local.rotation,
           // Non-uniform, unlike the model's own scale: a part is inside the model's
           // bounding box, so nothing else in the scene has to read this back as one
           // number. A drag through zero is clamped to the file's own value on that
           // axis rather than sent, because the wire refuses a part scaled to nothing
           // and a refused drag would leave this browser showing what the room is not.
-          scale: usablePartScale(local.scale ?? original.scale, original.scale),
+          // The file's own value comes off the handle, which took it before the first
+          // write of the drag and not at the end of it.
+          scale: usablePartScale(local.scale, part.handle.bindPose().scale),
         },
       };
       lastSentAt.current = Date.now();
@@ -196,7 +222,7 @@ const ReviewModelGizmo: React.FC<{
     // step is a prediction the echo confirms; it is still needed outside a room.
     broadcastSceneUpdate(update);
     useStore.getState().applyLocalSceneUpdate(update);
-  }, [modelId, partObject, partTarget, wrapper, broadcastSceneUpdate]);
+  }, [modelId, part, partTarget, wrapper, broadcastSceneUpdate]);
 
   const flush = useCallback(() => {
     const wait = SEND_INTERVAL_MS - (Date.now() - lastSentAt.current);
@@ -292,17 +318,13 @@ const ReviewModelGizmo: React.FC<{
         // Said out loud for the click-to-select beside this component: the press landed
         // on a handle, so it is not a click on the part underneath one.
         if (draggingRef) draggingRef.current = true;
+        held.current = true;
         dragBefore.current = snapshot(modelId ? [modelId] : []);
-        // Stamped here and not in an effect: TransformControls moves the object on
-        // the pointer-move that follows this event, and an "original" captured after
-        // that would be the dragged value — which is what "Reset part" restores, so
-        // getting the moment wrong would make Reset put the part where the drag
-        // happened to end.
-        if (partObject) rememberOriginalLocalTransform(partObject);
       }}
       onMouseUp={() => {
         if (controlsRef.current) controlsRef.current.enabled = true;
         if (draggingRef) draggingRef.current = false;
+        held.current = false;
         // A drag that ends inside the throttle window still has to land: the last
         // few centimetres of a move are the ones the person was aiming.
         if (timer.current) {
@@ -319,7 +341,16 @@ const ReviewModelGizmo: React.FC<{
           keepPlacements();
         });
       }}
-      onObjectChange={() => flush()}
+      onObjectChange={() => {
+        // The proxy stands in for the part, so the drag has to be pushed onto the part
+        // itself. Nothing else moves it until the throttled wire echo comes back, ten times
+        // a second, and the handles would slide smoothly over a part that jumped after
+        // them. This is also the first write the part has seen, which is when its handle
+        // takes the file's own transform — the moment a pointer-down stamp here used to be
+        // for, now in the write path where it cannot be got wrong.
+        if (part) part.handle.setLocalTransform(partTransformFromObject(part.proxy));
+        flush();
+      }}
     />
   );
 };

@@ -516,7 +516,9 @@ const ReviewModelViewer: React.FC<ReviewModelViewerProps> = ({ reviewId, classNa
         // Before `measure`, so the frame is composed around the model as it actually
         // stands: a part dragged out to show a clearance is exactly the part that would
         // otherwise be cut off by a box measured on the file's own geometry.
-        applyPartTransforms(entry.group, model.parts);
+        if (entry.partRegistry) {
+          applyPartTransforms(entry.partRegistry, entry.sceneTree.id, model.parts);
+        }
         return { model, entry, box: measure(model, entry) };
       } catch (error) {
         console.error(`[lobby] could not load ${model.fileName} (${model.hash}):`, error);

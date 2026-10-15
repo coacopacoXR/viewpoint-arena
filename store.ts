@@ -10,7 +10,7 @@ import { isCapturePaused } from './lib/capture/captureGate';
 // recording ran, and whether its transcript is to be kept. See each module's header.
 import { getRecordingState } from './lib/recordingState';
 import { getTranscriptKeep } from './lib/transcriptKeep';
-import { flattenSceneTree, type FlatComponent } from './lib/componentIndex';
+import { DEFAULT_MAX_COMPONENTS, flattenSceneTree, type FlatComponent } from './lib/componentIndex';
 import { useReviewSetupStore } from './lib/reviewSetupStore';
 // Read inside endMeeting only, and lib/activeReviewStore reads this store inside
 // its own actions only — so the two never touch each other while a module is
@@ -227,16 +227,38 @@ export const countParts = (node: SceneNode): number => {
     return count;
 };
 
-// Seed POIs from a scene tree so agents always have targets to inspect, even
-// for models whose 3D component doesn't call registerPOI (bicycle, headphones,
-// fresh imports before mesh traversal runs). Positions default to origin;
-// per-mesh components later upsert real world positions via registerPOI.
-const derivePoisFromSceneTree = (node: SceneNode, out: PointOfInterest[] = []): PointOfInterest[] => {
+/**
+ * Seed POIs from a scene tree so agents always have targets to inspect, even for models
+ * whose 3D component doesn't call registerPOI (bicycle, headphones, fresh imports before
+ * the parts have been measured). Positions default to origin; the component later upserts
+ * real world positions via registerPOI / registerPOIs.
+ *
+ * Capped at the same number of components the extraction prompt is allowed, and the cap is
+ * what makes the one on registration mean anything: uncapped, this hands the store one POI
+ * per leaf of a 40 000-part assembly and every one of them is at the origin, so the 200
+ * real positions the renderer measures would be 200 needles in that. An agent picks its
+ * target uniformly at random out of this list (components/Scene/Agent.tsx), so it would
+ * spend the meeting looking at the origin.
+ *
+ * Depth-first, so what survives a truncation is the first branch of the tree rather than
+ * its skeleton — unlike lib/componentIndex's flattenSceneTree, which goes breadth-first on
+ * purpose because a truncated prompt still has to describe the whole assembly. These are
+ * standing targets for a simulated agent, not a description of the model, and for anything
+ * big enough to be truncated the renderer's own 200 largest parts upsert over them.
+ */
+const derivePoisFromSceneTree = (
+    node: SceneNode,
+    out: PointOfInterest[] = [],
+    max: number = DEFAULT_MAX_COMPONENTS,
+): PointOfInterest[] => {
     const isLeaf = !node.children || node.children.length === 0;
-    if (isLeaf) {
+    if (isLeaf && out.length < max) {
         out.push({ id: node.id, position: new Vector3(0, 0, 0), label: node.name, type: 'GENERAL' });
     }
-    node.children?.forEach(child => derivePoisFromSceneTree(child, out));
+    for (const child of node.children ?? []) {
+        if (out.length >= max) break;
+        derivePoisFromSceneTree(child, out, max);
+    }
     return out;
 };
 
@@ -708,6 +730,22 @@ interface AppState {
   resetTime: () => void;
 
   registerPOI: (poi: PointOfInterest) => void;
+  /**
+   * `registerPOI` for a whole model's parts, as ONE write.
+   *
+   * The batch half of the render audit's D3. `registerPOI` is one zustand `set()` per call,
+   * and components/Scene/ImportedModel.tsx used to call it once per mesh inside a traverse —
+   * so a 40 000-part STEP performed 40 000 store writes and re-rendered every POI
+   * subscriber 40 000 times, per model, on every change to the model's moved parts. That is
+   * independent of batching and was arguably worse than the draw-call problem 04b exists to
+   * fix.
+   *
+   * Upserts, exactly as the single version does, so a caller may hand over the parts it
+   * measured and leave everything else — another model's POIs, the bundled sample's — alone.
+   * An empty list is not a write at all: a model with nothing to measure must not churn the
+   * subscribers that are watching.
+   */
+  registerPOIs: (pois: PointOfInterest[]) => void;
   setActiveAgent: (id: string | null) => void;
   setLeader: (id: string | 'USER' | null) => void;
   setFollowingRemoteUser: (userId: string | null) => void;
@@ -1137,6 +1175,24 @@ export const useStore = create<AppState>((set, get) => ({
     // with the real world-space center once meshes mount.
     const next = state.pois.slice();
     next[existingIdx] = poi;
+    return { pois: next };
+  }),
+  registerPOIs: (incoming) => set((state) => {
+    if (incoming.length === 0) return state;
+    // One index and one array for the whole batch. `registerPOI` in a loop is the D3
+    // write storm: each call is a `set()`, and every subscriber of `pois` re-renders on
+    // each one, so a model's parts arriving cost as many renders as it has parts.
+    const indexOf = new Map(state.pois.map((poi, index) => [poi.id, index]));
+    const next = state.pois.slice();
+    for (const poi of incoming) {
+      const existing = indexOf.get(poi.id);
+      if (existing === undefined) {
+        indexOf.set(poi.id, next.length);
+        next.push(poi);
+      } else {
+        next[existing] = poi;
+      }
+    }
     return { pois: next };
   }),
   setActiveAgent: (id) => set({ activeAgentId: id }),

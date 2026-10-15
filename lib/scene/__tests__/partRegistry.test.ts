@@ -417,6 +417,32 @@ describe('the handle contract the later stages hang off', () => {
     expect(part.getMatrix(new THREE.Matrix4()).equals(moved)).toBe(false);
   });
 
+  it('keeps the file\'s own transform through either write path', () => {
+    const { registry } = fixture();
+    const part = registry.parts().find((one) => one.name === 'Base Plate')!;
+    const bind = part.bindPose();
+
+    // The gizmo's live drag writes a matrix; the wire echo writes the three fields. Both
+    // have to leave the bind pose alone, or "Reset part" would restore whichever pose the
+    // part happened to be standing in when the second write landed.
+    part.setMatrix(new THREE.Matrix4().compose(
+      new THREE.Vector3(4, 4, 4),
+      new THREE.Quaternion(),
+      new THREE.Vector3(2, 2, 2),
+    ));
+    expect(part.bindPose()).toEqual(bind);
+    expect(part.getLocalTransform().position).toEqual([4, 4, 4]);
+
+    part.setLocalTransform({ position: [9, 9, 9], rotation: [0, 0, 0], scale: [1, 1, 1] });
+    expect(part.bindPose()).toEqual(bind);
+    expect(registry.movedPartIds()).toEqual([part.id]);
+
+    // And putting it back is exact, because the bind pose is the three fields and not a
+    // matrix that has been decomposed on the way in.
+    part.setLocalTransform(part.bindPose());
+    expect(part.getLocalTransform()).toEqual(bind);
+  });
+
   it('setVisibleSubtree hides the part and everything below it, and gives it back', () => {
     const { tree, registry, objects } = fixture();
 
@@ -779,5 +805,109 @@ describe('syncStates — a state change costs the parts that changed', () => {
     const fixture = assembly();
     expect(fixture.registry.syncStates(states(['nope_0', { visible: false }]), GLOW)).toBe(0);
     expect(fixture.objects.get('Left')!.visible).toBe(true);
+  });
+});
+
+describe('gizmoProxyFor — the one Object3D drei\'s TransformControls still needs', () => {
+  /**
+   * The registry plus the objects behind it, reached through the fixture's own group: what
+   * a handle is backed by is exactly what stage 4 changes, so the proxy is asserted against
+   * the FRAME it has to share with the part and not against the part's object.
+   */
+  function fixture() {
+    const { root, tree } = parseAssembly();
+    root.updateMatrixWorld(true);
+    const registry = new MeshPartRegistry(root, tree);
+    const meshNamed = (name: string): THREE.Mesh => {
+      let found: THREE.Mesh | null = null;
+      root.traverse((object) => {
+        if (!found && object instanceof THREE.Mesh && object.name === name) found = object;
+      });
+      if (!found) throw new Error(`the fixture has no mesh named ${name}`);
+      return found;
+    };
+    const idOf = (name: string): string => {
+      const part = registry.parts().find((one) => one.name === name);
+      if (!part) throw new Error(`the fixture has no part named ${name}`);
+      return part.id;
+    };
+    return { root, registry, meshNamed, idOf };
+  }
+
+  it('answers nothing for an id this model does not have', () => {
+    const { registry } = fixture();
+    // Which is what gives the gizmo NO handles rather than a quiet fallback to moving the
+    // whole product, because a stale node id resolves to no part.
+    expect(registry.gizmoProxyFor('nope_404')).toBeNull();
+  });
+
+  it('parks the proxy in the part\'s own parent, carrying the part\'s own transform', () => {
+    const { registry, meshNamed, idOf } = fixture();
+    const pad = meshNamed('Pad');
+    const plate = meshNamed('Base Plate');
+    // A nested part and a top-level one, so the two parents really are different objects
+    // and the assertion below cannot pass by accident.
+    expect(pad.parent).not.toBe(plate.parent);
+    pad.position.set(3, 1, -2);
+
+    const proxy = registry.gizmoProxyFor(idOf('Pad'));
+
+    // Sharing the parent is the whole of the contract: the numbers drei reads off the proxy
+    // are the numbers a PartTransform carries, and the numbers written back through the
+    // handle land in the frame the part is actually in. A proxy attached to the model's root
+    // instead would read root-space numbers off a part nested inside a sub-assembly and
+    // write them back as parent-space ones, which is the same mistake twice over.
+    expect(proxy?.parent).toBe(pad.parent);
+    expect(proxy?.position.toArray()).toEqual([3, 1, -2]);
+  });
+
+  it('is ONE proxy per model, moved to whichever part is selected next', () => {
+    const { registry, meshNamed, idOf } = fixture();
+    const pad = meshNamed('Pad');
+    const plate = meshNamed('Base Plate');
+
+    // The parent is read after each call and not at the end: it IS the same object every
+    // time, so a later attach has already moved it again.
+    const first = registry.gizmoProxyFor(idOf('Pad'));
+    expect(first?.parent).toBe(pad.parent);
+
+    const second = registry.gizmoProxyFor(idOf('Base Plate'));
+    expect(second).toBe(first);
+    expect(second?.parent).toBe(plate.parent);
+
+    const third = registry.gizmoProxyFor(idOf('Pad'));
+    expect(third).toBe(first);
+    expect(third?.parent).toBe(pad.parent);
+
+    // One object and not one per part: a 40 000-part assembly would otherwise keep 40 000
+    // Object3Ds alive for the one a gizmo is ever attached to, which is the cost the render
+    // audit's §3.4 rejects along with the placeholder tree.
+  });
+
+  it('is not part of the model\'s box', () => {
+    const { root, registry, idOf } = fixture();
+    const before = registry.bounds(new THREE.Box3()).clone();
+
+    registry.gizmoProxyFor(idOf('Pad'));
+    root.updateMatrixWorld(true);
+    const after = registry.bounds(new THREE.Box3());
+
+    // It has no geometry, so Box3 walks straight through it — worth pinning because the
+    // proxy is the one object stage 3 adds to a parsed group, and a box that grew to
+    // include it would re-frame every thumbnail of a room somebody had moved a part in.
+    expect(after.min.toArray()).toEqual(before.min.toArray());
+    expect(after.max.toArray()).toEqual(before.max.toArray());
+  });
+
+  it('comes back out of the group when the registry is disposed', () => {
+    const { registry, idOf } = fixture();
+    const proxy = registry.gizmoProxyFor(idOf('Pad'))!;
+    expect(proxy.parent).not.toBeNull();
+
+    registry.dispose();
+
+    // The parsed group outlives the registry when a lobby viewer disposes one and keeps
+    // drawing the other, so the proxy must not be left standing in it.
+    expect(proxy.parent).toBeNull();
   });
 });

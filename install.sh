@@ -541,7 +541,7 @@ A_DB='' A_SUPABASE_URL='' A_SUPABASE_ANON_KEY=''
 A_TURN='' A_TURN_TOKEN_ID='' A_TURN_API_TOKEN='' A_COTURN_HOST='' A_COTURN_PORT=''
 A_NOTIFY='' A_TEAMS_WEBHOOK=''
 A_GPU='' A_N8N=''
-S_CAPTURE_SECRET='' S_POSTGRES_PASSWORD='' S_N8N_KEY='' S_COTURN_SECRET=''
+S_CAPTURE_SECRET='' S_CONVERT_SECRET='' S_POSTGRES_PASSWORD='' S_N8N_KEY='' S_COTURN_SECRET=''
 S_JWT_SECRET='' S_SECRET_KEY_BASE='' S_REALTIME_DB_ENC_KEY='' S_ANON_KEY=''
 S_ACCESS_PASSWORD_HASH='' S_ADMIN_PASSPHRASE_HASH=''
 
@@ -935,6 +935,7 @@ collect_access_answers() {
   # rotated is not. Safe to rotate because both ends read them from .env when
   # `compose up` recreates the containers.
   S_CAPTURE_SECRET="$(generate_secret)"
+  S_CONVERT_SECRET="$(generate_secret)"
 
   # NOT rotated, because rotating them destroys data. Postgres stores its
   # password when the data volume is first initialised and never reads
@@ -1460,6 +1461,12 @@ HEADER
 # explains the pairing, and lib/health/probes.ts sends it.
 CAPTURE_SHARED_SECRET=${S_CAPTURE_SECRET}
 
+# Guards convert-service the same way, on every route including /health. That
+# service tessellates uploaded CAD files with a native kernel and publishes no
+# host port either; convert-service/convert_service/auth.py explains the
+# pairing, and lib/health/probes.ts is where a probe would send it.
+CONVERT_SHARED_SECRET=${S_CONVERT_SECRET}
+
 # The postgres container's password. postgres publishes no port either.
 POSTGRES_PASSWORD=${S_POSTGRES_PASSWORD}
 
@@ -1828,6 +1835,10 @@ BACKUPS
 #CAPTURE_MEMORY=6g
 #WHISPER_CPUS=4
 #WHISPER_MEMORY=6g
+# CAD tessellation holds roughly six times the file size in memory, so this
+# ceiling has to move with CONVERT_MAX_UPLOAD_BYTES and CONVERT_CONCURRENCY.
+#CONVERT_CPUS=4
+#CONVERT_MEM_LIMIT=6g
 #OLLAMA_MEMORY=10g
 #
 # Publishing PartyKit or n8n on a real interface. Both default to loopback and
@@ -2265,10 +2276,14 @@ print_summary() {
     note "n8n             http://127.0.0.1:${N8N_PORT:-5678}/  (loopback only)"
   fi
   say ''
-  say '  capture-service is deliberately NOT in that list. It accepts meeting'
-  say '  recordings and publishes no host port. Reach it with:'
+  say '  capture-service and convert-service are deliberately NOT in that list.'
+  say '  They accept meeting recordings and CAD files, and publish no host port.'
+  say '  Reach either one with:'
   say '    docker compose exec capture-service curl -sS \'
   say '      -H "X-Capture-Token: $CAPTURE_SHARED_SECRET" http://127.0.0.1:8080/health'
+  say '  convert-service has no curl in its image (it has no need of one), so its'
+  say '  healthcheck script is the way in:'
+  say '    docker compose exec convert-service python healthcheck.py'
   say ''
   if [[ "$A_TLS" == 'tailscale' ]]; then
     say "  Next: on any device signed in to your tailnet, open ${A_PUBLIC_URL}/"

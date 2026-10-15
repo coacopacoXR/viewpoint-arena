@@ -553,6 +553,7 @@ describe('docker-compose.yml — a default install is unchanged', () => {
       'api',
       'app',
       'capture-service',
+      'convert-service',
       'db',
       // Batch BY: backups are on by default, on purpose — an install that had to be
       // opted into backing itself up is one that loses data first.

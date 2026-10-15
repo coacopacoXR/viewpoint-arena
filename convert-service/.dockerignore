@@ -1,0 +1,20 @@
+# convert-service build context exclusions.
+#
+# Separate from the repo-root .dockerignore because this service builds with
+# `context: ./convert-service` — Docker reads the ignore file from the CONTEXT
+# directory, so the root one does not apply here.
+#
+# Unlike capture-service/.dockerignore this file does NOT exclude `tests`.
+# `docker compose run --rm convert-service pytest` is how the service is proved
+# to work (convert-service/README.md §5), and the fixtures under tests/fixtures
+# are the input to the conversion tests, the parity script and the benchmark.
+# pytest itself is installed by the Dockerfile for the same reason.
+
+.venv
+venv
+.pytest_cache
+__pycache__
+**/__pycache__
+**/*.py[cod]
+.env
+.env.local

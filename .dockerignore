@@ -26,6 +26,9 @@ viewpoint.config.ts
 capture-service/.venv
 capture-service/venv
 capture-service/.pytest_cache
+convert-service/.venv
+convert-service/venv
+convert-service/.pytest_cache
 **/__pycache__
 **/*.py[cod]
 

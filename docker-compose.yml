@@ -19,8 +19,8 @@
 #                                 coturn service comment below.
 #   n8n           127.0.0.1:5678  loopback only, profile n8n
 #
-#   app, api, capture-service, whisper, db, rest, realtime, auth,
-#   ollama                                                  NO PORTS
+#   app, api, capture-service, convert-service, whisper, db, rest, realtime,
+#   auth, ollama                                            NO PORTS
 #
 #   Ollama used to publish 127.0.0.1:11434 for `ollama pull` from the host,
 #   but that clashes with a native Ollama on developer machines (port held on
@@ -481,6 +481,53 @@ services:
         limits:
           cpus: '${WHISPER_CPUS:-4}'
           memory: ${WHISPER_MEMORY:-6g}
+
+  # ── CAD tessellation ─────────────────────────────────────────────────────
+  #
+  # NO PORTS, for the reason given for capture-service in the block comment at
+  # the top of this file: convert-service accepts arbitrary model files and runs
+  # a native kernel on them, so reachability comes only from containers on the
+  # `backend` network — the api, which is what wires it up. It is NOT on
+  # `models`, because it has nothing to download: OpenCascade is installed in the
+  # image and gltfpack is baked in at build time from a pinned, checksummed
+  # release, so a running install still sends nothing off the machine.
+  #
+  # Reach it from the host the way you would reach capture-service:
+  #
+  #   docker compose exec convert-service python healthcheck.py
+  convert-service:
+    build:
+      context: ./convert-service
+    image: viewpoint-arena-convert-service:${IMAGE_TAG:-local}
+    restart: unless-stopped
+    logging: *logging
+    networks:
+      - backend
+    environment:
+      # Empty means authentication is off, which is only acceptable because this
+      # container has no published port — and install.sh never leaves it empty.
+      CONVERT_SHARED_SECRET: ${CONVERT_SHARED_SECRET:-}
+      CONVERT_MAX_UPLOAD_BYTES: ${CONVERT_MAX_UPLOAD_BYTES:-209715200}
+      CONVERT_TIMEOUT_S: ${CONVERT_TIMEOUT_S:-900}
+      # One conversion at a time: extra requests queue. Raise it only together
+      # with CONVERT_MEM_LIMIT — see the memory comment below.
+      CONVERT_CONCURRENCY: ${CONVERT_CONCURRENCY:-1}
+      CONVERT_HOST: 0.0.0.0
+      CONVERT_PORT: '8080'
+    # No volumes, and that is the point: a conversion writes an uncompressed GLB,
+    # a compressed GLB and a result JSON into a temp directory inside the
+    # container and deletes them when the response has been sent. Nothing here is
+    # worth persisting, and a model that IS worth keeping is stored by the api
+    # under its own SHA-256 in models-data.
+    deploy:
+      resources:
+        limits:
+          cpus: '${CONVERT_CPUS:-4}'
+          # Tessellation holds roughly six times the file size in memory — the
+          # measurement behind CAD_SLOW_IMPORT_BYTES in utils/modelLoader.ts — so
+          # this ceiling has to be a multiple of CONVERT_MAX_UPLOAD_BYTES times
+          # CONVERT_CONCURRENCY. 6 g is one 200 MB job with room to spare.
+          memory: ${CONVERT_MEM_LIMIT:-6g}
 
   # ── Local LLM ────────────────────────────────────────────────────────────
   ollama:

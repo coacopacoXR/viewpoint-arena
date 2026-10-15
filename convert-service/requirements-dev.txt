@@ -1,0 +1,27 @@
+# convert-service test dependencies.
+#
+#   pip install -r requirements-dev.txt          # HTTP-layer tests
+#   pip install -r requirements-ocp.txt          # …and the conversion tests
+#   python -m pytest
+#
+# The suite splits in two, and the split is the point:
+#
+#   * WITHOUT the engine (this file alone), everything about the HTTP surface
+#     still runs: configuration validation, the shared secret, the streaming
+#     size cap, 415/422/504 mapping and the job queue. Those tests inject a fake
+#     JobRunner exactly the way capture-service's tests inject a fake
+#     transcriber, so a contributor on a platform cadquery-ocp has no wheel for
+#     can still prove the service behaves.
+#   * WITH the engine, the tests convert the committed STEP fixtures and assert
+#     on the GLB: node names, hierarchy, shared meshes, Y-up, and that gltfpack
+#     kept the names. Those skip (with the reason printed) when OCP or gltfpack
+#     is missing rather than failing, so `python -m pytest` is honest on both
+#     kinds of machine.
+#
+# httpx is here rather than in requirements.txt because the service itself makes
+# no outbound HTTP calls — it is FastAPI's TestClient that needs a transport.
+
+-r requirements.txt
+
+pytest>=8.0,<10
+httpx>=0.27,<1.0

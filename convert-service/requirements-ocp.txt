@@ -1,0 +1,28 @@
+# convert-service — the OpenCascade engine.
+#
+#   pip install -r requirements-ocp.txt
+#
+# cadquery-ocp is the pip build of OCCT's Python bindings: it installs an `OCP`
+# module holding the native OpenCascade libraries, so convert-service tessellates
+# with the SAME kernel the browser path uses through occt-import-js (which is
+# OCCT compiled to WebAssembly). Wheels exist for Linux, Windows and macOS on
+# CPython 3.11–3.14; there is no source build, so a platform without a wheel
+# cannot run the engine at all.
+#
+# The version is pinned to the 8.0.x line rather than a caret range: OCP's
+# version number tracks the OCCT release it binds (8.0.1), and an OCCT minor
+# bump can change tessellation output. A conversion is only comparable with the
+# browser's if the kernel is the one the tests were run against.
+#
+# Two things this does NOT bring:
+#   - gltfpack. It is a single static binary, installed in the Dockerfile from
+#     the official meshoptimizer release with a pinned checksum. There is a
+#     `gltfpack` npm package too, but its cli.js fetches a binary at run time,
+#     which would make an air-gapped install fail on the first conversion.
+#   - A display server. OCP links the visualisation toolkit, so a headless image
+#     needs libGL and friends even though nothing here ever opens a window — the
+#     Dockerfile installs them and the build fails loudly if `import OCP` does.
+
+-r requirements.txt
+
+cadquery-ocp>=8.0.1,<8.1

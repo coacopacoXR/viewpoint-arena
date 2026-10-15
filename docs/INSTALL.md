@@ -269,7 +269,7 @@ Run these in the Ubuntu window from `~/viewpoint-arena`:
 | See what is running | `docker compose ps` |
 | Stop everything (keeps all your data) | `docker compose stop` |
 | Start it again | `docker compose up -d` |
-| Read a part's log | `docker compose logs --tail 50 <name>`, e.g. `capture-service`, `api`, `db` |
+| Read a part's log | `docker compose logs --tail 50 <name>`, e.g. `capture-service`, `convert-service`, `api`, `db` |
 | Change a setting | `./install.sh` again (see below) |
 
 Docker Desktop must be running for any of these. It starts with Windows by
@@ -366,6 +366,13 @@ After `down -v`, `./install.sh` starts again from a clean slate.
 - **The graphics card on a laptop** also drives the screen, so open apps
   leave less room for the AI model and capture gets slower (see
   Troubleshooting).
+- **Very large CAD files (STEP, IGES, BREP) are still opened by your browser.**
+  Importing one converts it to triangles on your own computer, which is slow
+  above roughly 100 MB and can fail above 150 MB; the app warns before it tries.
+  A `convert-service` container is installed alongside the others and does that
+  conversion once on the server instead, but nothing calls it yet — the app
+  still uses the browser path, so an install behaves exactly as it did before.
+  See `convert-service/README.md`.
 - **Onshape, Teamcenter and Microsoft Teams** connections need your own
   accounts and keys; the installer asks for them if you pick those options.
 - **Sign-in is your choice.** `./install.sh` asks "How do people sign in?":

@@ -1,0 +1,28 @@
+# convert-service runtime dependencies — the HTTP service and the GLB writer.
+#
+# cadquery-ocp (the OpenCascade engine) is deliberately NOT listed here, in the
+# same spirit as capture-service keeping faster-whisper out of its runtime file:
+# it is a 67 MB wheel that only exists for a handful of platforms, and the HTTP
+# half of the service — configuration, authentication, the upload size cap, the
+# job runner's timeout and queueing — is all testable without it. Install
+# requirements-ocp.txt as well to convert real files.
+#
+#   pip install -r requirements.txt -r requirements-ocp.txt
+#
+# What is absent and why:
+#   - python-multipart: POST /convert takes the CAD file as the RAW request
+#     body, not a multipart form, so Starlette never parses form data here.
+#   - numpy: pygltflib is a pure-Python glTF builder and the geometry buffers
+#     are array.array('f') / array.array('I'). Four bytes per float instead of a
+#     Python float object matters when the input is a 200 MB assembly.
+#   - trimesh: its glTF exporter models one geometry per node, which cannot
+#     express a part whose faces carry two colours (one glTF mesh, two
+#     primitives — the equivalent of the two THREE groups cadToThree.ts builds).
+#     convert-service/README.md §4 records the choice.
+#
+# Python 3.11 or newer (the code uses `X | None` annotations and StrEnum-free
+# literals; cadquery-ocp itself requires >=3.11).
+
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pygltflib>=1.16,<2.0

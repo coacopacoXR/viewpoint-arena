@@ -37,6 +37,11 @@ Videos Post linkedin/
 test-results/
 playwright-report/
 
+# Perf benchmark fixtures — regenerated deterministically from a seed by
+# scripts/perf/make-assembly.mjs, and 80 MB+ each. The RESULTS in perf/results/
+# are committed; the binaries they were measured from are not.
+perf/fixtures/
+
 # capture-service (Python) build artefacts
 __pycache__/
 *.py[cod]

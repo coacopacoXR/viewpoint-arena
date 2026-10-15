@@ -12,7 +12,8 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "test": "vitest run",
-    "test:e2e": "playwright test",
+    "test:e2e": "playwright test --project=chromium",
+    "perf": "playwright test --project=perf",
     "check:env": "node scripts/check-public-env.mjs",
     "config:json": "node scripts/config-to-json.mjs"
   },

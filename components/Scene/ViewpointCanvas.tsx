@@ -12,6 +12,7 @@ import XRManager from './XRManager';
 import ReviewArtifacts from './ReviewArtifacts';
 import ReviewModelGizmo from './ReviewModelGizmo';
 import SceneClickSelect from './SceneClickSelect';
+import PerfProbe, { perfProbeEnabled } from './PerfProbe';
 import { SCENE_TONE_MAPPING, SCENE_TONE_MAPPING_EXPOSURE } from './LightRig';
 import { useStore } from '../../store';
 import { usePresence } from '../../lib/PresenceContext';
@@ -787,6 +788,13 @@ const ViewpointCanvas: React.FC = () => {
     >
       <XR store={xrStore}>
         <PerspectiveCamera makeDefault position={[8, 6, 8]} fov={60} />
+
+        {/* The ?perf=1 benchmark probe. Asked about during the render rather than
+            cached at module scope: the lobby navigates here client-side, so a
+            value read once at import time would have been read from the lobby's
+            address and would never see the parameter the room was opened with.
+            Renders nothing at all without it — see components/Scene/PerfProbe.tsx. */}
+        {perfProbeEnabled() && <PerfProbe />}
 
         {/* Systems */}
         <DialogueEngine />

@@ -5,6 +5,8 @@
 import { describe, it, expect } from 'vitest';
 import * as THREE from 'three';
 import { computeOrbitPivot, getModelCenter } from '../orbitPivot';
+import { MeshPartRegistry, type PartRegistry } from '../scene/partRegistry';
+import { buildSceneTree } from '../../utils/modelLoader';
 
 const ORIGIN = new THREE.Vector3(0, 0, 0);
 
@@ -105,45 +107,62 @@ describe('computeOrbitPivot', () => {
 });
 
 describe('getModelCenter', () => {
-  function taggedMesh(id: string, position: THREE.Vector3, size = 2) {
+  /**
+   * One parsed model: a root group with a box in it at `position`, indexed the way a
+   * parse indexes it. `buildSceneTree` does the tagging, so the fixture is the shape
+   * lib/scene/sceneEntries.ts builds a registry from rather than a hand-stamped one.
+   */
+  function model(position: THREE.Vector3, size = 2, prefix = 'm1'): PartRegistry {
+    const root = new THREE.Group();
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(size, size, size));
-    mesh.userData.modelId = id;
     mesh.position.copy(position);
-    return mesh;
+    root.add(mesh);
+    buildSceneTree(root, { value: 0 }, prefix);
+    root.updateMatrixWorld(true);
+    return new MeshPartRegistry(root);
   }
 
-  it('returns null when nothing is tagged as a model', () => {
-    const scene = new THREE.Scene();
-    scene.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1)));
-    scene.updateMatrixWorld(true);
-
-    expect(getModelCenter(scene)).toBeNull();
+  it('returns null when there are no models', () => {
+    // Which is also the bundled synth's answer, and always was: components/Scene/
+    // Product.tsx tags its part GROUPS and leaves their meshes untagged, so the walk
+    // this replaced — which asked for `isMesh` as well as the tag — never found it
+    // either. Both callers fall back to where they already were.
+    expect(getModelCenter([])).toBeNull();
   });
 
-  it('returns the centre of the tagged model', () => {
-    const scene = new THREE.Scene();
-    scene.add(taggedMesh('m1', new THREE.Vector3(4, 0, 0)));
-    scene.updateMatrixWorld(true);
+  it('returns the centre of the model', () => {
+    const center = getModelCenter([model(new THREE.Vector3(4, 0, 0))]);
 
-    const center = getModelCenter(scene);
     expect(center).not.toBeNull();
     expect(center!.x).toBeCloseTo(4);
     expect(center!.y).toBeCloseTo(0);
     expect(center!.z).toBeCloseTo(0);
   });
 
-  it('spans every tagged mesh, including ones nested in a group', () => {
-    const scene = new THREE.Scene();
-    const group = new THREE.Group();
-    group.add(taggedMesh('m1', new THREE.Vector3(-2, 0, 0)));
-    scene.add(group);
-    scene.add(taggedMesh('m1', new THREE.Vector3(6, 0, 0)));
-    scene.add(new THREE.Mesh(new THREE.BoxGeometry(50, 50, 50))); // untagged: ignored
-    scene.updateMatrixWorld(true);
+  it('spans every model in the scene, including parts nested in a group', () => {
+    const nested = new THREE.Group();
+    const inner = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2));
+    inner.position.set(-2, 0, 0);
+    nested.add(inner);
+    const outer = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2));
+    outer.position.set(6, 0, 0);
+    const root = new THREE.Group();
+    root.add(nested, outer);
+    buildSceneTree(root, { value: 0 }, 'm1');
+    root.updateMatrixWorld(true);
 
-    const center = getModelCenter(scene);
+    const center = getModelCenter([new MeshPartRegistry(root)]);
     expect(center!.x).toBeCloseTo(2);
     expect(center!.y).toBeCloseTo(0);
     expect(center!.z).toBeCloseTo(0);
+  });
+
+  it('spans two models, because a comparison puts both in the room', () => {
+    const center = getModelCenter([
+      model(new THREE.Vector3(-2, 0, 0), 2, 'a1'),
+      model(new THREE.Vector3(6, 0, 0), 2, 'b2'),
+    ]);
+
+    expect(center!.x).toBeCloseTo(2);
   });
 });

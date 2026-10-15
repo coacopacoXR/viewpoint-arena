@@ -1,8 +1,8 @@
-// The part registry — task 04b stage 1.
+// The part registry — task 04b, stages 1 and 2.
 //
-// Two things here are load-bearing enough to have been called out as risks in the
-// render audit, and both are about the registry AGREEING with what already exists
-// rather than about the registry being clever:
+// Four things here are load-bearing enough to have been called out as risks or defects
+// in the render audit, and all four are about the registry AGREEING with what already
+// exists rather than about the registry being clever:
 //
 //   • R8 — the part count and the tree rows must not move. `countParts` feeds the
 //     import status line's "N parts", and the Model Tree's rows come from the same
@@ -14,9 +14,15 @@
 //     every participant in a room derives the same ones; a pin names the part it was
 //     dropped on, and a pin whose id meant something different on another screen
 //     would point at nothing.
+//   • R1 — `bounds()` must be the box `Box3.setFromObject` measures today, because
+//     every caller reads a wrong or an empty box as "there is nothing to frame" and
+//     the thumbnails and the lobby previews go blank rather than throwing.
+//   • D1 — a highlight must belong to ONE part. It used to be written onto a Material,
+//     materials are shared, and selecting one bolt of a file whose 400 bolts share one
+//     lit all 400 and left them lit.
 //
 // The rest is the contract the later stages hang off: picking, names, boxes,
-// transforms, visibility, highlight.
+// transforms, visibility, and the cost of a state change.
 //
 // Fixtures go through cadResultToGroup rather than being hand-assembled where the
 // point is "a real parse", because that converter is the one thing in the import path
@@ -35,6 +41,7 @@ import {
   isPointableHit,
   partRegistries,
   type PartRegistry,
+  type PartState,
   type PickHit,
 } from '../partRegistry';
 import { sceneModelPrefix } from '../roomScene';
@@ -42,6 +49,13 @@ import type { SceneNode } from '../../../types';
 
 const HASH = 'a1'.repeat(32);
 const PREFIX = sceneModelPrefix(HASH);
+
+/**
+ * The one selection glow the app has: components/Scene/ImportedModel.tsx's
+ * SELECTION_HIGHLIGHT, copied here rather than imported because a component module
+ * cannot be imported into a node test without dragging R3F and a canvas with it.
+ */
+const GLOW = { color: new THREE.Color(0x0044aa), intensity: 0.5 };
 
 /** One triangle in the XY plane, which is all a fixture needs to be a solid. */
 const triangle = (): Pick<OcctMesh, 'attributes' | 'index'> => ({
@@ -418,29 +432,37 @@ describe('the handle contract the later stages hang off', () => {
     for (const object of objects) expect(object.visible, object.name).toBe(true);
   });
 
-  it('setHighlight lights every material of the part and gives them back', () => {
+  it('setHighlight lights every material of the part and gives the file its own back', () => {
     const { registry, meshNamed } = fixture();
     // "Pad" is the fixture's multi-material part: the CAD reader splits a solid whose
     // faces differ in colour into one material per colour, and a highlight that only
-    // wrote the first of them would leave half a part glowing.
+    // replaced the first of them would leave half a part glowing.
     const pad = registry.parts().find((part) => part.name === 'Pad')!;
-    const materials = meshNamed('Pad').material;
-    expect(Array.isArray(materials)).toBe(true);
-    const all = materials as THREE.MeshStandardMaterial[];
+    const mesh = meshNamed('Pad');
+    const own = mesh.material as THREE.MeshStandardMaterial[];
+    expect(Array.isArray(own)).toBe(true);
 
-    pad.setHighlight({ color: new THREE.Color(0x0044aa), intensity: 0.5 });
-    for (const material of all) {
+    pad.setHighlight(GLOW);
+    const lit = mesh.material as THREE.MeshStandardMaterial[];
+    // Drawn from private clones, one per material of the part. Writing the glow ONTO
+    // `own` instead is the audit's D1: it lights every other part that shares them.
+    expect(lit).not.toBe(own);
+    for (const material of lit) {
       expect(material.emissive.getHex()).toBe(0x0044aa);
       expect(material.emissiveIntensity).toBe(0.5);
     }
-
-    // Back to the material's OWN emissive, not to black: lib/scene/materialHighlight
-    // exists because writing zero here permanently killed a file's warning stripes.
-    pad.setHighlight(null);
-    for (const material of all) {
+    for (const material of own) {
       expect(material.emissive.getHex()).toBe(0x000000);
-      expect(material.emissiveIntensity).toBe(1);
+      // Never even stamped: remembering the original lazily exists so that a 40 000-part
+      // assembly is not written to 40 000 times, and a source material is not touched at
+      // all now.
+      expect(material.userData.originalEmissive).toBeUndefined();
     }
+
+    // Back to the file's own materials — the same objects, not copies of them, so a
+    // texture or a vertex-colour attribute the file carried is still the one bound.
+    pad.setHighlight(null);
+    expect(mesh.material).toBe(own);
   });
 
   it('dispose() drops the index', () => {
@@ -449,5 +471,313 @@ describe('the handle contract the later stages hang off', () => {
     registry.dispose();
     expect(registry.parts().length).toBe(0);
     expect(registry.get(tree.id)).toBeNull();
+  });
+});
+
+describe('R1: the box every caller used to measure with Box3.setFromObject', () => {
+  /**
+   * Two parts, one 100 units out along x and one the other side of the origin, which is
+   * the shape the placement comment in components/Scene/ImportedModel.tsx exists for: a
+   * CAD part in millimetres, far from its own origin, used to be pushed ~100 scene units
+   * away and never appeared.
+   */
+  function scattered() {
+    const root = new THREE.Group();
+    root.name = 'Scattered';
+    const material = new THREE.MeshStandardMaterial({ color: 0x888888 });
+    const far = new THREE.Mesh(new THREE.BoxGeometry(10, 10, 10), material);
+    far.name = 'Far';
+    far.position.set(100, 5, -40);
+    const near = new THREE.Mesh(new THREE.BoxGeometry(4, 4, 4), material);
+    near.name = 'Near';
+    near.position.set(-30, 0, 12);
+    root.add(far, near);
+    const tree = buildSceneTree(root, { value: 0 }, PREFIX)!;
+    root.updateMatrixWorld(true);
+    return { root, registry: new MeshPartRegistry(root, tree) };
+  }
+
+  it('is the same box, to the last decimal, for a model far from its own origin', () => {
+    const { root, registry } = scattered();
+
+    const viaRegistry = registry.bounds(new THREE.Box3());
+    const viaThree = new THREE.Box3().setFromObject(root);
+
+    expect(viaRegistry.min.distanceTo(viaThree.min)).toBeLessThan(1e-9);
+    expect(viaRegistry.max.distanceTo(viaThree.max)).toBeLessThan(1e-9);
+    // And the numbers are the parts', not something degenerate: a box that quietly
+    // answered a buffer instead of the geometry would still be a box, and every caller
+    // reads an empty or a wrong one as "there is nothing to frame".
+    expect(viaRegistry.max.x).toBeCloseTo(105, 6);
+    expect(viaRegistry.min.x).toBeCloseTo(-32, 6);
+  });
+
+  it('follows the model once it has been scaled, centred and dropped on the floor', () => {
+    // Measured on demand rather than cached at build, and this is why: every caller runs
+    // AFTER something moved the geometry — placeImportedGroup scales the group and then
+    // measures it to find the floor, a variant moves individual parts, the lobby measures
+    // a group it has just placed. A box captured at parse time would be the box of a
+    // model nobody is looking at yet.
+    const { root, registry } = scattered();
+    root.scale.setScalar(0.02);
+    root.position.set(0, 3, 0);
+    root.updateMatrixWorld(true);
+
+    const viaRegistry = registry.bounds(new THREE.Box3());
+    const viaThree = new THREE.Box3().setFromObject(root);
+
+    expect(viaRegistry.min.distanceTo(viaThree.min)).toBeLessThan(1e-9);
+    expect(viaRegistry.max.distanceTo(viaThree.max)).toBeLessThan(1e-9);
+    expect(viaRegistry.getSize(new THREE.Vector3()).x).toBeCloseTo(137 * 0.02, 6);
+  });
+
+  it('visibleBounds is bounds while the model is shown, and empty once it is not', () => {
+    // The two are separate because the callers want different answers: lib/scene/
+    // modelBounds frames a picture on what the room is SHOWING, so a model somebody hid
+    // in the tree comes out of it, while placement measures the whole file or a hidden
+    // bolt would move the floor under the parts still on screen.
+    const { registry } = scattered();
+
+    expect(registry.visibleBounds(new THREE.Box3()).equals(registry.bounds(new THREE.Box3()))).toBe(true);
+
+    registry.setVisibleSubtree(registry.parts()[0].id, false);
+    expect(registry.visibleBounds(new THREE.Box3()).isEmpty()).toBe(true);
+    // The geometry has not gone anywhere, and the floor must not move with the eye toggle.
+    expect(registry.bounds(new THREE.Box3()).isEmpty()).toBe(false);
+
+    registry.setVisibleSubtree(registry.parts()[0].id, true);
+    expect(registry.visibleBounds(new THREE.Box3()).isEmpty()).toBe(false);
+  });
+});
+
+describe('D1: a highlight belongs to the part that was selected', () => {
+  /**
+   * Two bolts sharing ONE material, which is what a file does by default: utils/
+   * modelLoader's ensureMeshMaterial converts a Basic/Lambert/Phong into a new Standard
+   * material but for anything already standard it hands back the same object, so a GLB
+   * or a STEP whose 400 bolts share a material has one Material between all of them.
+   */
+  function bolts() {
+    const shared = new THREE.MeshStandardMaterial({ color: 0x888888 });
+    const root = new THREE.Group();
+    root.name = 'Bolts';
+    const left = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), shared);
+    left.name = 'Bolt Left';
+    left.position.x = -2;
+    const right = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), shared);
+    right.name = 'Bolt Right';
+    right.position.x = 2;
+    root.add(left, right);
+    const tree = buildSceneTree(root, { value: 0 }, PREFIX)!;
+    root.updateMatrixWorld(true);
+    return { registry: new MeshPartRegistry(root, tree), left, right, shared };
+  }
+
+  const partNamed = (registry: MeshPartRegistry, name: string) => {
+    const found = registry.parts().find((part) => part.name === name);
+    if (!found) throw new Error(`the fixture has no part named ${name}`);
+    return found;
+  };
+
+  it('lights one part and leaves the other on the file\'s own material', () => {
+    const { registry, left, right, shared } = bolts();
+
+    partNamed(registry, 'Bolt Left').setHighlight(GLOW);
+
+    expect((left.material as THREE.MeshStandardMaterial).emissive.getHex()).toBe(0x0044aa);
+    expect((left.material as THREE.MeshStandardMaterial).emissiveIntensity).toBe(0.5);
+    // The defect, and the assertion that failed before this stage: one material, so the
+    // other bolt glowed too and stayed glowing after the selection moved on.
+    expect(right.material).toBe(shared);
+    expect(shared.emissive.getHex()).toBe(0x000000);
+    expect(shared.userData.originalEmissive).toBeUndefined();
+
+    partNamed(registry, 'Bolt Left').setHighlight(null);
+    expect(left.material).toBe(shared);
+  });
+
+  it('draws every highlighted part from ONE clone per material, not one per part', () => {
+    // Selecting a group inherits downward and can name every part of an assembly, so a
+    // clone per part would allocate forty thousand materials to draw a glow that is the
+    // same colour on all of them. Keyed on the source, the count is bounded by the file.
+    const { registry, left, right, shared } = bolts();
+
+    partNamed(registry, 'Bolt Left').setHighlight(GLOW);
+    partNamed(registry, 'Bolt Right').setHighlight(GLOW);
+
+    expect(left.material).toBe(right.material);
+    expect(left.material).not.toBe(shared);
+    expect((left.material as THREE.MeshStandardMaterial).emissive.getHex()).toBe(0x0044aa);
+
+    // And unselecting one leaves the other lit, which a shared write could never do.
+    partNamed(registry, 'Bolt Left').setHighlight(null);
+    expect(left.material).toBe(shared);
+    expect((right.material as THREE.MeshStandardMaterial).emissive.getHex()).toBe(0x0044aa);
+  });
+
+  it('reuses the clone it already made, so selecting twice does not allocate twice', () => {
+    const { registry, left } = bolts();
+    const bolt = partNamed(registry, 'Bolt Left');
+
+    bolt.setHighlight(GLOW);
+    const first = left.material;
+    bolt.setHighlight(null);
+    bolt.setHighlight(GLOW);
+
+    expect(left.material).toBe(first);
+  });
+});
+
+describe('syncStates — a state change costs the parts that changed', () => {
+  /**
+   * An assembly of two groups of three bolts, sharing one material, tagged the way a
+   * parse tags one. Nine parts, and the shape the cost claims are made about: a leaf is
+   * one part, a group is a subtree.
+   */
+  function assembly() {
+    const shared = new THREE.MeshStandardMaterial({ color: 0x888888 });
+    const root = new THREE.Group();
+    root.name = 'Assembly';
+    for (const side of ['Left', 'Right']) {
+      const group = new THREE.Group();
+      group.name = side;
+      for (let index = 0; index < 3; index += 1) {
+        const bolt = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), shared);
+        bolt.name = `${side} Bolt ${index}`;
+        bolt.position.set(index * 2, side === 'Left' ? 0 : 4, 0);
+        group.add(bolt);
+      }
+      root.add(group);
+    }
+    const tree = buildSceneTree(root, { value: 0 }, PREFIX)!;
+    root.updateMatrixWorld(true);
+
+    const registry = new MeshPartRegistry(root, tree);
+    const objects = new Map<string, THREE.Object3D>();
+    root.traverse((object) => {
+      if (object.name) objects.set(object.name, object);
+    });
+    const idOf = (name: string): string => {
+      const found = registry.parts().find((part) => part.name === name);
+      if (!found) throw new Error(`the fixture has no part named ${name}`);
+      return found.id;
+    };
+    return { registry, objects, idOf, shared };
+  }
+
+  /**
+   * An `objectStates` map holding only the ids named here. An id that is absent reads as
+   * visible and unselected, which is what the store's own map says about a node it has
+   * never seen.
+   */
+  function states(...changed: Array<[string, Partial<PartState>]>): Record<string, PartState> {
+    const out: Record<string, PartState> = {};
+    for (const [id, over] of changed) out[id] = { visible: true, selected: false, ...over };
+    return out;
+  }
+
+  const glowing = (fixture: { objects: Map<string, THREE.Object3D> }, name: string): number => {
+    const mesh = fixture.objects.get(name) as THREE.Mesh;
+    return (mesh.material as THREE.MeshStandardMaterial).emissive.getHex();
+  };
+
+  it('writes nothing at all for a tree nobody has touched', () => {
+    // The common case by a wide margin, and the one the walk it replaced never had: a
+    // model sitting in a room was re-traversed, and every material in it re-written, on
+    // every change to objectStates anywhere in the scene.
+    const fixture = assembly();
+
+    expect(fixture.registry.syncStates({}, GLOW)).toBe(0);
+    expect(fixture.objects.get('Left Bolt 0')!.visible).toBe(true);
+    expect(glowing(fixture, 'Left Bolt 0')).toBe(0x000000);
+    expect(fixture.shared.userData.originalEmissive).toBeUndefined();
+  });
+
+  it('costs one part to select a part, and two to move the selection', () => {
+    const fixture = assembly();
+    const first = fixture.idOf('Left Bolt 0');
+    const second = fixture.idOf('Right Bolt 2');
+
+    expect(fixture.registry.syncStates(states([first, { selected: true }]), GLOW)).toBe(1);
+    expect(glowing(fixture, 'Left Bolt 0')).toBe(0x0044aa);
+
+    // store.ts's selectNode rewrites EVERY entry in objectStates to clear the old
+    // selection, so a diff on object identity would see the whole scene as changed. The
+    // diff is on the two booleans, and it is what keeps a click at two parts.
+    expect(
+      fixture.registry.syncStates(states([second, { selected: true }]), GLOW),
+    ).toBe(2);
+    expect(glowing(fixture, 'Left Bolt 0')).toBe(0x000000);
+    expect(glowing(fixture, 'Right Bolt 2')).toBe(0x0044aa);
+    expect(fixture.shared.emissive.getHex()).toBe(0x000000);
+  });
+
+  it('costs a group and everything in it to hide the group', () => {
+    const fixture = assembly();
+    const left = fixture.idOf('Left');
+
+    // Four, not nine: the group and its three bolts, and nothing on the other side.
+    expect(fixture.registry.syncStates(states([left, { visible: false }]), GLOW)).toBe(4);
+    expect(fixture.objects.get('Left')!.visible).toBe(false);
+    for (const index of [0, 1, 2]) {
+      expect(fixture.objects.get(`Left Bolt ${index}`)!.visible, `Left Bolt ${index}`).toBe(false);
+      expect(fixture.objects.get(`Right Bolt ${index}`)!.visible, `Right Bolt ${index}`).toBe(true);
+    }
+  });
+
+  it('keeps a part hidden on its own when the group above it is shown again', () => {
+    // The case a per-changed-id `setVisibleSubtree` would get wrong, and the reason the
+    // inheritance lives in the registry: showing a group is not the same as showing every
+    // part in it, because somebody may have turned one off first.
+    const fixture = assembly();
+    const left = fixture.idOf('Left');
+    const bolt = fixture.idOf('Left Bolt 1');
+
+    fixture.registry.syncStates(states([bolt, { visible: false }]), GLOW);
+    expect(fixture.objects.get('Left Bolt 1')!.visible).toBe(false);
+
+    fixture.registry.syncStates(states([bolt, { visible: false }], [left, { visible: false }]), GLOW);
+    expect(fixture.objects.get('Left Bolt 0')!.visible).toBe(false);
+
+    // The group comes back; the bolt does not.
+    expect(fixture.registry.syncStates(states([bolt, { visible: false }]), GLOW)).toBe(3);
+    expect(fixture.objects.get('Left Bolt 0')!.visible).toBe(true);
+    expect(fixture.objects.get('Left Bolt 1')!.visible).toBe(false);
+  });
+
+  it('lights a whole group when the group is what was selected', () => {
+    // Selection inherits downward exactly as visibility does, which is what the walk it
+    // replaced did by threading `parentSelected` through the recursion.
+    const fixture = assembly();
+
+    fixture.registry.syncStates(states([fixture.idOf('Right'), { selected: true }]), GLOW);
+
+    for (const index of [0, 1, 2]) {
+      expect(glowing(fixture, `Right Bolt ${index}`), `Right Bolt ${index}`).toBe(0x0044aa);
+      expect(glowing(fixture, `Left Bolt ${index}`), `Left Bolt ${index}`).toBe(0x000000);
+    }
+    // One clone between all three, from the same source material.
+    const materials = [0, 1, 2].map((index) =>
+      (fixture.objects.get(`Right Bolt ${index}`) as THREE.Mesh).material,
+    );
+    expect(new Set(materials).size).toBe(1);
+    expect(materials[0]).not.toBe(fixture.shared);
+  });
+
+  it('takes the glow off again, and gives the file its own material back', () => {
+    const fixture = assembly();
+    const bolt = fixture.idOf('Left Bolt 0');
+
+    fixture.registry.syncStates(states([bolt, { selected: true }]), GLOW);
+    expect(fixture.registry.syncStates({}, GLOW)).toBe(1);
+
+    expect(glowing(fixture, 'Left Bolt 0')).toBe(0x000000);
+    expect((fixture.objects.get('Left Bolt 0') as THREE.Mesh).material).toBe(fixture.shared);
+  });
+
+  it('ignores an id that is not this model\'s, which is what a stale SCENE_STATE carries', () => {
+    const fixture = assembly();
+    expect(fixture.registry.syncStates(states(['nope_0', { visible: false }]), GLOW)).toBe(0);
+    expect(fixture.objects.get('Left')!.visible).toBe(true);
   });
 });

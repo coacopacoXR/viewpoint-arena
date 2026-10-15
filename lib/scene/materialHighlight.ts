@@ -17,7 +17,7 @@
 import type { Color, Material, MeshStandardMaterial } from 'three';
 
 /** Where a material's own emissive is kept once a highlight has touched it. */
-const ORIGINAL_KEY = 'originalEmissive';
+export const ORIGINAL_KEY = 'originalEmissive';
 
 /** What a material's file gave it, read back when the highlight ends. */
 export interface OriginalEmissive {
@@ -105,4 +105,36 @@ export function setEmissiveHighlight(
   }
   mat.emissive.copy(original.color);
   mat.emissiveIntensity = original.intensity;
+}
+
+/**
+ * A private copy of `source`, already carrying `highlight` — task 04b stage 2.
+ *
+ * This is the seam the render audit's decision 1 calls the overlay, and it is the whole
+ * of the fix for its D1. A highlight used to be written ONTO the material, and materials
+ * are shared: `ensureMeshMaterial` (utils/modelLoader.ts) converts a Basic/Lambert/Phong
+ * into a new Standard material but for anything already standard it sets `.side` and
+ * hands back the SAME object — so a GLB or a STEP whose 400 bolts share one material had
+ * one Material between them, and selecting one bolt glowed all 400. Drawing the selected
+ * part from its own clone leaves every other part on the file's material, which is both
+ * the fix and the exact look the app has had: same emissive, same intensity, same
+ * textures, because Material.copy carries `map` and friends across by reference.
+ *
+ * The clone is unstamped before the highlight goes on. Material.copy runs `userData`
+ * through JSON, which would turn a remembered `originalEmissive` — a THREE.Color — into
+ * a plain `{r,g,b}` object that the restore then reads as if it were a colour. A source
+ * material is never highlighted itself any more so it has nothing to lose here, but a
+ * clone has to start with nothing remembered so that `setEmissiveHighlight` stamps the
+ * real Color it will later give back.
+ *
+ * The CALLER owns the returned material and must dispose it: nothing in the scene graph
+ * knows it exists, and components/lobby/ReviewModelViewer's `disposeGroup` walks the
+ * live materials of a group, which for a highlighted part is this clone and not the
+ * file's own.
+ */
+export function highlightClone(source: Material, highlight: EmissiveHighlight): Material {
+  const clone = source.clone();
+  delete clone.userData[ORIGINAL_KEY];
+  setEmissiveHighlight(clone, highlight);
+  return clone;
 }

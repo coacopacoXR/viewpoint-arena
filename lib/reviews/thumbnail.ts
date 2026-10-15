@@ -52,6 +52,7 @@ import { supabase, supabaseConfigured } from '../supabase';
 import { FRAME_FOV, applyFrame, frameBox } from '../scene/frameBox';
 import { hideEditingHelpers } from '../scene/captureClean';
 import { reviewModelBounds } from '../scene/modelBounds';
+import type { PartRegistry } from '../scene/partRegistry';
 
 /** The picture the lobby stores: a JPEG data URL, small enough to read in a list. */
 export const THUMBNAIL_MAX_WIDTH = 480;
@@ -261,6 +262,10 @@ export interface ThumbnailRenderer {
  * arithmetic is: the framing is the part worth testing, and it can be tested with a
  * scene of real three.js objects and no WebGL context at all.
  *
+ * @param registries the parsed models in the room, from `partRegistries(store.sceneEntries)`.
+ *        Their boxes are asked of them rather than measured off the scene graph — see
+ *        lib/scene/modelBounds.ts. Optional and empty for a room holding only the
+ *        bundled synth, which has no registry and is measured by its tags.
  * @returns null when the scene holds nothing tagged as the product — an empty room, or
  *          one whose models have not finished parsing. A capture answers null for that
  *          and the review keeps the picture it already had, which is a better card than
@@ -270,8 +275,9 @@ export interface ThumbnailRenderer {
 export function captureCameraFor(
   scene: THREE.Object3D | null | undefined,
   aspect: number,
+  registries: readonly PartRegistry[] = [],
 ): THREE.PerspectiveCamera | null {
-  const framed = frameBox(reviewModelBounds(scene));
+  const framed = frameBox(reviewModelBounds(scene, registries));
   if (!framed) return null;
   const camera = new THREE.PerspectiveCamera(
     FRAME_FOV,
@@ -306,6 +312,7 @@ export function captureRoomThumbnail(
   scene: THREE.Object3D | null | undefined,
   makeCanvas: CanvasFactory,
   quality: number = THUMBNAIL_QUALITY,
+  registries: readonly PartRegistry[] = [],
 ): string | null {
   try {
     const canvas = gl.domElement;
@@ -332,7 +339,7 @@ export function captureRoomThumbnail(
       // it, which is the "never replace a good picture with a grey rectangle" case the
       // caller's own guard also covers — a room whose models are still parsing is not a
       // room with nothing in it, and the debounce asks again three seconds later.
-      const camera = captureCameraFor(scene, canvas.width / canvas.height);
+      const camera = captureCameraFor(scene, canvas.width / canvas.height, registries);
       if (!camera) return null;
 
       // Take the renderer off whatever the room's frame loop left it doing, for this one

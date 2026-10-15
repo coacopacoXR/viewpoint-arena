@@ -22,10 +22,20 @@
 // onto the interface now, while the answer is still the object they used to walk, so
 // that the batching commit is a renderer change and not a nine-site picking change.
 //
-// This stage wires up picking only. `bounds`, `setVisibleSubtree` and the
-// transform/highlight halves of PartHandle are implemented but not yet called: they
-// are the seams stages 2, 3 and 4 hang off, and building them here is what keeps
-// those stages to their own consumers.
+// Stage 1 wired up picking. `getMatrix`/`setMatrix` and the transform half of a handle
+// are implemented but not yet called: they are the seam stage 3 hangs off, and building
+// them here is what keeps that stage to its own consumers.
+//
+// STAGE 2 hangs three more off it. `bounds`/`visibleBounds` replace every
+// `Box3().setFromObject(group)` that runs AFTER the parse, which is the audit's R1: a
+// batch's geometry is its concatenated buffer in the batch's own space, so a box
+// measured by walking it describes geometry nobody is drawing. `syncStates` replaces
+// the recursive walk components/Scene/ImportedModel.tsx used to run over every object
+// of every model on every change to the tree's states anywhere in the scene. And
+// `PartHandle.setHighlight` now draws a highlighted part from its own clone of the
+// file's material, which is the fix for the audit's D1 — the glow used to be written
+// onto a Material, and materials are shared, so selecting one bolt of an assembly whose
+// 400 bolts share one lit all 400.
 
 import {
   Box3,
@@ -36,7 +46,7 @@ import {
   type Object3D,
 } from 'three';
 import type { SceneNode } from '../../types';
-import { setEmissiveHighlight, type EmissiveHighlight } from './materialHighlight';
+import { highlightClone, setEmissiveHighlight, type EmissiveHighlight } from './materialHighlight';
 import type { StoredLocalTransform } from './partTransforms';
 
 /**
@@ -71,13 +81,29 @@ export interface PartHandle {
   /**
    * The selection glow, or null to give the part back its own emissive.
    *
-   * Per PART, which is the whole of the fix for the audit's D1: the glow is written on
-   * a Material today, and materials are shared, so selecting one bolt of a GLB where
-   * 400 share a material lights all 400. Stage 2 calls this; nothing calls it yet.
+   * Per PART, which is the whole of the fix for the audit's D1: the glow used to be
+   * written on a Material, and materials are shared, so selecting one bolt of a GLB
+   * where 400 share a material lit all 400. This draws the part from a private clone of
+   * its material instead (lib/scene/materialHighlight's `highlightClone`), so nothing
+   * else that shares it moves.
    */
   setHighlight(highlight: EmissiveHighlight | null): void;
   /** This part's box in WORLD space, matching what Box3.setFromObject answers today. */
   getBoundingBox(out: Box3): Box3;
+}
+
+/**
+ * The two of the Model Tree's per-node fields that reach the renderer.
+ *
+ * A structural type rather than the store's `ObjectState` because that also carries `id`
+ * and `expanded`, and `expanded` is a chevron: components/UI/SceneTree.tsx reads it and
+ * nothing under components/Scene/ ever has. Narrowing is what lets a caller hand over
+ * the whole `objectStates` map — `ObjectState` satisfies this — without this module
+ * importing a store type it has no other business knowing.
+ */
+export interface PartState {
+  visible: boolean;
+  selected: boolean;
 }
 
 /** One per parsed model, owned by the parse and disposed with it. */
@@ -88,6 +114,17 @@ export interface PartRegistry {
   parts(): readonly PartHandle[];
   /** The union box of the whole model. Replaces every `Box3().setFromObject(group)`. */
   bounds(out: Box3): Box3;
+  /**
+   * The box of the model as it is being DRAWN, which is `bounds` unless the model itself
+   * has been turned off.
+   *
+   * The two are separate because the callers want different answers: framing a picture
+   * of a room must leave out a model somebody hid in the tree (lib/scene/modelBounds),
+   * while dropping a model onto the floor must measure the whole file or a hidden part
+   * would slide the visible ones off their own origin (components/Scene/ImportedModel's
+   * `placeImportedGroup`, and the lobby's `measure`).
+   */
+  visibleBounds(out: Box3): Box3;
   /**
    * The part ids a raycast hit names in this registry, nearest first, or NULL when the
    * hit is not this registry's at all.
@@ -112,6 +149,34 @@ export interface PartRegistry {
    * only set one part would leave every caller re-walking the tree to find the rest.
    */
   setVisibleSubtree(rootId: string, visible: boolean): void;
+  /**
+   * Apply the tree's state to this model's parts, and answer how many parts it wrote.
+   *
+   * BOTH halves of what a state change means are in here rather than in the caller,
+   * because both need the part hierarchy and only the registry has it:
+   *
+   *   • visibility and selection inherit DOWNWARD — hiding an assembly hides every bolt
+   *     in it, and selecting one selects everything inside it. So a change to a group is
+   *     a change to its whole subtree.
+   *   • a part that was hidden on its own stays hidden when the group above it is shown
+   *     again. `setVisibleSubtree` cannot express that, and a caller that reached for it
+   *     per changed id would un-hide exactly the parts somebody had turned off.
+   *
+   * The registry keeps the state it last applied, diffs the tree's own values against
+   * it, and writes only the parts whose EFFECTIVE value moved. That is what makes the
+   * cost of a click proportional to the click: `selectNode` (store.ts) rewrites every
+   * entry in `objectStates` to clear the old selection, so a diff on object identity
+   * would see the whole scene as changed, while a diff on the two booleans sees the two
+   * ids that actually moved. The returned count is what the "a selection change touches
+   * O(changed) parts" test asserts on.
+   *
+   * `highlight` is the glow a selected part is drawn with, or null for none. Passed in
+   * rather than owned here because the colour is the app's, not the renderer's.
+   */
+  syncStates(
+    states: Record<string, PartState | undefined>,
+    highlight: EmissiveHighlight | null,
+  ): number;
   /** Drop what this registry owns. Stage 4's implementation owns GPU buffers. */
   dispose(): void;
 }
@@ -249,25 +314,88 @@ export function partRegistries(
   return found;
 }
 
+/**
+ * The box of one parsed model, from its registry when it has one.
+ *
+ * The fallback is for an entry built without a registry — a hand-made fixture, or a
+ * caller holding a group and nothing else — and it is exactly the measurement the
+ * audit's R1 warns about: `Box3.setFromObject` walks geometry, and a BatchedMesh's
+ * geometry is the concatenated buffer in the batch's own space, so it would answer a box
+ * of parts nobody is drawing where they are not. Every real parse builds a registry
+ * (lib/scene/sceneEntries.ts), so in the app the fallback is never reached.
+ */
+export function modelBox(
+  group: Object3D,
+  registry: PartRegistry | null | undefined,
+  out: Box3,
+): Box3 {
+  return registry ? registry.bounds(out) : out.setFromObject(group);
+}
+
 /** The names buildSceneTree gave each node, so a handle's name is the tree row's. */
 function treeNames(node: SceneNode, out: Map<string, string>): void {
   out.set(node.id, node.name);
   for (const child of node.children ?? []) treeNames(child, out);
 }
 
-function materialsOf(object: Object3D): Material[] {
-  if (!(object as Mesh).isMesh) return [];
-  const material = (object as Mesh).material;
-  return Array.isArray(material) ? material : [material];
+/**
+ * The private materials a highlight draws with, one per SOURCE material.
+ *
+ * Keyed on the source rather than on the part because a selection is a handful of parts
+ * while a GROUP selection inherits downward and can name every part of an assembly: one
+ * clone per part would allocate forty thousand materials to draw a glow that is the same
+ * colour on all of them. One clone per material bounds it by the file, which is the same
+ * bound the shared material it replaces had — with the difference that a part nobody
+ * selected keeps the file's own material, and that is the fix for the audit's D1.
+ *
+ * Kept for the registry's lifetime rather than freed when the last highlighted part
+ * gives it back: the next selection wants the same clone, and `dispose` frees the lot.
+ *
+ * ONE CLONE PER SOURCE MATERIAL also means two parts sharing a material share a colour.
+ * The app has one selection colour, so that is invisible; a second highlight — the laser's
+ * pointer colour, say — would need this keyed on the colour as well, and the comment on
+ * `of` below is where that would bite.
+ */
+class HighlightMaterials {
+  private readonly clones = new Map<Material, Material>();
+
+  /** The glowing stand-in for `source`, built the first time it is asked for. */
+  of(source: Material, highlight: EmissiveHighlight): Material {
+    let clone = this.clones.get(source);
+    if (!clone) {
+      clone = highlightClone(source, highlight);
+      this.clones.set(source, clone);
+      return clone;
+    }
+    // Re-applied rather than assumed: the app has one selection colour today, and a
+    // second caller with another would otherwise get the first caller's glow.
+    setEmissiveHighlight(clone, highlight);
+    return clone;
+  }
+
+  dispose(): void {
+    for (const clone of this.clones.values()) clone.dispose();
+    this.clones.clear();
+  }
 }
 
-/** A part that is still one Object3D, which in stage 1 is every part. */
+/** A part that is still one Object3D, which in stage 2 is every part. */
 class MeshPartHandle implements PartHandle {
+  /**
+   * The file's own material, held only while a highlight is on.
+   *
+   * Swapping it back is what "unselect" means now, and it is why the shared material
+   * never learns it was highlighted: nothing is written to it, so nothing has to be
+   * remembered off it either.
+   */
+  private ownMaterial: Material | Material[] | undefined;
+
   constructor(
     readonly id: string,
     readonly name: string,
     /** Package-private on purpose: the registry walks subtrees through it. */
     readonly object: Object3D,
+    private readonly highlighted: HighlightMaterials,
   ) {}
 
   // Composed from position/quaternion/scale rather than copied from `.matrix`, because
@@ -300,14 +428,64 @@ class MeshPartHandle implements PartHandle {
     this.object.visible = visible;
   }
 
+  // A swap of the material rather than a write to it, which is the audit's D1: the
+  // glow used to be written onto whatever Material the mesh carried, and a file whose
+  // 400 bolts share one material has ONE Material, so selecting a bolt lit all 400.
+  // The part is now drawn from a private clone that carries the glow, and every other
+  // part keeps the file's own — the same look, one part at a time.
   setHighlight(highlight: EmissiveHighlight | null): void {
-    for (const material of materialsOf(this.object)) setEmissiveHighlight(material, highlight);
+    const mesh = this.object as Mesh;
+    if (!mesh.isMesh) return;
+    if (highlight === null) {
+      if (this.ownMaterial === undefined) return;
+      mesh.material = this.ownMaterial;
+      this.ownMaterial = undefined;
+      return;
+    }
+    if (this.ownMaterial === undefined) this.ownMaterial = mesh.material;
+    const own = this.ownMaterial;
+    // A multi-material part becomes several clones, one per group of its geometry: the
+    // CAD reader splits a solid whose faces differ in colour into a material each, and a
+    // highlight that only replaced the first would leave half a part glowing.
+    mesh.material = Array.isArray(own)
+      ? own.map((one) => this.highlighted.of(one, highlight))
+      : this.highlighted.of(own, highlight);
   }
 
   getBoundingBox(out: Box3): Box3 {
     return out.setFromObject(this.object);
   }
 }
+
+/**
+ * What one part was last drawn as, so a pass can skip the parts nothing moved.
+ *
+ * Two pairs rather than one because they answer different questions. The RAW pair is the
+ * tree's own value for this id, and diffing it is how a pass finds the ids that changed;
+ * the EFFECTIVE pair is what was written to the handle after this part's ancestors were
+ * folded in, and diffing THAT is how a descent knows it can stop.
+ */
+interface AppliedState {
+  rawVisible: boolean;
+  rawSelected: boolean;
+  effVisible: boolean;
+  effSelected: boolean;
+}
+
+/**
+ * A part nobody has touched: drawn, and not glowing.
+ *
+ * Which is also what a freshly parsed group IS — every Object3D comes out of a loader
+ * visible and on the file's own material — so seeding the registry with this is what
+ * lets the first `syncStates` write only the parts the tree has actually turned off or
+ * selected, instead of needing a separate "apply everything" first pass.
+ */
+const untouched = (): AppliedState => ({
+  rawVisible: true,
+  rawSelected: false,
+  effVisible: true,
+  effSelected: false,
+});
 
 /**
  * The registry for a model that is still drawn the way it was parsed: one Object3D per
@@ -320,15 +498,19 @@ class MeshPartHandle implements PartHandle {
  * pin contract in lib/scene/sceneEntries.ts: a pin names the part it was placed on, and
  * every participant derives the same ids from the same file.
  *
- * Owns no GPU resource — it indexes objects the parsed group already owns — so
- * `dispose` only drops the maps. Stage 4's batched implementation is the one that
- * allocates buffers and has something to free.
+ * Owns the highlight clones and nothing else — the geometry and the file's materials
+ * belong to the parsed group — so `dispose` frees the clones and drops the maps. Stage
+ * 4's batched implementation is the one that allocates buffers.
  */
 export class MeshPartRegistry implements PartRegistry {
   private readonly root: Object3D;
   private readonly handles: MeshPartHandle[] = [];
   private readonly byId = new Map<string, MeshPartHandle>();
   private readonly idByObject = new Map<Object3D, string>();
+  /** Nearest tagged ancestor, so a part's inherited state can be read without a walk down. */
+  private readonly parentOf = new Map<string, string | null>();
+  private readonly applied = new Map<string, AppliedState>();
+  private readonly highlighted = new HighlightMaterials();
 
   constructor(root: Object3D, tree?: SceneNode | null) {
     this.root = root;
@@ -342,10 +524,13 @@ export class MeshPartRegistry implements PartRegistry {
       // collapseSingleChildGroups dropped a row for, which stay pickable ancestors.
       if (typeof id !== 'string') return;
       const ownName = object.name?.trim() ?? '';
-      const handle = new MeshPartHandle(id, names.get(id) ?? (ownName || id), object);
+      const handle = new MeshPartHandle(id, names.get(id) ?? (ownName || id), object, this.highlighted);
       this.handles.push(handle);
       this.byId.set(id, handle);
       this.idByObject.set(object, id);
+      // Pre-order, so every ancestor of this object has already been indexed.
+      this.parentOf.set(id, this.taggedAncestorId(object));
+      this.applied.set(id, untouched());
     });
   }
 
@@ -357,12 +542,28 @@ export class MeshPartRegistry implements PartRegistry {
     return this.handles;
   }
 
-  // On demand rather than precomputed: at build time the group has not been scaled,
-  // centred or dropped onto the floor yet (placeImportedGroup runs in an effect after
-  // the parse), and its parts have not been moved by a variant. Stage 2 decides where
-  // the cached copy belongs once the callers it replaces are known.
+  // On demand rather than precomputed, and stage 2 settled it there: every caller runs
+  // AFTER something moved the geometry. placeImportedGroup scales the group and then
+  // measures it to find the floor, a variant moves individual parts, and the lobby
+  // measures a group it has just placed — so a box captured at build would be the box
+  // of a model nobody is looking at yet. A cache here would have to be invalidated by
+  // every transform write and every visibility change, which is more bookkeeping than
+  // the measurement.
   bounds(out: Box3): Box3 {
     return out.setFromObject(this.root);
+  }
+
+  // The model's own `visible` and nothing finer, which is what
+  // lib/scene/modelBounds has always answered: it measured the OUTERMOST tagged object
+  // with Box3.expandByObject, and expandByObject walks every child whether it is
+  // visible or not — so a part hidden inside a model that is still shown has never come
+  // out of that box. What hiding the model's own row does is stop `traverseVisible`
+  // descending into it at all, and that is the behaviour reproduced here. Stage 4 can
+  // answer per part, because a batch that swaps a hidden part out really is not drawing
+  // it; until then, changing this would re-frame every thumbnail of a room somebody had
+  // hidden a bolt in.
+  visibleBounds(out: Box3): Box3 {
+    return this.root.visible ? out.setFromObject(this.root) : out.makeEmpty();
   }
 
   partChainForHit(hit: PickHit): string[] | null {
@@ -395,10 +596,43 @@ export class MeshPartRegistry implements PartRegistry {
     });
   }
 
+  syncStates(
+    states: Record<string, PartState | undefined>,
+    highlight: EmissiveHighlight | null,
+  ): number {
+    // Pass 1: find the ids whose OWN value moved, and record the new value before any
+    // descent reads it — a descent folds in its ancestors, and an ancestor later in the
+    // list would otherwise be folded in with its old value.
+    const changed: MeshPartHandle[] = [];
+    for (const handle of this.handles) {
+      const applied = this.applied.get(handle.id);
+      if (!applied) continue;
+      const state = states[handle.id];
+      const rawVisible = state?.visible ?? true;
+      const rawSelected = state?.selected ?? false;
+      if (applied.rawVisible === rawVisible && applied.rawSelected === rawSelected) continue;
+      applied.rawVisible = rawVisible;
+      applied.rawSelected = rawSelected;
+      changed.push(handle);
+    }
+
+    // Pass 2: descend from each of them. Only a changed id can change its descendants'
+    // effective value, so nothing else is visited at all.
+    let touched = 0;
+    for (const handle of changed) {
+      const { visible, selected } = this.inheritedFrom(handle.id);
+      touched += this.applyDown(handle.object, visible, selected, highlight);
+    }
+    return touched;
+  }
+
   dispose(): void {
     this.handles.length = 0;
     this.byId.clear();
     this.idByObject.clear();
+    this.parentOf.clear();
+    this.applied.clear();
+    this.highlighted.dispose();
   }
 
   /**
@@ -414,5 +648,73 @@ export class MeshPartRegistry implements PartRegistry {
       if (current === this.root) return true;
     }
     return false;
+  }
+
+  /** The nearest ancestor with an id of its own, or null at the top of the model. */
+  private taggedAncestorId(object: Object3D): string | null {
+    for (let current = object.parent; current; current = current.parent) {
+      const id = this.idByObject.get(current);
+      if (id !== undefined) return id;
+    }
+    return null;
+  }
+
+  /**
+   * What a part inherits from the ids above it, before its own value is folded in.
+   *
+   * A walk UP rather than a descent from the root, because a pass starts at whichever
+   * part changed and the root may be forty thousand parts away: depth is a handful of
+   * steps, the model is not.
+   */
+  private inheritedFrom(id: string): { visible: boolean; selected: boolean } {
+    let visible = true;
+    let selected = false;
+    for (let parent = this.parentOf.get(id) ?? null; parent; parent = this.parentOf.get(parent) ?? null) {
+      const applied = this.applied.get(parent);
+      if (!applied) break;
+      visible = visible && applied.rawVisible;
+      selected = selected || applied.rawSelected;
+    }
+    return { visible, selected };
+  }
+
+  /**
+   * Write this part and everything below it, stopping where nothing moved.
+   *
+   * Stopping is safe and is the whole of the O(changed): a subtree is only re-entered
+   * when the part above it changed, and a part whose OWN value changed is in pass 1's
+   * list and gets a descent of its own. So a node whose effective value is the same as
+   * last time can only have descendants whose effective value is also the same, unless
+   * one of them changed on its own account — and that one is already scheduled.
+   */
+  private applyDown(
+    object: Object3D,
+    inheritedVisible: boolean,
+    inheritedSelected: boolean,
+    highlight: EmissiveHighlight | null,
+  ): number {
+    const id = this.idByObject.get(object);
+    let visible = inheritedVisible;
+    let selected = inheritedSelected;
+    let touched = 0;
+
+    if (id !== undefined) {
+      const applied = this.applied.get(id);
+      const handle = this.byId.get(id);
+      if (!applied || !handle) return 0;
+      visible = inheritedVisible && applied.rawVisible;
+      selected = inheritedSelected || applied.rawSelected;
+      if (applied.effVisible === visible && applied.effSelected === selected) return 0;
+      applied.effVisible = visible;
+      applied.effSelected = selected;
+      handle.setVisible(visible);
+      handle.setHighlight(selected ? highlight : null);
+      touched = 1;
+    }
+
+    for (const child of object.children) {
+      touched += this.applyDown(child, visible, selected, highlight);
+    }
+    return touched;
   }
 }

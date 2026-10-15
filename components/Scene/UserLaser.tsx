@@ -10,15 +10,15 @@ import { fingerPointerRef } from '../../lib/fingerPointerRef';
 import { pointingSourceRef } from '../../lib/pointingSourceRef';
 import { getModelCenter } from '../../lib/orbitPivot';
 import { laserSelectionId } from '../../lib/scene/clickSelection';
-import { hitParts, isPointableHit, partRegistries, type HitParts } from '../../lib/scene/partRegistry';
+import { hitParts, isPointableHit, partRegistries, type HitParts, type PartRegistry } from '../../lib/scene/partRegistry';
 import { EDITING_HELPER_KEY } from '../../lib/scene/captureClean';
 
 /** The resolution of a ray that hit nothing this frame. */
 const NO_PARTS: HitParts = { chain: [], modelId: null, handle: null };
 
 // Project the active model's center to NDC. Returns true on success.
-function computeModelCenterNDC(scene: THREE.Scene, camera: THREE.Camera, out: Vector2): boolean {
-    const center = getModelCenter(scene);
+function computeModelCenterNDC(registries: readonly PartRegistry[], camera: THREE.Camera, out: Vector2): boolean {
+    const center = getModelCenter(registries);
     if (!center) return false;
     center.project(camera); // world → NDC
     out.set(center.x, center.y);
@@ -222,7 +222,7 @@ const UserLaser: React.FC = () => {
                         // Hand has settled — lock origin to where the user actually is,
                         // and snap the anchor to the model center.
                         fingerOrigin.current.set(curr[0], curr[1]);
-                        if (computeModelCenterNDC(scene, camera, modelCenterTmp.current)) {
+                        if (computeModelCenterNDC(registries, camera, modelCenterTmp.current)) {
                             fingerAnchor.current.copy(modelCenterTmp.current);
                         } else {
                             fingerAnchor.current.copy(fingerOrigin.current);

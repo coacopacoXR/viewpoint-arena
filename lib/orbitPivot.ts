@@ -8,20 +8,31 @@
 // only *along the line of sight*, so nothing on screen moves.
 
 import * as THREE from 'three';
+import type { PartRegistry } from './scene/partRegistry';
 
 /**
- * World-space centre of the model loaded into the scene — the objects tagged
- * with `userData.modelId` — or null when there is no model.
+ * World-space centre of the models in the scene, or null when there are none.
+ *
+ * Asked of the part registries rather than found by walking the scene for objects tagged
+ * `userData.modelId`, because a registry is the only thing that can answer for a model
+ * that is not one Object3D per part: `Box3.expandByObject` walks a geometry, and a
+ * BatchedMesh's geometry is the concatenated buffer in the batch's own space, so the
+ * walk would pivot the camera on a box nobody is drawing (the render audit's R1).
+ *
+ * The bundled twelve-part synth is not in the answer, and never was: components/Scene/
+ * Product.tsx tags its part GROUPS and leaves their meshes untagged, and this has always
+ * asked for `isMesh` as well as the tag. A room showing only the synth still gets null
+ * here, and both callers still fall back to where they already were.
  */
-export function getModelCenter(scene: THREE.Scene): THREE.Vector3 | null {
+export function getModelCenter(registries: Iterable<PartRegistry>): THREE.Vector3 | null {
   const box = new THREE.Box3();
+  const one = new THREE.Box3();
   let found = false;
-  scene.traverse((obj) => {
-    if ((obj as { isMesh?: boolean }).isMesh === true && obj.userData?.modelId) {
-      box.expandByObject(obj);
-      found = true;
-    }
-  });
+  for (const registry of registries) {
+    if (registry.parts().length > 0) found = true;
+    if (registry.bounds(one).isEmpty()) continue;
+    box.union(one);
+  }
   if (!found) return null;
   return box.getCenter(new THREE.Vector3());
 }

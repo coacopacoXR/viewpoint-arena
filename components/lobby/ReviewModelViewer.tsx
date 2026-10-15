@@ -66,6 +66,7 @@ import { FRAME_FOV, applyFrame, frameBox } from '../../lib/scene/frameBox';
 import { reviewModelBounds } from '../../lib/scene/modelBounds';
 import { applyStoredPlacements } from '../../lib/scene/placement';
 import { applyPartTransforms } from '../../lib/scene/partTransforms';
+import { modelBox } from '../../lib/scene/partRegistry';
 import {
   sceneModelLabel,
   sceneModelTransform,
@@ -294,13 +295,17 @@ async function reviewSceneFor(reviewId: string): Promise<{
 /**
  * This model's world box, measured while its group is still detached.
  *
+ * Through the entry's part registry rather than straight off the group, for the reason
+ * `modelBox` gives: a box measured by walking geometry is a box of the wrong thing once
+ * a part is a slot in a batch.
+ *
  * The wrapper matrix is composed by hand from `sceneModelTransform` rather than read
  * off a group in the canvas, so it is the same numbers the JSX below is given: a
  * model written before Move / Rotate / Scale existed has no rotation and no scale
  * field, and sceneModelTransform is the one place that says what absent means.
  */
 function measure(model: SceneModel, entry: SceneModelEntry): THREE.Box3 {
-  const box = new THREE.Box3().setFromObject(entry.group);
+  const box = modelBox(entry.group, entry.partRegistry, new THREE.Box3());
   if (box.isEmpty()) return box;
   const transform = sceneModelTransform(model);
   const matrix = new THREE.Matrix4().compose(
@@ -495,7 +500,12 @@ const ReviewModelViewer: React.FC<ReviewModelViewerProps> = ({ reviewId, classNa
         // is owned by this effect from the moment it is parsed to the moment it is
         // disposed. Doing it before React has seen the object is also what makes
         // `measure` below exact — see LoadedModel.box.
-        placeImportedGroup(entry.group, entry.scale * entry.baseScale, entry.basePosition);
+        placeImportedGroup(
+          entry.group,
+          entry.scale * entry.baseScale,
+          entry.basePosition,
+          entry.partRegistry ?? null,
+        );
         // The parts somebody pulled apart in the room's Edit mode, batch BR. Applied
         // here as well as in SceneModelView because this viewer draws the review's own
         // scene — `reviewSceneFor` above has already put the review's stored placements

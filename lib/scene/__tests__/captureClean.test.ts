@@ -19,7 +19,11 @@ import {
   markEditingHelper,
 } from '../captureClean';
 import { setEmissiveHighlight } from '../materialHighlight';
+import { MeshPartRegistry } from '../partRegistry';
 import { captureRoomThumbnail, type CanvasFactory, type ThumbnailRenderer } from '../../reviews/thumbnail';
+
+/** components/Scene/ImportedModel.tsx's SELECTION_HIGHLIGHT, which is what a registry applies. */
+const GLOW = { color: new THREE.Color(0x0044aa), intensity: 0.5 };
 
 /**
  * An object that claims to be three's transform gizmo.
@@ -137,6 +141,32 @@ describe('hideEditingHelpers — for the one render', () => {
     clean.restore();
     expect(material.emissive.getHex()).toBe(0x0044aa);
     expect(material.emissiveIntensity).toBe(0.5);
+  });
+
+  it('takes the glow off a part a REGISTRY highlighted, and gives it back', () => {
+    // Task 04b stage 2 moved the selection glow off the shared material and onto a
+    // private clone the part is drawn from, which is the fix for the audit's D1. Batch
+    // BV's promise has to survive that move: the picture of a review on every card in the
+    // lobby is a picture with nobody's selection in it.
+    const model = product();
+    const own = model.material as THREE.MeshStandardMaterial;
+    const registry = new MeshPartRegistry(model);
+    registry.syncStates({ bracket: { visible: true, selected: true } }, GLOW);
+
+    const lit = model.material as THREE.MeshStandardMaterial;
+    expect(lit).not.toBe(own);
+    expect(lit.emissive.getHex()).toBe(0x0044aa);
+    // The file's own material was never written to, so nothing here may calm it either.
+    expect(own.emissive.getHex()).toBe(0x000000);
+    expect(own.userData.originalEmissive).toBeUndefined();
+
+    const clean = hideEditingHelpers(scene(model));
+    expect(clean.calmed).toBe(1);
+    expect(lit.emissive.getHex()).toBe(0x000000);
+    expect(own.emissive.getHex()).toBe(0x000000);
+
+    clean.restore();
+    expect(lit.emissive.getHex()).toBe(0x0044aa);
   });
 
   it('leaves a material’s own emissive alone, because it is part of the model', () => {

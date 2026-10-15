@@ -5,16 +5,15 @@ import { useStore, sceneModelVisible, type SceneModelEntry } from '../../store';
 import type { SceneModel } from '../../lib/scene/roomScene';
 import { sceneModelTransform } from '../../lib/scene/roomScene';
 import { applyPartTransforms } from '../../lib/scene/partTransforms';
-import { setEmissiveHighlight } from '../../lib/scene/materialHighlight';
+import { modelBox, type PartRegistry } from '../../lib/scene/partRegistry';
 
 /**
  * The selection glow for an imported model, as one object rather than per-mesh values.
  *
- * Allocated once here because the walk that applies it runs over every mesh of every
- * model on every change to the tree's states, and the version this replaced built two
- * THREE.Colors per mesh per pass. The same blue the built-in samples use — see
- * SELECTION_GLOW in lib/builtInModelGlow.ts — because one selection has one colour
- * whichever model it is on.
+ * Allocated once here because it is handed to the registry on every state change, and
+ * the version this replaced built two THREE.Colors per mesh per pass. The same blue the
+ * bundled synth declares in its own JSX (`#0044aa` in components/Scene/Product.tsx),
+ * because one selection has one colour whichever model it is on.
  */
 const SELECTION_HIGHLIGHT = { color: new THREE.Color(0x0044aa), intensity: 0.5 };
 
@@ -29,12 +28,24 @@ const SELECTION_HIGHLIGHT = { color: new THREE.Color(0x0044aa), intensity: 0.5 }
  * that is comes from the SceneModel's offset, applied by the wrapper group in
  * SceneModelView below — so a model can be put beside another without this
  * having to know anything about the models around it.
+ *
+ * The floor is found through the model's registry, which is the only thing that can
+ * answer once a part stops being an Object3D of its own: `Box3.setFromObject` walks a
+ * geometry, and a BatchedMesh's geometry is the concatenated buffer in the batch's own
+ * space, so measuring that would drop the model on a floor no part is standing on (the
+ * render audit's R1). Null for a hand-built entry with no registry, which is a test
+ * fixture and nothing in the app.
  */
-export function placeImportedGroup(group: THREE.Object3D, scale: number, basePosition: THREE.Vector3 | null): void {
+export function placeImportedGroup(
+    group: THREE.Object3D,
+    scale: number,
+    basePosition: THREE.Vector3 | null,
+    registry: PartRegistry | null,
+): void {
     group.scale.setScalar(scale);
     if (basePosition) group.position.copy(basePosition).multiplyScalar(scale);
     group.updateMatrixWorld(true);
-    const box = new THREE.Box3().setFromObject(group);
+    const box = modelBox(group, registry, new THREE.Box3());
     group.position.y -= box.min.y;
 }
 
@@ -73,7 +84,12 @@ const SceneModelView: React.FC<{ model: SceneModel; entry: SceneModelEntry; labe
 
     useEffect(() => {
         if (!groupRef.current) return;
-        placeImportedGroup(groupRef.current, entry.scale * entry.baseScale, entry.basePosition);
+        placeImportedGroup(
+            groupRef.current,
+            entry.scale * entry.baseScale,
+            entry.basePosition,
+            entry.partRegistry ?? null,
+        );
     }, [entry]);
 
     /**
@@ -116,35 +132,32 @@ const SceneModelView: React.FC<{ model: SceneModel; entry: SceneModelEntry; labe
         });
     }, [registerPOI, entry, model.parts]);
 
+    /**
+     * Node visibility and the selection glow, as writes to the parts whose state moved.
+     *
+     * This used to be a recursive walk over every object of this model on every change
+     * to `objectStates` ANYWHERE in the scene, and the walk wrote to every material it
+     * passed: a 40 000-part assembly re-touched 40 000 materials each time somebody two
+     * models away clicked a row. The registry keeps the state it last applied, diffs the
+     * tree's own two booleans against it, and writes only the parts whose EFFECTIVE value
+     * moved plus the subtrees under them — both visibility and selection inherit
+     * downward, so a group is a subtree and a leaf is one part. One click is two parts.
+     *
+     * The glow is per PART now, which is the fix for the render audit's D1. It used to be
+     * written onto the Material, and materials are shared: `ensureMeshMaterial` hands
+     * back the same object for anything already standard, so a file whose 400 bolts share
+     * one material had one Material between them and selecting a bolt lit all 400. A
+     * highlighted part is drawn from a private clone instead, and every other part keeps
+     * the file's own.
+     *
+     * Still subscribed to the whole `objectStates` map rather than to this model's ids,
+     * because a zustand selector that picked out a sub-record would answer a fresh object
+     * on every change anywhere and re-render on all of them anyway. The subscription is
+     * the cheap half; the walk it used to trigger was not.
+     */
     useEffect(() => {
         if (!groupRef.current) return;
-
-        const updateVisibility = (object: THREE.Object3D, parentVisible: boolean, parentSelected: boolean) => {
-            const id = object.userData.modelId as string | undefined;
-            const state = id ? objectStates[id] : undefined;
-            const isVisible = (state?.visible ?? true) && parentVisible;
-            const isSelected = (state?.selected ?? false) || parentSelected;
-
-            object.visible = isVisible;
-
-            if (object instanceof THREE.Mesh) {
-                const materials = Array.isArray(object.material) ? object.material : [object.material];
-                // The selection glow, and the material's own emissive back again when
-                // the selection moves on. It used to write black and zero here, which
-                // is what an imported material's emissive "should" be and is not: a
-                // file that gave a lens its glow, or a CAD export that marked a warning
-                // stripe with one, came back from being selected once permanently dead.
-                // lib/scene/materialHighlight remembers the original in userData the
-                // first time it is asked, so the restore costs one lookup per material.
-                materials.forEach(material => {
-                    setEmissiveHighlight(material, isSelected ? SELECTION_HIGHLIGHT : null);
-                });
-            }
-
-            object.children.forEach(child => updateVisibility(child, isVisible, isSelected));
-        };
-
-        updateVisibility(groupRef.current, true, false);
+        entry.partRegistry?.syncStates(objectStates, SELECTION_HIGHLIGHT);
     }, [objectStates, entry]);
 
     // Above the model, in scene units: the geometry is scaled inside the group,

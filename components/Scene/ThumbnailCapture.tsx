@@ -56,7 +56,12 @@ import { useThree } from '@react-three/fiber';
 import { sceneModelVisible, useStore } from '../../store';
 import { usePresence } from '../../lib/PresenceContext';
 import { useReviewRole } from '../../lib/reviews/useReviewRole';
-import { captureRoomThumbnail, saveReviewThumbnail } from '../../lib/reviews/thumbnail';
+import {
+  THUMBNAIL_QUALITY,
+  captureRoomThumbnail,
+  saveReviewThumbnail,
+} from '../../lib/reviews/thumbnail';
+import { partRegistries } from '../../lib/scene/partRegistry';
 
 /** How long the scene has to be still before an import or a move is worth a picture. */
 const SETTLE_MS = 3000;
@@ -112,7 +117,16 @@ const ThumbnailCapture: React.FC = () => {
     if (!allowed || !id) return;
     if (!somethingToShow()) return;
     try {
-      const thumbnail = captureRoomThumbnail(renderer, world, makeCanvas);
+      const thumbnail = captureRoomThumbnail(
+        renderer,
+        world,
+        makeCanvas,
+        THUMBNAIL_QUALITY,
+        // The models' boxes are asked of their registries rather than measured off the
+        // scene graph, and read at the moment of capture like `somethingToShow` above:
+        // this fires three seconds after the render that armed it.
+        partRegistries(useStore.getState().sceneEntries),
+      );
       if (!thumbnail) return;
       await saveReviewThumbnail(id, thumbnail);
     } catch (err) {

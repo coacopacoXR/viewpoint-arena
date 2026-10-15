@@ -23,6 +23,7 @@ import { ViewMode } from '../../types';
 import type { ViewCapture } from '../../types';
 import { xrStore } from '../../lib/xrStore';
 import { computeOrbitPivot, getModelCenter } from '../../lib/orbitPivot';
+import { partRegistries } from '../../lib/scene/partRegistry';
 import { FOLLOW_RESUME_DELAY_MS } from '../../lib/followTiming';
 import { EDITING_HELPER_KEY } from '../../lib/scene/captureClean';
 import * as THREE from 'three';
@@ -247,16 +248,25 @@ const SceneRenderer = () => {
   // drag after leaving a follow spins the user on the spot instead of orbiting
   // the model, and zoom is stuck at minDistance. The pivot stays on the view
   // ray, so nothing the user sees moves.
+  //
+  // The model's centre comes from the part registries, read at the moment of the
+  // repivot rather than closed over: this fires exactly when a driven camera hands
+  // control back, which can be a long time after the render that armed it, and the
+  // models in the scene are not the ones that were there then.
   const repivot = useCallback(() => {
     const controls = controlsRef.current;
     if (!controls) return;
     const cam = defaultCamera as THREE.PerspectiveCamera;
     forwardVec.current.set(0, 0, -1).applyQuaternion(cam.quaternion);
     controls.target.copy(
-      computeOrbitPivot(cam.position, forwardVec.current, getModelCenter(scene)),
+      computeOrbitPivot(
+        cam.position,
+        forwardVec.current,
+        getModelCenter(partRegistries(useStore.getState().sceneEntries)),
+      ),
     );
     controls.update();
-  }, [defaultCamera, scene]);
+  }, [defaultCamera]);
 
   // Repivot exactly where a driven camera hands control back — and nowhere
   // else: a camera jump to a review pin sets the target on purpose.

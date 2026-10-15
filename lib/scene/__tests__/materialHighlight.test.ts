@@ -8,8 +8,7 @@
 
 import { describe, it, expect } from 'vitest';
 import * as THREE from 'three';
-import { applyBuiltInGlow } from '../../builtInModelGlow';
-import { originalEmissiveOf, setEmissiveHighlight } from '../materialHighlight';
+import { highlightClone, originalEmissiveOf, setEmissiveHighlight } from '../materialHighlight';
 
 const GLOW = { color: new THREE.Color(0x0044aa), intensity: 0.5 };
 
@@ -103,44 +102,54 @@ describe('setEmissiveHighlight', () => {
   });
 });
 
-describe('the glow the built-in samples ease back from', () => {
-  it('eases towards the material\'s own emissive, not towards black', () => {
-    // The samples do not snap a highlight on and off: lib/builtInModelGlow.ts lerps
-    // every mesh towards its target every frame, and towards ZERO when there is no
-    // target, which is how a laser sweeping across the headphones took the file's own
-    // glow off them permanently. Two hundred frames with nobody pointing at anything is
-    // what "the highlight has ended" means there.
-    const mat = material(0xff6600, 0.8);
-    const root = new THREE.Group();
-    root.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), mat));
-    const scratch = new THREE.Color();
+describe('highlightClone — the per-part copy a selection draws from', () => {
+  it('leaves the material it was cloned from exactly where it was, which is the fix for D1', () => {
+    // The defect this exists for: 400 bolts sharing one material had one Material between
+    // them, so `setEmissiveHighlight` on it lit all 400 when one was selected. Nothing is
+    // written to the source any more, so nothing else that shares it can move.
+    const source = material(0xff6600, 0.8);
+    const clone = highlightClone(source, GLOW) as THREE.MeshStandardMaterial;
 
-    for (let frame = 0; frame < 200; frame += 1) {
-      applyBuiltInGlow(root, 'headphones_0', 'part', {}, scratch);
-    }
-
-    expect(mat.emissiveIntensity).toBeCloseTo(0.8, 4);
-    // getHex rather than the channels: three manages colour, so a Color built from
-    // 0xff6600 holds it in linear-srgb and its green channel is 0.13, not 0.4.
-    expect(mat.emissive.getHex()).toBe(0xff6600);
+    expect(clone).not.toBe(source);
+    expect(clone.emissive.getHex()).toBe(0x0044aa);
+    expect(clone.emissiveIntensity).toBe(0.5);
+    expect(source.emissive.getHex()).toBe(0xff6600);
+    expect(source.emissiveIntensity).toBe(0.8);
+    // And the source was never STAMPED, which matters at scale: the whole point of
+    // remembering lazily is that a 40 000-part assembly does not get 40 000 writes.
+    expect(source.userData.originalEmissive).toBeUndefined();
   });
 
-  it('still lights a mesh up while something is pointing at it', () => {
-    // The regression this must not cause: remembering the original is not the same as
-    // refusing to move off it.
-    const mat = material(0xff6600, 0.8);
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), mat);
-    mesh.userData.nodeId = 'headphones_1';
-    const root = new THREE.Group();
-    root.add(mesh);
-    const scratch = new THREE.Color();
-    const selected = { headphones_1: { id: 'headphones_1', visible: true, selected: true, expanded: true } };
+  it('remembers the source\'s own emissive on the clone, so the clone can give it back', () => {
+    const source = material(0x00ff88, 1);
+    const clone = highlightClone(source, GLOW) as THREE.MeshStandardMaterial;
 
-    for (let frame = 0; frame < 200; frame += 1) {
-      applyBuiltInGlow(root, 'headphones_0', 'part', selected, scratch);
-    }
+    // A clone starts unstamped even though Material.copy runs `userData` through JSON:
+    // a remembered original holds a THREE.Color, which JSON turns into a plain {r,g,b},
+    // so the copy is dropped and the clone stamps its own real Color instead.
+    const remembered = clone.userData.originalEmissive;
+    expect(remembered.color).toBeInstanceOf(THREE.Color);
+    expect(remembered.color.getHex()).toBe(0x00ff88);
+    expect(remembered.intensity).toBe(1);
 
-    expect(mat.emissiveIntensity).toBeCloseTo(0.5, 4);
-    expect(mat.emissive.b).toBeGreaterThan(mat.emissive.r);
+    setEmissiveHighlight(clone, null);
+    expect(clone.emissive.getHex()).toBe(0x00ff88);
+    expect(clone.emissiveIntensity).toBe(1);
+  });
+
+  it('carries the source\'s textures across, because the look must not change', () => {
+    const map = new THREE.Texture();
+    const source = material(0x000000, 0);
+    source.map = map;
+    source.name = 'bolt-steel';
+
+    const clone = highlightClone(source, GLOW) as THREE.MeshStandardMaterial;
+
+    // By reference, which is what utils/modelLoader's convertToStandardMaterial does too
+    // and the reason components/lobby/ReviewModelViewer must not dispose a texture: a
+    // highlight that dropped the diffuse map would be a far more visible change than the
+    // glow it was asked for.
+    expect(clone.map).toBe(map);
+    expect(clone.name).toBe('bolt-steel');
   });
 });

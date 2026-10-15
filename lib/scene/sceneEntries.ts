@@ -28,11 +28,11 @@ export interface SceneModelEntry {
    * OPTIONAL, and only because the parse is not the only way to get an entry: tests
    * hand-build one around a bare Group to exercise a component that never looks at a
    * part, and making the field required would have nine of them fabricate a registry
-   * for nothing. `sceneModelEntry` below always fills it, and a missing one is safe in
-   * this stage rather than silently wrong — `hitParts` falls back to reading the ids
-   * off the tagged objects, which is exactly what a MeshPartRegistry indexes. Stage 4
-   * is where the fallback stops being able to answer for a batched model, and where
-   * this becomes required.
+   * for nothing. `sceneModelEntry` below always fills it, and a missing one is safe
+   * rather than silently wrong: `hitParts` falls back to reading the ids off the tagged
+   * objects and `modelBox` to measuring the group, both of which are exactly what a
+   * MeshPartRegistry indexes. Stage 4 is where the fallbacks stop being able to answer
+   * for a batched model, and where this becomes required.
    */
   partRegistry?: PartRegistry;
   fileName: string;

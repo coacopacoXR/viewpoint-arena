@@ -114,6 +114,18 @@ export function hideEditingHelpers(root: Object3D | null | undefined): CaptureCl
     object.visible = false;
   });
 
+  // Pass 2, the selection glow. Still a material walk, and still needed, after task 04b
+  // made a highlight per PART: a part is now drawn from a private clone of its material
+  // that carries the glow (lib/scene/partRegistry's `setHighlight`, via
+  // `highlightClone`), and a clone is a Material like any other — it is the mesh's live
+  // material while the part is selected, so this pass finds it, calms it for the one
+  // render and gives the glow back afterwards. What changed is WHICH material it finds:
+  // the clone, stamped with its own remembered original, rather than the file's material
+  // shared with three hundred other parts, which is now never written to at all.
+  //
+  // The render audit expected this pass to disappear, on the reasoning that a highlight
+  // would stop being a material property. That is true of stage 4's instanced-colour
+  // path and not of the overlay path stage 2 took, so the pass stays until it is.
   root.traverse((object) => {
     if (!(object instanceof Mesh)) return;
     for (const material of Array.isArray(object.material) ? object.material : [object.material]) {

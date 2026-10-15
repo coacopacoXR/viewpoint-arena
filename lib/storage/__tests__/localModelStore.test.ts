@@ -25,6 +25,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { LocalModelStore } from '../localModelStore.ts';
 import { sha256Hex } from '../hash.ts';
 
@@ -312,5 +313,145 @@ describe('LocalModelStore.delete', () => {
     await store.put(BYTES, META);
     expect(await store.delete('../secret')).toBe(false);
     expect(entries()).toEqual([HASH, `${HASH}.json`]);
+  });
+});
+
+// ─── Derivatives ────────────────────────────────────────────────────────────
+//
+// A derivative is a file the app COMPUTED from a stored one and keyed by the
+// SOURCE's hash, so it is never a second identity for a model — the room socket
+// and a curated review keep carrying the source hash. What is worth a red test is
+// the three ways that could quietly go wrong: a derivative showing up in `list()`
+// as if it were a model, one outliving the source it was made from, and one being
+// served half-written to a participant whose browser is already loading it.
+
+describe('LocalModelStore — derivatives', () => {
+  // A stand-in for the GLB convert-service would answer with: the magic and
+  // version a real one starts with, then padding.
+  const GLB = Buffer.concat([
+    Buffer.from('glTF', 'ascii'),
+    Buffer.from([0x02, 0x00, 0x00, 0x00]),
+    Buffer.alloc(24, 0x11),
+  ]);
+  const GLB_PATH = join('derived', `${HASH}.glb`);
+
+  // The source a derivative is keyed on is the CAD file, not the GLB above: the
+  // app converts STEP/IGES/BREP and has no reason to convert a mesh.
+  const STEP_META = { ...META, fileName: 'bracket.step', contentType: 'model/step' };
+
+  /** The source every derivative here is keyed on. */
+  async function putSource(): Promise<void> {
+    await store.put(BYTES, STEP_META);
+  }
+
+  async function readDerived(): Promise<Buffer | null> {
+    const stream = await store.getDerived(HASH, 'glb');
+    return stream ? readAll(stream) : null;
+  }
+
+  it('round-trips bytes under derived/, keyed by the SOURCE hash', async () => {
+    await putSource();
+    await store.putDerived(HASH, 'glb', new Uint8Array(GLB));
+
+    expect(readFileSync(join(dir, GLB_PATH))).toEqual(GLB);
+    expect(await store.headDerived(HASH, 'glb')).toEqual({ size: GLB.byteLength });
+    expect(await readDerived()).toEqual(GLB);
+  });
+
+  it('round-trips a stream, which is how a conversion response arrives', async () => {
+    await putSource();
+    // Readable.from over two chunks, not one buffer: the point of accepting a
+    // stream is that the api writes the GLB as convert-service produces it, and a
+    // single-chunk test would pass with an implementation that only ever buffers.
+    await store.putDerived(HASH, 'glb', Readable.from([GLB.subarray(0, 8), GLB.subarray(8)]));
+
+    expect(readFileSync(join(dir, GLB_PATH))).toEqual(GLB);
+    expect(await store.headDerived(HASH, 'glb')).toEqual({ size: GLB.byteLength });
+  });
+
+  it('replaces an earlier derivative instead of keeping both', async () => {
+    await putSource();
+    await store.putDerived(HASH, 'glb', new Uint8Array(GLB));
+    const smaller = Buffer.from('glTF');
+    await store.putDerived(HASH, 'glb', new Uint8Array(smaller));
+
+    // One object, the newest: the key names the SOURCE, so a re-conversion is a
+    // replacement, and skipping it would pin every room to the first GLB this
+    // deployment ever produced.
+    expect(await readDerived()).toEqual(smaller);
+    expect(await store.headDerived(HASH, 'glb')).toEqual({ size: smaller.byteLength });
+    expect(readdirSync(join(dir, 'derived'))).toEqual([`${HASH}.glb`]);
+  });
+
+  it('answers null for a derivative nobody wrote', async () => {
+    await putSource();
+    expect(await store.getDerived(HASH, 'glb')).toBeNull();
+    expect(await store.headDerived(HASH, 'glb')).toBeNull();
+  });
+
+  it('refuses a source hash that is not a content address', async () => {
+    await putSource();
+    for (const bad of ['../secret', `${HASH}g`, HASH.toUpperCase(), '']) {
+      expect(await store.getDerived(bad, 'glb'), bad).toBeNull();
+      expect(await store.headDerived(bad, 'glb'), bad).toBeNull();
+    }
+    // A put is a caller bug rather than a lookup, so it throws instead of
+    // silently dropping a finished conversion — and nothing reached the disk.
+    await expect(store.putDerived('../secret', 'glb', new Uint8Array(GLB))).rejects.toThrow(
+      /model hash/,
+    );
+    expect(existsSync(join(dir, 'derived'))).toBe(false);
+  });
+
+  it('leaves no derivative and no temp file when the write cannot be finished', async () => {
+    await putSource();
+    const fs = await import('node:fs');
+    vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+      throw new Error('EXDEV: cross-device link');
+    });
+
+    await expect(store.putDerived(HASH, 'glb', Readable.from([GLB]))).rejects.toThrow(/EXDEV/);
+
+    // The destination path only ever exists complete, so a participant polling
+    // the derived route is told "pending" rather than handed a truncated GLB that
+    // a loader would report as a corrupt model.
+    expect(existsSync(join(dir, GLB_PATH))).toBe(false);
+    expect(await store.getDerived(HASH, 'glb')).toBeNull();
+    expect(readdirSync(join(dir, 'derived'))).toEqual([]);
+  });
+
+  it('is not listed as a model', async () => {
+    await putSource();
+    await store.putDerived(HASH, 'glb', new Uint8Array(GLB));
+
+    // One entry, for the source. A listing that showed the derivative would show
+    // the same assembly twice in the admin console and offer to delete what is
+    // only a cache of it.
+    expect(await store.list()).toEqual([
+      { hash: HASH, ...STEP_META, size: BYTES.byteLength },
+    ]);
+  });
+
+  it('goes when its source is deleted, and reports the deletion', async () => {
+    await putSource();
+    await store.putDerived(HASH, 'glb', new Uint8Array(GLB));
+
+    expect(await store.delete(HASH)).toBe(true);
+
+    expect(existsSync(join(dir, GLB_PATH))).toBe(false);
+    expect(entries()).toEqual(['derived']);
+  });
+
+  it('reports a deletion that only removed a derivative', async () => {
+    // The state an interrupted cleanup leaves. Something WAS removed, so the
+    // admin console's "deleted" is honest rather than a claim nothing happened.
+    await store.putDerived(HASH, 'glb', new Uint8Array(GLB));
+    expect(await store.delete(HASH)).toBe(true);
+    expect(await store.getDerived(HASH, 'glb')).toBeNull();
+  });
+
+  it('deleting an unstored hash still removes nothing and reports false', async () => {
+    expect(await store.delete(HASH)).toBe(false);
+    expect(entries()).toEqual([]);
   });
 });

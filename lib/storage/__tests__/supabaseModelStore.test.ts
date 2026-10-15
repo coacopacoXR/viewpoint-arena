@@ -7,6 +7,7 @@
 // or a log reader could pick it up.
 
 import { describe, expect, it, vi } from 'vitest';
+import { Readable } from 'node:stream';
 import { SupabaseModelStore } from '../supabaseModelStore.ts';
 import { sha256Hex } from '../hash.ts';
 
@@ -99,6 +100,23 @@ function fakeStorage() {
       }
 
       const found = objects.get(path);
+      if ((init?.method ?? 'GET') === 'HEAD') {
+        // What Storage's object route answers a HEAD with: the headers and no
+        // body. Content-Length is set explicitly because undici does not derive
+        // one for a Response built in-process, and a real Storage does send it —
+        // which is the whole of what headDerived has to measure a derivative with.
+        if (!found) {
+          return new Response(null, { status: 400 });
+        }
+        return new Response(null, {
+          status: 200,
+          headers: {
+            'Content-Type': found.contentType,
+            'Content-Length': String(found.body.byteLength),
+          },
+        });
+      }
+
       if (!found) {
         return new Response(
           JSON.stringify({ statusCode: '400', error: 'Not found', message: 'Object not found' }),
@@ -317,7 +335,10 @@ describe('SupabaseModelStore.delete', () => {
     expect(storage.objects.has(`${HASH}.json`)).toBe(false);
     // The DELETE calls carried the service-role key as bearer and apikey.
     const deleteCalls = storage.calls.filter((c) => c.method === 'DELETE');
-    expect(deleteCalls).toHaveLength(2);
+    // Three, not two: object, sidecar, and the derivative — which is asked for
+    // even when nothing was ever converted, because Storage has no prefix delete
+    // and a 400 for an absent object is the normal answer.
+    expect(deleteCalls).toHaveLength(3);
     for (const call of deleteCalls) {
       expect(call.headers['Authorization']).toBe(`Bearer ${SERVICE_ROLE_KEY}`);
       expect(call.headers['apikey']).toBe(SERVICE_ROLE_KEY);
@@ -336,6 +357,104 @@ describe('SupabaseModelStore.delete', () => {
   });
 });
 
+// ─── Derivatives ────────────────────────────────────────────────────────────
+//
+// The same contract the local store keeps, over Storage's REST routes: a
+// derivative lives under `derived/`, is named for its SOURCE, is invisible to
+// `list()`, and goes when its source does.
+
+describe('SupabaseModelStore — derivatives', () => {
+  const GLB = Buffer.concat([
+    Buffer.from('glTF', 'ascii'),
+    Buffer.from([0x02, 0x00, 0x00, 0x00]),
+    Buffer.alloc(24, 0x11),
+  ]);
+  const DERIVED_KEY = `derived/${HASH}.glb`;
+
+  it('stores a derivative under derived/, named for the SOURCE hash', async () => {
+    const { storage, store } = makeStore();
+    await store.putDerived(HASH, 'glb', new Uint8Array(GLB));
+
+    expect(storage.calls.map((c) => c.url)).toEqual([`${OBJECT_PREFIX}${DERIVED_KEY}`]);
+    // Upsert, so a re-conversion replaces rather than fails on the object that is
+    // already there — the key names the source, so it cannot collide with a
+    // different derivative of it.
+    expect(storage.calls[0]?.method).toBe('POST');
+    expect(storage.calls[0]?.headers['x-upsert']).toBe('true');
+    expect(storage.calls[0]?.headers['Content-Type']).toBe('model/gltf-binary');
+    expect(storage.objects.get(DERIVED_KEY)?.body).toEqual(GLB);
+  });
+
+  it('buffers a stream, because a Storage upload is one request', async () => {
+    const { storage, store } = makeStore();
+    await store.putDerived(HASH, 'glb', Readable.from([GLB.subarray(0, 8), GLB.subarray(8)]));
+    expect(storage.objects.get(DERIVED_KEY)?.body).toEqual(GLB);
+  });
+
+  it('round-trips the bytes as a stream, and the length from a HEAD', async () => {
+    const { storage, store } = makeStore();
+    await store.putDerived(HASH, 'glb', new Uint8Array(GLB));
+
+    // headDerived asks with HEAD rather than downloading the object to measure it.
+    expect(await store.headDerived(HASH, 'glb')).toEqual({ size: GLB.byteLength });
+    expect(storage.calls.at(-1)?.method).toBe('HEAD');
+
+    const stream = await store.getDerived(HASH, 'glb');
+    expect(stream).not.toBeNull();
+    expect(await readAll(stream!)).toEqual(GLB);
+  });
+
+  it('answers null for a derivative nobody wrote, on both 400 and 404', async () => {
+    const { store } = makeStore();
+    expect(await store.getDerived(HASH, 'glb')).toBeNull();
+    expect(await store.headDerived(HASH, 'glb')).toBeNull();
+  });
+
+  it('refuses a value that is not a hash, without making a request', async () => {
+    const { storage, store } = makeStore();
+    for (const bad of ['../etc/passwd', HASH.toUpperCase(), HASH.slice(1), '']) {
+      expect(await store.getDerived(bad, 'glb')).toBeNull();
+      expect(await store.headDerived(bad, 'glb')).toBeNull();
+    }
+    await expect(store.putDerived('../etc/passwd', 'glb', new Uint8Array(GLB))).rejects.toThrow(
+      /model hash/,
+    );
+    expect(storage.fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('is not listed as a model', async () => {
+    const { store } = makeStore();
+    await store.put(BYTES, META);
+    await store.putDerived(HASH, 'glb', new Uint8Array(GLB));
+
+    // Only the source. The bucket now holds three objects — the file, its sidecar
+    // and the derivative — and exactly one of them is a model an admin can delete.
+    expect(await store.list()).toEqual([{ hash: HASH, ...META, size: BYTES.byteLength }]);
+  });
+
+  it('goes when its source is deleted', async () => {
+    const { storage, store } = makeStore();
+    await store.put(BYTES, META);
+    await store.putDerived(HASH, 'glb', new Uint8Array(GLB));
+
+    expect(await store.delete(HASH)).toBe(true);
+
+    expect(storage.objects.has(DERIVED_KEY)).toBe(false);
+    const deletedPaths = storage.calls
+      .filter((c) => c.method === 'DELETE')
+      .map((c) => c.url.slice(OBJECT_PREFIX.length));
+    expect(deletedPaths).toEqual([HASH, `${HASH}.json`, DERIVED_KEY]);
+  });
+
+  it('throws on a server error rather than reporting the derivative absent', async () => {
+    const { storage, store } = makeStore();
+    await store.putDerived(HASH, 'glb', new Uint8Array(GLB));
+    storage.failEveryRequestWith(503);
+    await expect(store.getDerived(HASH, 'glb')).rejects.toThrow(/HTTP 503/);
+    await expect(store.headDerived(HASH, 'glb')).rejects.toThrow(/HTTP 503/);
+  });
+});
+
 describe('SupabaseModelStore — the service-role key stays server-side', () => {
   it('never appears in a URL', async () => {
     const { storage, store } = makeStore();
@@ -343,6 +462,11 @@ describe('SupabaseModelStore — the service-role key stays server-side', () => 
     await store.get(HASH);
     await store.head(HASH);
     await store.list();
+    // The derivative routes too: they are the ones added last, and a key that
+    // leaked into a `derived/` URL would be invisible to every assertion above.
+    await store.putDerived(HASH, 'glb', BYTES);
+    await store.getDerived(HASH, 'glb');
+    await store.headDerived(HASH, 'glb');
     for (const call of storage.calls) {
       expect(call.url).not.toContain(SERVICE_ROLE_KEY);
       expect(call.url).not.toContain(encodeURIComponent(SERVICE_ROLE_KEY));
@@ -358,6 +482,9 @@ describe('SupabaseModelStore — the service-role key stays server-side', () => 
       () => store.get(HASH).then((s) => s && readAll(s)),
       () => store.head(HASH),
       () => store.list(),
+      () => store.putDerived(HASH, 'glb', BYTES),
+      () => store.getDerived(HASH, 'glb').then((s) => s && readAll(s)),
+      () => store.headDerived(HASH, 'glb'),
     ]) {
       try {
         await attempt();
@@ -365,7 +492,7 @@ describe('SupabaseModelStore — the service-role key stays server-side', () => 
         messages.push((err as Error).message);
       }
     }
-    expect(messages.length).toBe(4);
+    expect(messages.length).toBe(7);
     for (const message of messages) {
       expect(message).not.toContain(SERVICE_ROLE_KEY);
       expect(message).not.toContain('internal');

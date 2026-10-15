@@ -8,10 +8,12 @@
 //
 //     <dir>/<sha256>          the bytes, and nothing but the bytes
 //     <dir>/<sha256>.json     the sidecar (lib/storage/sidecar.ts)
+//     <dir>/derived/<sha256>.glb   a derivative of that file (lib/storage/derived.ts)
 //
 // Flat is enough because the name is a 64-char content address: there are no
 // collisions to shard around and no subdirectory tree for a listing to walk —
-// `list()` is one `readdirSync` of this directory. It also means the ONLY thing
+// `list()` is one `readdirSync` of this directory, and the one subdirectory in it
+// holds no sidecar so a listing walks straight past. It also means the ONLY thing
 // that decides a path is a value MODEL_HASH_RE accepted, which is what makes a
 // request for `/api/models/../../etc/passwd` unreach this module at all — and it
 // is checked again here so a future caller that forgot the api's validation
@@ -20,19 +22,25 @@
 import { randomBytes } from 'node:crypto';
 import {
   createReadStream,
+  createWriteStream,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { compareModelHashes, isModelHash, sha256Hex } from './hash.ts';
 import { SIDECAR_SUFFIX, buildSidecar, parseSidecar, sidecarName } from './sidecar.ts';
+import { DERIVED_KINDS, derivedFilePath, isReadableStream } from './derived.ts';
 import type {
+  DerivedKind,
+  DerivedMeta,
   ModelListEntry,
   ModelMeta,
   ModelRef,
@@ -145,7 +153,65 @@ export class LocalModelStore implements ModelStore {
       rmSync(sidecarPath);
       removed = true;
     }
+    // Derivatives go with the source they were computed from. Nothing else would
+    // ever ask for one again — the route that serves them answers 404 once the
+    // source is gone — so leaving them is disk only `rm -rf` on the volume reclaims.
+    for (const kind of DERIVED_KINDS) {
+      const derivedPath = derivedFilePath(this.dir, hash, kind);
+      if (existsSync(derivedPath)) {
+        rmSync(derivedPath);
+        removed = true;
+      }
+    }
     return removed;
+  }
+
+  async putDerived(
+    sourceHash: string,
+    kind: DerivedKind,
+    bytes: Uint8Array | Readable,
+  ): Promise<void> {
+    if (!isModelHash(sourceHash)) {
+      // The object's name is built from this value, so refusing it here is what
+      // keeps `derived/<hash>.glb` inside the store even for a caller that forgot
+      // the api's own validation. A throw rather than a silent no-op: dropping a
+      // finished conversion would look exactly like a conversion that failed.
+      throw new Error('putDerived needs a model hash');
+    }
+    const dest = derivedFilePath(this.dir, sourceHash, kind);
+    // Created per write rather than in the constructor, so a store that never
+    // converts anything leaves no empty `derived/` behind to be mistaken for a
+    // half-finished one.
+    mkdirSync(dirname(dest), { recursive: true });
+    if (isReadableStream(bytes)) {
+      await this.writeAtomicStream(dest, bytes);
+    } else {
+      this.writeAtomic(dest, bytes);
+    }
+  }
+
+  async getDerived(sourceHash: string, kind: DerivedKind): Promise<Readable | null> {
+    if (!isModelHash(sourceHash)) return null;
+    const path = derivedFilePath(this.dir, sourceHash, kind);
+    if (!existsSync(path)) return null;
+    return createReadStream(path);
+  }
+
+  async headDerived(sourceHash: string, kind: DerivedKind): Promise<DerivedMeta | null> {
+    if (!isModelHash(sourceHash)) return null;
+    try {
+      const stat = statSync(derivedFilePath(this.dir, sourceHash, kind), {
+        throwIfNoEntry: false,
+      });
+      // isFile because the path is inside a directory this module owns: something
+      // else putting a directory there is a bug worth answering "no derivative"
+      // to rather than serving.
+      return stat?.isFile() ? { size: stat.size } : null;
+    } catch {
+      // Gone between the check and the stat, or a volume that went away. Absent,
+      // not an error — the same reading `head` gives a sidecar it cannot read.
+      return null;
+    }
   }
 
   /**
@@ -174,6 +240,31 @@ export class LocalModelStore implements ModelStore {
       // Nothing else knows this temp file's name, so nothing else would ever
       // remove it; a directory of orphaned .tmp files is how a volume quietly
       // fills up. `force` because the write may have failed before creating it.
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        // Already gone. The original error below is the one worth throwing.
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The streaming half of writeAtomic, for a derivative that arrives as the body
+   * of an HTTP response.
+   *
+   * Same two guarantees, and the reason a conversion is written this way rather
+   * than buffered: the api container is the thing that would hold it, and a
+   * GLB that streams to the volume costs the process one chunk at a time.
+   * `pipeline` destroys the source when the write fails, so a half-written
+   * derivative is neither renamed into place nor left with an open handle.
+   */
+  private async writeAtomicStream(dest: string, source: Readable): Promise<void> {
+    const tmp = `${dest}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+    try {
+      await pipeline(source, createWriteStream(tmp));
+      renameSync(tmp, dest);
+    } catch (err) {
       try {
         rmSync(tmp, { force: true });
       } catch {

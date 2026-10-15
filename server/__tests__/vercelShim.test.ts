@@ -64,6 +64,13 @@ const HANDLERS: Record<string, Mod> = {
   'models/[hash].ts': {
     default: (req, res) => res.status(200).json({ query: req.query }),
   },
+  // A dynamic segment with handlers UNDER it, which is the shape the derived-GLB
+  // route has: GET /api/models/<hash>/derived/glb is
+  // api/models/[hash]/derived/glb.ts. The parameter is captured in the middle of
+  // the path rather than at the end of it.
+  'models/[hash]/derived/glb.ts': {
+    default: (req, res) => res.status(200).json({ query: req.query }),
+  },
 };
 
 let dir: string;
@@ -75,7 +82,7 @@ beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), 'vp-shim-'));
   mkdirSync(join(dir, 'nested'));
   mkdirSync(join(dir, '_lib'));
-  mkdirSync(join(dir, 'models'));
+  mkdirSync(join(dir, 'models', '[hash]', 'derived'), { recursive: true });
   for (const name of Object.keys(HANDLERS)) writeFileSync(join(dir, name), '');
   writeFileSync(join(dir, '_lib', 'helper.ts'), '');
   writeFileSync(join(dir, 'noexport.ts'), '');
@@ -140,10 +147,12 @@ describe('routing', () => {
 
 // ─── Dynamic routes ─────────────────────────────────────────────────────────
 //
-// /api/models/<hash> is the first path in this app whose last segment is not a
-// file name. Vercel matches it with a `[param].ts` sibling; if the shim does
-// not, the route works in one deployment shape and 404s in the other, and the
-// failure is invisible until somebody imports a model on a self-hosted install.
+// /api/models/<hash> is the first path in this app with a segment that is not a
+// file name, and /api/models/<hash>/derived/glb is the first with one that is not
+// the LAST segment. Vercel matches both from the directory layout — a `[param].ts`
+// sibling and a `[param]/` folder; if the shim does not, the route works in one
+// deployment shape and 404s in the other, and the failure is invisible until
+// somebody imports a model on a self-hosted install.
 
 describe('dynamic routes', () => {
   const HASH = 'a'.repeat(64);
@@ -166,6 +175,9 @@ describe('dynamic routes', () => {
   });
 
   it('reports the resolved file and parameter for a dynamic match', () => {
+    // `[hash].ts`, and not the `[hash]/` directory that now sits beside it: a
+    // handler file wins at its own level before the walk descends into a folder
+    // named for the same segment.
     expect(resolveRoute(dir, `/api/models/${HASH}`)).toEqual({
       file: join(dir, 'models', '[hash].ts'),
       params: { hash: HASH },
@@ -189,11 +201,32 @@ describe('dynamic routes', () => {
     expect(body.query).toEqual({ hash: HASH, v: '2' });
   });
 
-  it('does not match a dynamic segment in the middle of a path', async () => {
-    // Only the LAST segment is a parameter. Anything deeper has no handler, and
-    // inventing one would mean guessing which folder a `[param].ts` belongs to.
-    expect((await fetch(`${base}/api/models/${HASH}/extra`)).status).toBe(404);
-    expect(resolveRoute(dir, `/api/models/${HASH}/extra`)).toBeNull();
+  it('routes a parameter that has handlers UNDER it, mid-path', async () => {
+    // GET /api/models/<hash>/derived/glb is api/models/[hash]/derived/glb.ts: the
+    // dynamic segment is the second of four, so matching it needs a walk of the
+    // directory tree rather than one look at the last segment's siblings.
+    const res = await fetch(`${base}/api/models/${HASH}/derived/glb`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ query: { hash: HASH } });
+    expect(resolveRoute(dir, `/api/models/${HASH}/derived/glb`)).toEqual({
+      file: join(dir, 'models', '[hash]', 'derived', 'glb.ts'),
+      params: { hash: HASH },
+    });
+  });
+
+  it('does not invent a handler for a segment nothing routes on', async () => {
+    // `extra` has no handler under `models/[hash]/`, and `derived` on its own is a
+    // directory rather than one. Guessing either would answer a route the api
+    // never declared, with a handler that was not written for it.
+    for (const path of [
+      `/api/models/${HASH}/extra`,
+      `/api/models/${HASH}/derived`,
+      `/api/models/${HASH}/derived/glb/extra`,
+      `/api/models/${HASH}/derived/GLB`,
+    ]) {
+      expect((await fetch(`${base}${path}`)).status, path).toBe(404);
+      expect(resolveRoute(dir, path), path).toBeNull();
+    }
   });
 
   it('still refuses traversal and anything a segment may not contain', () => {

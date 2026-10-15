@@ -4,11 +4,18 @@
 // what this route replaces — a 200 MB STEP file became a 267 MB string that the
 // room server then held in memory and replayed to every connection, and the
 // socket's 50 MB cap existed only because of it. Bytes in, `{ hash, size,
-// fileName }` out, and from then on every part of the app that needs this model
-// passes the hash around instead.
+// fileName, derived }` out, and from then on every part of the app that needs
+// this model passes the hash around instead.
 //
 // The name travels in `X-File-Name`, percent-encoded, because a header value is
 // ISO-8859-1 and part names are not always ASCII.
+//
+// `derived` is the one field that is not about the bytes just stored: a CAD file
+// also sets off a server-side tessellation (api/_lib/derivedJobs.ts) whose GLB is
+// collected later from /api/models/<hash>/derived/glb. It is a promise about work
+// that has started, never a wait for it — 'pending' when a conversion is going,
+// 'unavailable' when this deployment has no convert-service or the file is a mesh
+// that needs none.
 //
 // On Vercel the platform's own 4.5 MB body limit applies and cannot be raised;
 // the self-hosted stack, where the big CAD files actually arrive, is limited by
@@ -23,6 +30,8 @@ import {
   requestIsAllowed,
   resolveModelStore,
 } from './_lib/models.ts';
+import { startDerivedGlb } from './_lib/derivedJobs.ts';
+import type { ModelRef } from '../lib/storage/modelStore.ts';
 import { modelFileMime } from '../utils/modelFormats.ts';
 
 export const config = {
@@ -89,17 +98,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     return;
   }
 
+  let ref: ModelRef;
   try {
-    const ref = await store.put(bytes, {
+    ref = await store.put(bytes, {
       fileName,
       contentType: modelFileMime(fileName),
       uploadedAt: new Date().toISOString(),
     });
-    res.status(200).json({ hash: ref.hash, size: ref.size, fileName });
   } catch (err) {
     // The message can name a directory or a bucket. It goes to the log, and the
     // caller gets a code it can show next to "try again".
     console.error('[api/models] failed to store the upload:', err);
     res.status(500).json({ error: 'storage_error' });
+    return;
   }
+
+  // Started, NOT awaited, and outside the try above: a 200 MB assembly takes
+  // minutes to tessellate and the person importing it is owed an answer now, and
+  // a conversion that cannot start is not a reason to report the upload — which
+  // succeeded — as a storage failure.
+  //
+  // `derived` says what to expect: 'pending' for a CAD file on a deployment that
+  // runs convert-service, 'unavailable' for everything else, which is every mesh
+  // upload and every install that never configured the service (the default, and
+  // the whole of a Vercel deployment's experience). The GLB is collected later
+  // from /api/models/<hash>/derived/glb, and the source hash stays the only
+  // identity this upload produced.
+  const derived = startDerivedGlb(store, ref.hash, fileName, { bytes });
+  res.status(200).json({ hash: ref.hash, size: ref.size, fileName, derived });
 }

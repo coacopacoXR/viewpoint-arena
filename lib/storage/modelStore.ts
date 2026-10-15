@@ -12,6 +12,10 @@
 //     nothing and stores no second copy — which is also what makes the same
 //     revision uploaded from three browsers converge on one object.
 //
+// A store also holds DERIVATIVES: files computed from a stored one and keyed by
+// the SOURCE's hash, so the content address above stays the only identity that
+// travels anywhere. See DerivedKind below and ./derived.ts for the layout.
+//
 // Nothing here imports three.js, a worker, React or the config loader: it is
 // pulled in by api/models.ts and api/models/[hash].ts, and by nothing the
 // browser bundles. The client side talks to /api/models only.
@@ -56,6 +60,32 @@ export interface ModelListEntry extends ModelMeta {
   hash: string;
 }
 
+/**
+ * A file this app COMPUTED from a stored one: the meshopt-compressed GLB that
+ * convert-service tessellates a STEP/IGES/BREP upload into (task 03b).
+ *
+ * A derivative is addressed by its SOURCE's hash, never by its own, and that is
+ * the whole of its design. The source hash is the identity that travels on the
+ * room socket and in a curated review's asset, so a derivative keyed on anything
+ * else would be a second address for one model — and a re-conversion, after an
+ * operator raised a tessellation setting say, would orphan every reference a room
+ * already holds. Keyed on the source, it replaces in place and nothing downstream
+ * has to hear about it.
+ */
+export type DerivedKind = 'glb';
+
+/**
+ * What a store records about a derivative, and what `headDerived` answers with.
+ *
+ * Only the size, because everything else a caller wants is already known: the
+ * kind is in the request, the source is the key, and a derivative has no name of
+ * its own to record. `size` is 0 when a provider can hold the object but cannot
+ * report its length, which callers read as "unknown" rather than as "empty".
+ */
+export interface DerivedMeta {
+  size: number;
+}
+
 export interface ModelStore {
   /**
    * Store `bytes` under their own hash. Idempotent: putting the same bytes
@@ -89,16 +119,53 @@ export interface ModelStore {
    * a directory read nor a bucket listing has an order of its own. An object
    * whose sidecar is missing or unreadable is left out, exactly as `head`
    * leaves it out — the store cannot describe it, so there is nothing to show.
+   *
+   * Derivatives are NOT listed. They are not model files: nothing imports one,
+   * nothing references one by hash, and an admin console that showed them would
+   * show the same assembly twice and offer to delete a cache the source could
+   * always rebuild.
    */
   list(): Promise<ModelListEntry[]>;
 
   /**
-   * Remove the object and its sidecar. Returns true when something was removed,
-   * false when the hash was not stored. A hash that does not match MODEL_HASH_RE
-   * is treated as absent (false), not as an error — the admin console calls
-   * this after checking references, and a bad hash means "nothing to do".
+   * Remove the object, its sidecar and every derivative of it. Returns true when
+   * something was removed, false when the hash was not stored. A hash that does
+   * not match MODEL_HASH_RE is treated as absent (false), not as an error — the
+   * admin console calls this after checking references, and a bad hash means
+   * "nothing to do".
+   *
+   * Derivatives go with their source rather than surviving it: a GLB named for a
+   * hash the store no longer holds is unreachable through every route, so
+   * leaving it behind is disk no console can reclaim, and `delete` is the only
+   * place that knows the two belong together.
    */
   delete(hash: string): Promise<boolean>;
+
+  /**
+   * Store a derivative of `sourceHash`, replacing any earlier one.
+   *
+   * Not idempotent the way `put` is, and that follows from the key: `<hash>.glb`
+   * is named for the SOURCE, so a second conversion is a replacement rather than
+   * a duplicate. Skipping it because something is already there would pin every
+   * room to whatever an older convert-service produced, with no way to ask for a
+   * better one.
+   *
+   * Accepts a stream as well as bytes, because the thing being stored is the body
+   * of an HTTP response from convert-service. Writing it as it arrives is what
+   * keeps a large assembly's GLB out of the api container's heap; a provider that
+   * cannot stream an upload buffers it, and says so where it does.
+   *
+   * Throws when `sourceHash` is not a content address: the object's name is built
+   * from it, so this is the check that keeps `derived/<hash>.glb` inside the
+   * store, and it is a caller bug rather than a user-facing condition.
+   */
+  putDerived(sourceHash: string, kind: DerivedKind, bytes: Uint8Array | Readable): Promise<void>;
+
+  /** The derivative's bytes as a stream, or null when there is none. */
+  getDerived(sourceHash: string, kind: DerivedKind): Promise<Readable | null>;
+
+  /** The derivative's size, or null when there is none. */
+  headDerived(sourceHash: string, kind: DerivedKind): Promise<DerivedMeta | null>;
 }
 
 /**

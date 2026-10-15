@@ -14,7 +14,7 @@
 // never routable here either.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { existsSync, readdirSync } from 'node:fs';
+import { readdirSync, statSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 
 /** Vercel's default body limit for parsed bodies. */
@@ -24,14 +24,20 @@ const MAX_PARSED_BODY_BYTES = 4.5 * 1024 * 1024;
 const SEGMENT_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 /**
- * A Vercel dynamic-route file: `[param].ts`.
+ * A Vercel dynamic segment: `[param].ts` for a handler, `[param]` for a
+ * directory with handlers under it.
  *
- * The only routing this app needs beyond literal paths is `/api/models/<hash>`,
- * where the last segment is a SHA-256 the filesystem has no file for. Vercel
- * matches that with a sibling named `[hash].ts`; the shim has to match it the
- * same way or the route works in one deployment shape and 404s in the other.
+ * The only routing this app needs beyond literal paths is the model store's.
+ * `/api/models/<hash>` is `api/models/[hash].ts`, and the derived-GLB route under
+ * it is `api/models/[hash]/derived/glb.ts` — a SHA-256 the filesystem has no file
+ * for, in the middle of a path. Vercel matches both from the directory layout; the
+ * shim has to match them the same way or a route works in one deployment shape and
+ * 404s in the other.
  */
-const DYNAMIC_FILE_RE = /^\[([A-Za-z_][A-Za-z0-9_]*)\]\.ts$/;
+const DYNAMIC_SEGMENT_RE = /^\[([A-Za-z_][A-Za-z0-9_]*)\]$/;
+
+/** The suffix that makes a dynamic segment a handler rather than a directory. */
+const HANDLER_SUFFIX = '.ts';
 
 type Handler = (req: unknown, res: unknown) => unknown;
 
@@ -74,46 +80,113 @@ export interface ResolvedRoute {
  *
  * Never resolves outside apiDir: every segment must match SEGMENT_RE, which
  * excludes `..`, `_private`, dots, percent signs and encoded separators — so
- * the segments are safe to hand to `resolve` before any filesystem check, and
- * a path parameter can never carry a separator into a filename.
+ * the segments are safe to hand to `join` before any filesystem check, and a
+ * path parameter can never carry a separator into a filename. The walk below
+ * re-checks that invariant at every step rather than trusting it once.
  *
- * A file named for the exact path wins over a `[param].ts` sibling, which is
- * Vercel's own precedence and what lets `api/models.ts` answer POST /api/models
- * while `api/models/[hash].ts` answers GET /api/models/<hash>.
+ * A literal segment wins over a dynamic one at EVERY level, which is Vercel's
+ * own precedence and what lets `api/models.ts` answer POST /api/models while
+ * `api/models/[hash].ts` answers GET /api/models/<hash>.
  */
 export function resolveRoute(apiDir: string, pathname: string): ResolvedRoute | null {
   if (!pathname.startsWith('/api/')) return null;
   const segments = pathname.slice('/api/'.length).split('/');
   if (segments.length === 0 || !segments.every((s) => SEGMENT_RE.test(s))) return null;
   const root = resolve(apiDir);
+  return matchSegments(root, root, segments, {});
+}
 
-  const literal = resolve(root, ...segments) + '.ts';
-  if (literal.startsWith(root + sep) && existsSync(literal)) {
-    return { file: literal, params: {} };
+/**
+ * One step of the walk: match `segments[0]` against `dir`, then recurse.
+ *
+ * The last segment names a HANDLER FILE and every segment before it names a
+ * DIRECTORY. That is the only difference between the two halves below, and it is
+ * what lets a dynamic segment appear anywhere in a path rather than only at the
+ * end.
+ */
+function matchSegments(
+  root: string,
+  dir: string,
+  segments: string[],
+  params: Record<string, string>,
+): ResolvedRoute | null {
+  const [segment, ...rest] = segments;
+  // resolveRoute's SEGMENT_RE check already makes this impossible to fail; it is
+  // asserted at every step anyway, because "no path leaves apiDir" is the
+  // property a store's `<dir>/<hash>` relies on and this walk is what decides it.
+  if (segment === undefined || !isInside(root, dir)) return null;
+  const isLast = rest.length === 0;
+
+  const literal = join(dir, isLast ? `${segment}${HANDLER_SUFFIX}` : segment);
+  if (isLast ? isFile(literal) : isDirectory(literal)) {
+    const found = isLast ? { file: literal, params } : matchSegments(root, literal, rest, params);
+    if (found) return found;
   }
 
-  // The trailing segment may be a path parameter. Only the last one, and only
-  // one level deep: that is all this app routes on, and supporting Vercel's
-  // full grammar (optional, catch-all, nested dynamics) here would be code
-  // nothing calls.
-  const parent = segments.length > 1 ? resolve(root, ...segments.slice(0, -1)) : root;
-  if (!parent.startsWith(root)) return null;
-  let entries: string[];
-  try {
-    entries = readdirSync(parent);
-  } catch {
-    // No such directory (or it is a file, not a directory): nothing to match.
-    return null;
-  }
-  const value = segments[segments.length - 1];
-  // Sorted so two dynamic siblings in one folder resolve the same way every
-  // time rather than in whatever order the filesystem lists them.
-  for (const entry of entries.sort()) {
-    const match = DYNAMIC_FILE_RE.exec(entry);
-    if (!match) continue;
-    return { file: resolve(parent, entry), params: { [match[1]]: value } };
+  for (const { name, param } of dynamicSiblings(dir, isLast)) {
+    const target = join(dir, name);
+    const captured = { ...params, [param]: segment };
+    const found = isLast
+      ? { file: target, params: captured }
+      : matchSegments(root, target, rest, captured);
+    if (found) return found;
   }
   return null;
+}
+
+/**
+ * The `[param]` entries beside a literal one, sorted so two dynamic siblings in
+ * one folder resolve the same way every time rather than in whatever order the
+ * filesystem lists them.
+ *
+ * `handler` picks `[param].ts` files for a last segment over `[param]`
+ * directories for a middle one. A folder that holds no matching handler simply
+ * produces nothing here, which is how a path with no route stays a 404 instead of
+ * being answered by a guess about which folder a `[param]` belongs to.
+ */
+function dynamicSiblings(dir: string, handler: boolean): Array<{ name: string; param: string }> {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    // No such directory (or it is a file, not a directory): nothing to match.
+    return [];
+  }
+  const found: Array<{ name: string; param: string }> = [];
+  for (const entry of entries.sort()) {
+    if (entry.endsWith(HANDLER_SUFFIX) !== handler) continue;
+    const bare = handler ? entry.slice(0, -HANDLER_SUFFIX.length) : entry;
+    const match = DYNAMIC_SEGMENT_RE.exec(bare);
+    if (match) found.push({ name: entry, param: match[1] });
+  }
+  return found;
+}
+
+function isFile(path: string): boolean {
+  return statKind(path)?.isFile() ?? false;
+}
+
+function isDirectory(path: string): boolean {
+  return statKind(path)?.isDirectory() ?? false;
+}
+
+/**
+ * A stat, or nothing. `throwIfNoEntry` covers plain absence; the catch covers the
+ * paths that are absent in a less tidy way — a segment under something that turned
+ * out to be a file, or a volume that went away — all of which mean "nothing
+ * routable here" rather than "this request failed".
+ */
+function statKind(path: string): ReturnType<typeof statSync> | undefined {
+  try {
+    return statSync(path, { throwIfNoEntry: false });
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether `path` is `root` itself or somewhere under it, separator included. */
+function isInside(root: string, path: string): boolean {
+  return path === root || path.startsWith(root + sep);
 }
 
 /**

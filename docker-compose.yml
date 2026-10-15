@@ -292,10 +292,12 @@ services:
     networks:
       # edge: outbound internet for Onshape, Cloudflare TURN, Teams, cloud AI.
       - edge
-      # backend: capture-service and the db layer (db, rest, realtime).
+      # backend: capture-service, convert-service and the db layer (db, rest,
+      # realtime).
       - backend
     # Every secret the handlers read (ONSHAPE_*, CF_TURN_*, TEAMS_*, capture
-    # keys, CAPTURE_SHARED_SECRET). Runtime only, never an image layer.
+    # keys, CAPTURE_SHARED_SECRET, CONVERT_SHARED_SECRET). Runtime only, never an
+    # image layer.
     # Optional: `docker compose config` must work on a fresh clone before
     # install.sh has written .env, so a missing file is not an error.
     env_file:
@@ -312,6 +314,24 @@ services:
       # Not from .env: it is a compose service name, not a deployment choice, and
       # install.sh should not have to know it.
       CAPTURE_SERVICE_URL: ${CAPTURE_SERVICE_URL:-http://capture-service:8080}
+      # Where the CAD tessellation service is, as THIS container reaches it.
+      # api/_lib/convertClient.ts reads it. A compose install runs convert-service
+      # by default, so this defaults to it too. UNSET means no server-side
+      # conversion: every CAD import tessellates in the browser exactly as it did
+      # before convert-service existed, which is what a Vercel deployment (no
+      # compose file at all) always gets. Set it to an empty value in .env to turn
+      # conversion off on a self-hosted install. A compose service name rather
+      # than a deployment choice otherwise, so it is not written by install.sh.
+      # `-` and not `:-`, so that an empty value stays empty instead of falling
+      # back to the default.
+      CONVERT_SERVICE_URL: ${CONVERT_SERVICE_URL-http://convert-service:8080}
+      # The secret convert-service requires on EVERY route once it is set, which
+      # install.sh always sets. env_file already delivers it, and it is repeated
+      # here beside the URL because the two are one decision: an api pointed at
+      # convert-service without the secret gets a 401 on every conversion, and
+      # that failure lands in a background job's log line rather than in a
+      # response anybody is watching.
+      CONVERT_SHARED_SECRET: ${CONVERT_SHARED_SECRET:-}
       BACKUP_STATUS_DIR: /backups
       BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
     volumes:

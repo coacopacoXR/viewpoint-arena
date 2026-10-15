@@ -26,6 +26,7 @@ function read(relativePath: string): string {
 interface ComposeService {
   ports?: string[];
   volumes?: string[];
+  networks?: string[];
   environment?: Record<string, string>;
 }
 
@@ -144,6 +145,20 @@ describe('deploy/nginx/app.conf — /api/models', () => {
     // (${CAPTURE_SHARED_SECRET}) went with the capture routes that used it.
     expect([...new Set(APP_CONF.match(/\$\{[^}]*\}/g) ?? [])]).toEqual([]);
   });
+
+  it('also answers the derived-GLB route under a hash, with nothing new added', () => {
+    // /api/models/<hash>/derived/glb is served by the same `api` container, so the
+    // prefix location above covers it and needs no sibling block of its own. What
+    // it must NOT do is fall through to /api/, whose 300s read timeout would cut
+    // off a 200 MB download and whose `add_header Cache-Control "no-store"` would
+    // sit beside the handler's `immutable` and make every participant re-fetch.
+    expect(MODELS_HEADER).toBe('location /api/models {');
+    expect(MODELS_CODE).toContain('proxy_read_timeout 900s;');
+    expect(MODELS_CODE).not.toContain('add_header Cache-Control');
+    // Nothing in the block matches on a path deeper than /api/models, so a new
+    // sub-path cannot be caught by an exact or regex location written for another.
+    expect(APP_CONF_CODE).not.toContain('location /api/models/');
+  });
 });
 
 // ─── compose ────────────────────────────────────────────────────────────────
@@ -177,6 +192,45 @@ describe('docker-compose.yml — the models volume', () => {
     // api route; publishing 8787 would put model upload and download on the
     // network with no proxy in front of it.
     expect(COMPOSE.services.api.ports).toBeUndefined();
+  });
+});
+
+// ─── compose: the api reaches convert-service ───────────────────────────────
+//
+// A CAD upload is tessellated by the api calling convert-service, so the api
+// container has to be able to find it and be allowed to talk to it. Both halves
+// fail quietly in a way no unit test can see: an address that is wrong makes every
+// conversion `convert_unreachable` in a background job's log line, and a missing
+// secret makes every one a 401 from a service that is up and healthy.
+
+describe('docker-compose.yml — the api and convert-service', () => {
+  it('gives the api the service address, defaulted to the compose service name', () => {
+    // The same shape as CAPTURE_SERVICE_URL: a compose service name rather than a
+    // deployment choice, so install.sh does not have to know it. Overridable,
+    // because an operator may run convert-service somewhere else, and `-` rather than
+    // `:-` so that an empty value in .env turns server-side conversion off.
+    expect(COMPOSE.services.api.environment?.CONVERT_SERVICE_URL).toBe(
+      '${CONVERT_SERVICE_URL-http://convert-service:8080}',
+    );
+  });
+
+  it('gives the api the same shared secret convert-service requires', () => {
+    expect(COMPOSE.services.api.environment?.CONVERT_SHARED_SECRET).toBe(
+      '${CONVERT_SHARED_SECRET:-}',
+    );
+    expect(COMPOSE.services['convert-service'].environment?.CONVERT_SHARED_SECRET).toBe(
+      '${CONVERT_SHARED_SECRET:-}',
+    );
+  });
+
+  it('puts both on a network they share, and publishes no port for the service', () => {
+    // The api reaches convert-service over `backend`, which is internal: true. The
+    // service accepts arbitrary model files and runs a native kernel on them, so
+    // reachability has to come from the network and the secret, not from a port
+    // nobody can see.
+    expect(COMPOSE.services.api.networks).toContain('backend');
+    expect(COMPOSE.services['convert-service'].networks).toContain('backend');
+    expect(COMPOSE.services['convert-service'].ports).toBeUndefined();
   });
 });
 

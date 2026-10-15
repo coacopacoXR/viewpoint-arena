@@ -8,8 +8,9 @@
 // not in a log line, and not in a URL.
 //
 // Objects are addressed exactly as the local store addresses them — `<hash>`
-// with a `<hash>.json` sidecar beside it — so the two providers hold the same
-// data and one can be copied into the other without translation.
+// with a `<hash>.json` sidecar beside it, and a derivative under
+// `derived/<hash>.glb` — so the two providers hold the same data and one can be
+// copied into the other without translation.
 //
 // Upsert rather than create-then-check: the name is a content address, so the
 // object an upload would replace is byte-identical to the one it writes, and a
@@ -19,7 +20,16 @@
 import { Readable } from 'node:stream';
 import { compareModelHashes, isModelHash, sha256Hex } from './hash.ts';
 import { SIDECAR_SUFFIX, buildSidecar, parseSidecar, sidecarName } from './sidecar.ts';
+import {
+  DERIVED_CONTENT_TYPE,
+  DERIVED_KINDS,
+  bufferStream,
+  derivedKey,
+  isReadableStream,
+} from './derived.ts';
 import type {
+  DerivedKind,
+  DerivedMeta,
   ModelListEntry,
   ModelMeta,
   ModelRef,
@@ -148,7 +158,8 @@ export class SupabaseModelStore implements ModelStore {
     for (const name of await this.listNames()) {
       if (!name.endsWith(SIDECAR_SUFFIX)) continue;
       const hash = name.slice(0, -SIDECAR_SUFFIX.length);
-      // Leaves out the object beside each sidecar, and any other name in the
+      // Leaves out the object beside each sidecar, a derivative under
+      // `derived/` (which has no sidecar of its own), and any other name in the
       // bucket: only a sidecar of a content address describes a model file.
       if (isModelHash(hash)) hashes.push(hash);
     }
@@ -181,7 +192,70 @@ export class SupabaseModelStore implements ModelStore {
     const sidecarGone = ABSENT_STATUSES.has(sidecarRes.status);
     if (!objectRes.ok && !objectGone) throw this.storageError('delete', hash, objectRes.status);
     if (!sidecarRes.ok && !sidecarGone) throw this.storageError('delete', sidecarName(hash), sidecarRes.status);
-    return !objectGone || !sidecarGone;
+
+    // Derivatives go with the source they were computed from, exactly as they do
+    // in the local store. One DELETE per kind, unconditionally: Storage has no
+    // prefix delete, and a 400/404 for a derivative that was never written is
+    // the normal case rather than an error.
+    let derivedGone = true;
+    for (const kind of DERIVED_KINDS) {
+      const key = derivedKey(hash, kind);
+      const res = await this.fetchFn(this.objectUrl(key), {
+        method: 'DELETE',
+        headers: this.headers(),
+      });
+      const gone = ABSENT_STATUSES.has(res.status);
+      if (!res.ok && !gone) throw this.storageError('delete', key, res.status);
+      if (!gone) derivedGone = false;
+    }
+    return !objectGone || !sidecarGone || !derivedGone;
+  }
+
+  async putDerived(
+    sourceHash: string,
+    kind: DerivedKind,
+    bytes: Uint8Array | Readable,
+  ): Promise<void> {
+    if (!isModelHash(sourceHash)) {
+      throw new Error('putDerived needs a model hash');
+    }
+    // Buffered, where the local store streams: Storage's REST upload is one
+    // request with the object in its body, so there is nothing to hand it a chunk
+    // at a time. What is held is the compressed output of a conversion rather than
+    // the source it came from — see bufferStream in ./derived.ts.
+    const body = isReadableStream(bytes)
+      ? await bufferStream(bytes)
+      : Buffer.from(bytes);
+    await this.upload(derivedKey(sourceHash, kind), body, DERIVED_CONTENT_TYPE[kind]);
+  }
+
+  async getDerived(sourceHash: string, kind: DerivedKind): Promise<Readable | null> {
+    if (!isModelHash(sourceHash)) return null;
+    const res = await this.fetchFn(this.objectUrl(derivedKey(sourceHash, kind)), {
+      headers: this.headers(),
+    });
+    if (ABSENT_STATUSES.has(res.status)) return null;
+    if (!res.ok) throw this.storageError('derived download', sourceHash, res.status);
+    return res.body ? Readable.from(webStreamChunks(res.body)) : null;
+  }
+
+  async headDerived(sourceHash: string, kind: DerivedKind): Promise<DerivedMeta | null> {
+    if (!isModelHash(sourceHash)) return null;
+    const key = derivedKey(sourceHash, kind);
+    // A HEAD, not the GET `head` uses: a derivative has no sidecar to read, so the
+    // length comes from Storage's own headers, and pulling the whole object to
+    // measure it would defeat the point of asking.
+    const res = await this.fetchFn(this.objectUrl(key), {
+      method: 'HEAD',
+      headers: this.headers(),
+    });
+    if (ABSENT_STATUSES.has(res.status)) return null;
+    if (!res.ok) throw this.storageError('derived metadata', key, res.status);
+    const length = Number(res.headers.get('content-length'));
+    // 0 rather than null when Storage answers without a length: the object IS
+    // there, and DerivedMeta's contract is that a non-positive size means
+    // "unknown", which the route reads as "send it without Content-Length".
+    return { size: Number.isFinite(length) && length > 0 ? length : 0 };
   }
 
   private async upload(path: string, body: Buffer, contentType: string): Promise<void> {

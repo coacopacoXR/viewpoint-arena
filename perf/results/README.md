@@ -10,6 +10,15 @@ written to the gitignored `perf/fixtures/`), then per size opens a room with
 `?perf=1`, imports the fixture through the real file input, and drags the mouse
 across the canvas for ten seconds while `components/Scene/PerfProbe.tsx` records.
 
+`npm run perf` runs a SECOND scenario as well, which writes
+[`laser.md`](./laser.md) rather than the table below: the same fixtures with the
+pointing laser held up and the pointer swept across the model's own projected box,
+so that everything a hit triggers — the raycast, the selection it writes, the tree
+rows and highlight overlays that follow it — lands inside the frame times. The two
+answer different questions: this table is what a frame costs to DRAW, that one is
+what it costs to POINT AT, so a row from one is not a baseline for the other. Pass
+`--grep` to `npm run perf` to run either on its own.
+
 Columns: **parts** is the fixture's part meshes; **fixture** its size on disk;
 **tris** and **calls** are `renderer.info` for one frame while orbiting, which is
 what the batching, instancing and LOD tasks are measured against; **visible** is
@@ -41,3 +50,5 @@ never an absolute score.
 | 2026-10-15 | 8481b9b | 10000 | 80.0 MB | 2,311,038 | 10002 | 16.0 | 207.70 | 230.10 | 4.8 | 414.8 | NVIDIA, NVIDIA RTX A3000 Laptop GPU (0x000024B8) |
 | 2026-10-15 | f9a96f0 | 3200 | 108.3 MB | 3,559,014 | 8 | 1.8 | 4.30 | 6.10 | 232.6 | 168.8 | NVIDIA, NVIDIA RTX A3000 Laptop GPU (0x000024B8) |
 | 2026-10-15 | f9a96f0 | 10000 | 80.0 MB | 2,311,038 | 8 | 1.2 | 11.40 | 14.70 | 87.7 | 468.3 | NVIDIA, NVIDIA RTX A3000 Laptop GPU (0x000024B8) |
+| 2026-10-15 | 091c0b3 | 3200 | 108.3 MB | 3,559,014 | 8 | 1.5 | 5.50 | 8.20 | 181.8 | 189.8 | NVIDIA, NVIDIA RTX A3000 Laptop GPU (0x000024B8) |
+| 2026-10-15 | 091c0b3 | 10000 | 80.0 MB | 2,311,038 | 8 | 1.2 | 16.40 | 22.40 | 61.0 | 468.3 | NVIDIA, NVIDIA RTX A3000 Laptop GPU (0x000024B8) |

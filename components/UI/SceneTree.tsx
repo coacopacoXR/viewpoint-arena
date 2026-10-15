@@ -71,7 +71,24 @@ function latestOfLine(models: SceneModel[], line: string): SceneModel | null {
     return latest;
 }
 
-const TreeNode: React.FC<{ node: SceneNode; depth: number }> = ({ node, depth }) => {
+/**
+ * One row of the Model Tree, and the reason it is memoised.
+ *
+ * A row's own state arrives through its own `objectStates[node.id]` subscription, so the
+ * subscription — not the parent — is what has to decide whether this row re-renders.
+ * Without the memo the opposite holds: SceneTree subscribes to state that moves for reasons
+ * of its own (components/Scene/World.tsx writes the clock to the store ten times a second,
+ * and every import control in this panel reads the scene), and one such write re-rendered
+ * EVERY mounted row and the three or four lucide icons in each. Task 05c measured a
+ * 3 200-part model with its tree open spending 92 ms of every frame in React with the laser
+ * down and the pointer parked — 68% of the main thread, re-rendering rows nothing had
+ * changed.
+ *
+ * The props are the two that are stable by construction: `node` is an object out of the
+ * parsed scene tree, which is a new object only when the model is, and `depth` is a number.
+ * So a memo compare is enough and the row re-renders exactly when its own entry does.
+ */
+const TreeNode: React.FC<{ node: SceneNode; depth: number }> = React.memo(({ node, depth }) => {
     const objectState = useStore(state => state.objectStates[node.id]);
     const toggleVisibility = useStore(state => state.toggleNodeVisibility);
     const toggleExpanded = useStore(state => state.toggleNodeExpanded);
@@ -167,7 +184,7 @@ const TreeNode: React.FC<{ node: SceneNode; depth: number }> = ({ node, depth })
             )}
         </div>
     );
-};
+});
 
 /**
  * One top-level row per model in the scene: "Bracket · Rev B".
@@ -179,8 +196,13 @@ const TreeNode: React.FC<{ node: SceneNode; depth: number }> = ({ node, depth })
  * behind it is not a change to what the review is about, and locking that behind
  * the host's permission would have made a read-only guest unable to look at
  * their own picture.
+ *
+ * Memoised for the same reason TreeNode is, and it is the row that matters more: this is
+ * the one that renders a model's whole part tree, so a re-render of it that its own props
+ * did not ask for is a re-render of every row under it that the memo on TreeNode then has
+ * to refuse one by one.
  */
-const SceneModelRow: React.FC<{ model: SceneModel; onCompare: (line: string) => void }> = ({ model, onCompare }) => {
+const SceneModelRow: React.FC<{ model: SceneModel; onCompare: (line: string) => void }> = React.memo(({ model, onCompare }) => {
     const entry = useStore(state => state.sceneEntries[model.id]);
     const expanded = useStore(state => Boolean(state.expandedSceneModels[model.id]));
     const toggleExpanded = useStore(state => state.toggleSceneModelExpanded);
@@ -326,7 +348,7 @@ const SceneModelRow: React.FC<{ model: SceneModel; onCompare: (line: string) => 
             )}
         </div>
     );
-};
+});
 
 /**
  * Pick two revisions of a line and put them side by side.

@@ -1318,14 +1318,39 @@ export const useStore = create<AppState>((set, get) => ({
       }
   })),
   selectNode: (id) => set((state) => {
-      const newStates = { ...state.objectStates };
-      Object.keys(newStates).forEach(key => {
-          newStates[key] = { ...newStates[key], selected: false };
-      });
-      if (id && newStates[id]) {
-          newStates[id] = { ...newStates[id], selected: true };
+      const states = state.objectStates;
+      // WHICH ENTRIES MOVE, and only those. This used to rebuild EVERY entry of
+      // `objectStates` to clear the old selection, so one hover change allocated one
+      // object per part and changed the identity of all of them — and identity is what
+      // every consumer downstream compares: a Model Tree row's own
+      // `useStore(s => s.objectStates[node.id])` subscription, and `PartGraph.sync`'s
+      // diff. Task 05c measured the result: pointing the laser at a 3 200-part model
+      // cost 263 ms a frame and at 10 000 parts 771 ms, scaling with PART COUNT rather
+      // than with triangles, because one part under the cursor re-rendered every row in
+      // the tree.
+      //
+      // Still a scan of every key, because "the old selection" is whichever entries say
+      // `selected`, and a state written by a test or relayed from a room can name more
+      // than one. A scan that allocates nothing is O(parts) reads and O(changed) writes,
+      // and the writes are the only thing a subscriber is keyed on.
+      const wanted = id !== null && states[id] ? id : null;
+      let next: Record<string, ObjectState> | null = null;
+      const put = (key: string, selected: boolean) => {
+          if (next === null) next = { ...states };
+          next[key] = { ...states[key], selected };
+      };
+      // The clear skips the entry being selected, so selecting the part that is ALREADY
+      // selected is the no-op it reads as: clearing it first and then testing the original
+      // entry for "is it selected yet" answers no and leaves nothing selected at all.
+      for (const key of Object.keys(states)) {
+          if (key !== wanted && states[key]?.selected) put(key, false);
       }
-      return { objectStates: newStates };
+      if (wanted !== null && !states[wanted]?.selected) put(wanted, true);
+      // Nothing moved, so hand the SAME state back: zustand compares it with Object.is
+      // and notifies nobody. Letting go of the laser over the floor calls
+      // selectNode(null) with nothing selected, and a room that has nothing to clear
+      // has nothing to re-render either.
+      return next === null ? state : { objectStates: next };
   }),
 
   // --- NEW: Model Import Actions ---

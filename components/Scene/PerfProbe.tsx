@@ -1,5 +1,9 @@
 import React, { useEffect, useRef } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
+import { Vector3 } from 'three';
+import { useStore } from '../../store';
+import { partRegistries } from '../../lib/scene/partRegistry';
+import { reviewModelBounds } from '../../lib/scene/modelBounds';
 
 /**
  * The `?perf=1` probe that e2e/perf/orbit.perf.spec.ts reads.
@@ -19,6 +23,10 @@ import { useFrame, useThree } from '@react-three/fiber';
  * render this component at all, so no frame callback is registered, no `useFrame`
  * subscriber is added to the render loop, and the only cost the shipped app
  * carries is this module's few hundred bytes.
+ *
+ * Besides the renderer's counters it publishes where the model actually is on
+ * screen (`modelScreenRect`), which the laser scenario aims its sweep at instead
+ * of at a pixel radius guessed from the viewport.
  */
 
 export interface PerfRendererInfo {
@@ -64,11 +72,28 @@ export interface PerfGpuInfo {
   version: string;
 }
 
+/** A rectangle in CSS pixels of the canvas, which for the room is the whole viewport. */
+export interface PerfScreenRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
 export interface VpPerf {
   enabled: true;
   renderer(): PerfRendererInfo;
   memory(): PerfMemoryInfo | null;
   gpu(): PerfGpuInfo;
+  /**
+   * Where the product under review is on screen, or null while the scene holds nothing
+   * tagged. The laser scenario aims its sweep at this instead of at a pixel radius guessed
+   * from the viewport: the fixtures are normalised to two scene units and the camera is
+   * fixed at (8, 6, 8), so a model that is two units WIDE is a few tens of pixels tall, and
+   * a sweep sized for one is a sweep that misses the other — which reads as "the raycast
+   * lost the triangles" and is not.
+   */
+  modelScreenRect(): PerfScreenRect | null;
   start(): void;
   stop(): PerfRecording;
   isRecording(): boolean;
@@ -107,6 +132,9 @@ const readMemory = (): PerfMemoryInfo | null => {
 
 const PerfProbe: React.FC = () => {
   const gl = useThree(state => state.gl);
+  const camera = useThree(state => state.camera);
+  const scene = useThree(state => state.scene);
+  const size = useThree(state => state.size);
 
   const recording = useRef(false);
   const frameTimes = useRef<number[]>([]);
@@ -162,11 +190,44 @@ const PerfProbe: React.FC = () => {
       };
     };
 
+    // Measured when asked and not cached, because the camera moves and a rectangle read
+    // once at mount would be the empty room's. `reviewModelBounds` is the same answer the
+    // lobby's thumbnail framing uses, so what the benchmark aims at is what a person
+    // framing the model would aim at — including the "ask the registry, do not walk a
+    // BatchedMesh's merged buffer" rule that makes the box the parts are actually in.
+    const corner = new Vector3();
+    const modelScreenRect = (): PerfScreenRect | null => {
+      const box = reviewModelBounds(scene, partRegistries(useStore.getState().sceneEntries));
+      if (box.isEmpty()) return null;
+      let left = Number.POSITIVE_INFINITY;
+      let top = Number.POSITIVE_INFINITY;
+      let right = Number.NEGATIVE_INFINITY;
+      let bottom = Number.NEGATIVE_INFINITY;
+      // All eight corners, not the centre: a box's silhouette is not the projection of its
+      // centre, and a laser sweep has to land INSIDE the model rather than merely near it.
+      for (let index = 0; index < 8; index += 1) {
+        corner.set(
+          index & 1 ? box.max.x : box.min.x,
+          index & 2 ? box.max.y : box.min.y,
+          index & 4 ? box.max.z : box.min.z,
+        );
+        corner.project(camera);
+        const x = (corner.x * 0.5 + 0.5) * size.width;
+        const y = (0.5 - corner.y * 0.5) * size.height;
+        left = Math.min(left, x);
+        right = Math.max(right, x);
+        top = Math.min(top, y);
+        bottom = Math.max(bottom, y);
+      }
+      return { left, top, width: right - left, height: bottom - top };
+    };
+
     window.__vpPerf = {
       enabled: true,
       renderer,
       memory: readMemory,
       gpu,
+      modelScreenRect,
       isRecording: () => recording.current,
       start: () => {
         frameTimes.current = [];
@@ -190,7 +251,7 @@ const PerfProbe: React.FC = () => {
     return () => {
       delete window.__vpPerf;
     };
-  }, [gl]);
+  }, [gl, camera, scene, size]);
 
   return null;
 };

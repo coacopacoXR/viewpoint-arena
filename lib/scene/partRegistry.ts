@@ -52,6 +52,8 @@ import {
   Box3,
   Matrix4,
   Object3D,
+  Sphere,
+  Vector3,
   type Intersection,
   type Material,
   type Mesh,
@@ -134,6 +136,27 @@ export interface PartState {
   selected: boolean;
 }
 
+/**
+ * Where the eye is and how small is too small, reduced to the two numbers a cull needs.
+ *
+ * A perspective camera projects a sphere of world radius `r` at distance `d` to about
+ * `r · heightPx / (d · 2·tan(fov/2))` pixels, so "smaller than N pixels" is
+ * `r < k · d` with `k = N · 2·tan(fov/2) / heightPx`. Folding the pixel threshold, the fov and
+ * the viewport height into that one scalar is what lets the test below be a multiply and a
+ * compare per part rather than a projection per part, and what lets the registry that runs it
+ * stay a renderer rather than become a camera: it never sees a fov, an aspect or a pixel.
+ *
+ * The eye is in WORLD space. Each registry converts it into the space its own part spheres are
+ * measured in, because for a batched model that space is the root's and a model that has been
+ * placed, moved or scaled must not have to rebuild ten thousand spheres to answer a cull.
+ */
+export interface MotionCullView {
+  /** The eye, in world space. Read, never kept: the caller owns the Vector3 and reuses it. */
+  readonly eye: Vector3;
+  /** A part is too small to draw when its world radius is under `k` times its distance. */
+  readonly k: number;
+}
+
 /** One per parsed model, owned by the parse and disposed with it. */
 export interface PartRegistry {
   /** The part this id names, or null when the id is not this model's. */
@@ -205,6 +228,37 @@ export interface PartRegistry {
     states: Record<string, PartState | undefined>,
     highlight: EmissiveHighlight | null,
   ): number;
+  /**
+   * Stop drawing the parts too small to see from `view`, give back the ones that are not, and
+   * answer how many are stopped now. `null` gives every part back and answers 0.
+   *
+   * A RENDER-ONLY flag, and a method of its own rather than a call into `setVisibleSubtree`,
+   * because the two must compose and must never be confused: a part is drawn iff the tree has
+   * it visible AND this has not culled it. One boolean would mean that restoring the culled
+   * parts when the camera settles also un-hid every part somebody had turned off in the Model
+   * Tree, which is a visible wrongness in exchange for a frame-rate win. Each registry keeps
+   * the two apart and writes the AND of them, so a restore can only ever give back what the
+   * cull took.
+   *
+   * A highlighted part is never culled — it is the part somebody is looking at, and the whole
+   * point of the glow is that it survives. Neither is a part the tree has hidden, which needs
+   * no exception: it is not being drawn either way.
+   *
+   * Called once a frame while the camera moves and once with `null` when it settles, by
+   * components/Scene/MotionQuality.tsx. Cheap enough for that because of `MotionCullIndex`:
+   * the parts are sorted by radius once per model and only the prefix whose radius could be
+   * under the threshold at the furthest distance in the model is tested, so a frame costs
+   * O(candidates) rather than O(parts) and allocates nothing.
+   *
+   * WHAT IT COSTS THE REST OF THE APP: a culled part is not drawn AND, in both registries, is
+   * not pickable — three's `Raycaster` never reads `Object3D.visible`, so
+   * `MeshPartRegistry.partChainForHit` refuses an invisible object explicitly, and a batch slot
+   * turned off produces no hit for three to find. That is the same answer the two gave before
+   * this method existed, and it is only reachable while the camera is moving, which is exactly
+   * when a click is a drag. Nothing that stores state reads it: `ObjectState`, the selection,
+   * the pins and the comments all keep naming the part whether or not it is being drawn.
+   */
+  motionCull(view: MotionCullView | null): number;
   /**
    * The ids of the parts this registry has written a transform to, in the order they were
    * first moved.
@@ -486,6 +540,18 @@ class MeshPartHandle implements PartHandle {
    */
   private bind: StoredLocalTransform | undefined;
 
+  /**
+   * What the Model Tree says about this part, kept apart from what is being drawn.
+   *
+   * Two flags and one AND, because the two things that hide a part have to be able to undo
+   * themselves independently: a person turns a part off in the tree and it stays off, and a
+   * camera that stops moving gives back every part the motion cull took — which must not be
+   * the same write, or settling the camera would un-hide what somebody had hidden.
+   */
+  private userVisible = true;
+  /** Whether a motion cull is hiding this part. Render-only: see PartRegistry.motionCull. */
+  private motionCulled = false;
+
   constructor(
     readonly id: string,
     readonly name: string,
@@ -493,7 +559,7 @@ class MeshPartHandle implements PartHandle {
     readonly object: Object3D,
     private readonly highlighted: HighlightMaterials,
     /** Package-private too: the registry's index of which parts have been moved. */
-    private readonly moved: Set<string>,
+    private readonly moved: MovedParts,
   ) {}
 
   // Composed from position/quaternion/scale rather than copied from `.matrix`, because
@@ -554,7 +620,29 @@ class MeshPartHandle implements PartHandle {
   }
 
   setVisible(visible: boolean): void {
-    this.object.visible = visible;
+    this.userVisible = visible;
+    this.applyVisibility();
+  }
+
+  /** Package-private: the registry's motion cull is the only thing that writes this. */
+  setCulled(culled: boolean): void {
+    this.motionCulled = culled;
+    this.applyVisibility();
+  }
+
+  /**
+   * Whether this part is drawing from a highlight clone right now.
+   *
+   * Package-private, for the registry's motion cull: a part somebody is looking at is the one
+   * part that must not disappear because it is small, and the clone is how this registry knows
+   * the glow is on without asking the tree.
+   */
+  get glowing(): boolean {
+    return this.ownMaterial !== undefined;
+  }
+
+  private applyVisibility(): void {
+    this.object.visible = this.userVisible && !this.motionCulled;
   }
 
   // A swap of the material rather than a write to it, which is the audit's D1: the
@@ -785,6 +873,284 @@ export class PartGraph {
 }
 
 /**
+ * The set of moved part ids, counting its own writes.
+ *
+ * The motion-cull index caches each part's sphere where the part stood when it
+ * was built, so it has to know when ANY part moved since — including a part that
+ * had already moved once, which leaves the set's size unchanged. Both registries
+ * add to this on every transform write, so `version` is that signal.
+ */
+export class MovedParts extends Set<string> {
+  version = 0;
+
+  add(id: string): this {
+    this.version += 1;
+    return super.add(id);
+  }
+
+  clear(): void {
+    this.version += 1;
+    super.clear();
+  }
+}
+
+/**
+ * The radius-sorted index that makes `motionCull` a walk of a PREFIX rather than of every part.
+ *
+ * Shared by both registries for the reason `PartGraph` is: the order and the bound are the
+ * subtle half of the cull, and two copies of a subtle thing is how a batched model and an
+ * un-batched one come to hide different parts of the same file. What differs between them is
+ * only where a sphere comes from and what a write does, and both are callbacks.
+ *
+ * THE BOUND. A part is culled when `radius < k · distance`, and the distance is per part, so
+ * at first sight every part has to be measured. It does not: no part of a model can be further
+ * from the eye than the model's own centre is, plus the model's own radius. So a part whose
+ * radius reaches `k · (distanceToCentre + modelRadius)` cannot be under the threshold at ANY
+ * distance it could be at, and since the parts are sorted by radius ascending, those parts are
+ * a SUFFIX. One binary search finds where the prefix ends and only the prefix is walked.
+ *
+ * What that buys depends on the camera, which is the honest limit of it: the threshold grows
+ * with distance, so a zoomed-out view of a fine assembly can put most of the parts inside the
+ * prefix and the walk degrades towards O(parts) — at which point it is still one multiply, one
+ * compare and one array read per part, with no allocation and no handle, no matrix and no box
+ * in the loop.
+ *
+ * SPHERES ARE IN THE ROOT'S SPACE, not the world's, and the caller hands over an eye that has
+ * been converted to match. A model that is placed, dragged or scaled moves its root, and a
+ * world-space index would have to be rebuilt for that; a root-space one does not, because the
+ * root's own matrix is applied to nothing per part. Under a UNIFORM root scale the test is
+ * exactly equivalent — `s·r < k·s·d` is `r < k·d`, the scale cancels — and under a non-uniform
+ * one it is an approximation of a heuristic, which is the right trade for not rebuilding ten
+ * thousand spheres every time somebody drags a model across the floor.
+ */
+export class MotionCullIndex {
+  /** Filled by `push`, and dropped by `finish`, which sorts them. */
+  private fillIndex: number[] = [];
+  private fillX: number[] = [];
+  private fillY: number[] = [];
+  private fillZ: number[] = [];
+  private fillR: number[] = [];
+
+  /** Part indexes, ascending by radius. The order the prefix bound depends on. */
+  private order = new Int32Array(0);
+  /** Sphere centres and radii in `order`'s sequence, in the space they were pushed in. */
+  private centreX = new Float32Array(0);
+  private centreY = new Float32Array(0);
+  private centreZ = new Float32Array(0);
+  private radii = new Float32Array(0);
+
+  /** Culled right now, by PART index — which is the index a `write` callback is handed. */
+  private readonly culled: Uint8Array;
+  /** How many are culled, so `apply` can answer without counting. */
+  private count = 0;
+  /**
+   * The highest `order` position currently culled, or -1.
+   *
+   * What makes a prefix that SHRANK cheap: a zoom out raises the threshold and reaches further
+   * into the sorted list, but a zoom in cuts the prefix short and every culled part past the
+   * new end has to be given back. Without this the give-back would be a walk of every part to
+   * find the few that were culled; with it the walk is over the positions that could hold one.
+   */
+  private highest = -1;
+
+  /** The span of everything pushed: the centre and radius that bound how far a part can be. */
+  private spanX = 0;
+  private spanY = 0;
+  private spanZ = 0;
+  private spanR = 0;
+  private ready = false;
+
+  constructor(parts: number) {
+    this.culled = new Uint8Array(parts);
+  }
+
+  /**
+   * Start a build. Every CANDIDATE part is pushed once before `finish`.
+   *
+   * A part may be left out, and the one that is left out is a part with no geometry of its own:
+   * a group draws nothing, so hiding it saves nothing, and hiding one that still has an Object3D
+   * hides every part below it — including a part somebody is looking at, whose own sphere is
+   * small only because the group it sits in is big. Its children are candidates in their own
+   * right, which is where the saving actually is.
+   *
+   * The culled flags go with the build: a rebuild happens because a part moved, and the caller
+   * applies a viewpoint straight afterwards, which re-decides every part from scratch.
+   */
+  begin(): void {
+    this.fillIndex = [];
+    this.fillX = [];
+    this.fillY = [];
+    this.fillZ = [];
+    this.fillR = [];
+    this.count = 0;
+    this.highest = -1;
+    this.culled.fill(0);
+    this.ready = false;
+  }
+
+  /**
+   * One candidate part's sphere, in the space the eye will be converted into.
+   *
+   * The part index is handed over rather than assumed from the push order, because the parts
+   * that are not candidates are not pushed at all and the two sequences are not the same.
+   */
+  push(partIndex: number, x: number, y: number, z: number, radius: number): void {
+    this.fillIndex.push(partIndex);
+    this.fillX.push(x);
+    this.fillY.push(y);
+    this.fillZ.push(z);
+    this.fillR.push(radius);
+  }
+
+  /** Sort what was pushed and measure its span. After this, `apply` answers. */
+  finish(): void {
+    const count = this.fillR.length;
+    const radii = this.fillR;
+    // Positions in the push order, sorted by the radius at that position: the sort permutes
+    // integers, so ten thousand parts cost a comparator and no boxed numbers.
+    const sorted = Array.from({ length: count }, (_, at) => at).sort((a, b) => radii[a] - radii[b]);
+    this.order = new Int32Array(count);
+    this.centreX = new Float32Array(count);
+    this.centreY = new Float32Array(count);
+    this.centreZ = new Float32Array(count);
+    this.radii = new Float32Array(count);
+    let minX = Infinity;
+    let minY = Infinity;
+    let minZ = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let maxZ = -Infinity;
+    for (let at = 0; at < count; at += 1) {
+      const pushed = sorted[at];
+      const x = this.fillX[pushed];
+      const y = this.fillY[pushed];
+      const z = this.fillZ[pushed];
+      const r = radii[pushed];
+      this.order[at] = this.fillIndex[pushed];
+      this.centreX[at] = x;
+      this.centreY[at] = y;
+      this.centreZ[at] = z;
+      this.radii[at] = r;
+      minX = Math.min(minX, x - r);
+      minY = Math.min(minY, y - r);
+      minZ = Math.min(minZ, z - r);
+      maxX = Math.max(maxX, x + r);
+      maxY = Math.max(maxY, y + r);
+      maxZ = Math.max(maxZ, z + r);
+    }
+    // The span as a sphere rather than a box, because the bound below is a distance and a box
+    // would have to be turned into one anyway.
+    this.spanX = count === 0 ? 0 : (minX + maxX) / 2;
+    this.spanY = count === 0 ? 0 : (minY + maxY) / 2;
+    this.spanZ = count === 0 ? 0 : (minZ + maxZ) / 2;
+    this.spanR = count === 0 ? 0 : 0.5 * Math.hypot(maxX - minX, maxY - minY, maxZ - minZ);
+    this.fillIndex = [];
+    this.fillX = [];
+    this.fillY = [];
+    this.fillZ = [];
+    this.fillR = [];
+    this.ready = true;
+  }
+
+  /** How many parts are culled right now. */
+  culledCount(): number {
+    return this.count;
+  }
+
+  /**
+   * Decide the cull for one viewpoint, writing only the parts whose answer moved.
+   *
+   * @param eye the eye, in the space the spheres were pushed in
+   * @param k the threshold scalar of `MotionCullView`
+   * @param protectedPart whether a part must be drawn whatever its size — a highlight
+   * @param write told about every part whose culled flag this call moved, and nothing else
+   */
+  apply(
+    eye: Vector3,
+    k: number,
+    protectedPart: (partIndex: number) => boolean,
+    write: (partIndex: number, culled: boolean) => void,
+  ): number {
+    if (!this.ready) return 0;
+    const count = this.order.length;
+
+    // The furthest any part of this model can be, and so the largest radius that could still
+    // be under the threshold somewhere in it. Everything at or above it is a suffix this frame
+    // does not have to look at.
+    const spanDx = eye.x - this.spanX;
+    const spanDy = eye.y - this.spanY;
+    const spanDz = eye.z - this.spanZ;
+    const limit = k * (Math.sqrt(spanDx * spanDx + spanDy * spanDy + spanDz * spanDz) + this.spanR);
+
+    // Binary search the first position whose radius reaches the limit: radii ascend, so
+    // [0, end) is the only part of the list that can hold a culled part.
+    let lo = 0;
+    let hi = count;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (this.radii[mid] < limit) lo = mid + 1;
+      else hi = mid;
+    }
+    const end = lo;
+
+    // Give back what the prefix no longer reaches. Their radius is at or above the limit, so
+    // no distance inside this model's span can put them under the threshold any more.
+    let culled = this.count;
+    for (let at = end; at <= this.highest; at += 1) {
+      const part = this.order[at];
+      if (this.culled[part] === 0) continue;
+      this.culled[part] = 0;
+      culled -= 1;
+      write(part, false);
+    }
+
+    const k2 = k * k;
+    let highest = -1;
+    for (let at = 0; at < end; at += 1) {
+      const part = this.order[at];
+      const dx = this.centreX[at] - eye.x;
+      const dy = this.centreY[at] - eye.y;
+      const dz = this.centreZ[at] - eye.z;
+      const radius = this.radii[at];
+      // Squared on both sides rather than a sqrt per part: the comparison is the same and the
+      // square root is the only transcendental this loop would otherwise do.
+      const want =
+        radius * radius < k2 * (dx * dx + dy * dy + dz * dz) && !protectedPart(part);
+      if (want) highest = at;
+      const was = this.culled[part] === 1;
+      if (want === was) continue;
+      this.culled[part] = want ? 1 : 0;
+      culled += want ? 1 : -1;
+      write(part, want);
+    }
+    this.highest = highest;
+    this.count = culled;
+    return culled;
+  }
+
+  /** Give every part back, writing only the ones that were culled. */
+  restore(write: (partIndex: number, culled: boolean) => void): number {
+    if (this.count === 0) return 0;
+    for (let at = 0; at <= this.highest; at += 1) {
+      const part = this.order[at];
+      if (this.culled[part] === 0) continue;
+      this.culled[part] = 0;
+      write(part, false);
+    }
+    this.count = 0;
+    this.highest = -1;
+    return 0;
+  }
+}
+
+/** Scratch for the sphere a part's box is turned into, so a build does not allocate per part. */
+const scratchSphere = new Sphere();
+/** Scratch for a part's box, for the same reason. */
+const scratchCullBox = new Box3();
+/** Scratch for the root's own scale, which is what turns a world radius into a root-space one. */
+const scratchScale = new Vector3();
+
+/**
  * The registry for a model that is still drawn the way it was parsed: one Object3D per
  * part. Built once, at parse time, from the group and the tree buildSceneTree made
  * from it.
@@ -809,7 +1175,14 @@ export class MeshPartRegistry implements PartRegistry {
   private readonly graph: PartGraph;
   private readonly highlighted = new HighlightMaterials();
   /** Written by the handles themselves, in the one place a transform can be written. */
-  private readonly moved = new Set<string>();
+  private readonly moved = new MovedParts();
+  /** The parts' spheres, in the root's space, sorted by radius. Built at the first cull. */
+  private readonly cullIndex: MotionCullIndex;
+  /** How many parts had been moved when `cullIndex` was built. See `motionCull`. */
+  private cullBuiltAt = -1;
+  /** Scratch for the cull, so a frame allocates nothing: the eye in root space, and the root's inverse. */
+  private readonly cullEye = new Vector3();
+  private readonly cullInverse = new Matrix4();
   /** Built the first time a part is selected in Part mode, and reused for every one after. */
   private proxy: Object3D | null = null;
 
@@ -842,6 +1215,9 @@ export class MeshPartRegistry implements PartRegistry {
       parentOf.set(id, this.taggedAncestorId(object));
     });
     this.graph = new PartGraph(ids, parentOf);
+    // Sized here rather than as a field initialiser, because the handles it indexes are the
+    // ones the traverse above just built.
+    this.cullIndex = new MotionCullIndex(this.handles.length);
   }
 
   get(id: string): PartHandle | null {
@@ -929,6 +1305,70 @@ export class MeshPartRegistry implements PartRegistry {
       handle.setVisible(visible);
       handle.setHighlight(selected ? highlight : null);
     });
+  }
+
+  // The spheres are in the ROOT's space and so is the eye, which is what makes a model that has
+  // been placed, moved or scaled cost nothing here: only a part that MOVED stales a sphere, and
+  // a part moves through `rememberBind`, which is the one place `moved` grows. Comparing its size
+  // is therefore a complete dirtiness test with no bookkeeping at the write site.
+  motionCull(view: MotionCullView | null): number {
+    if (view === null) {
+      return this.cullIndex.restore((part) => this.handles[part].setCulled(false));
+    }
+    if (this.cullBuiltAt !== this.moved.version) this.buildCullIndex();
+    this.root.updateWorldMatrix(true, false);
+    this.cullInverse.copy(this.root.matrixWorld).invert();
+    this.cullEye.copy(view.eye).applyMatrix4(this.cullInverse);
+    return this.cullIndex.apply(
+      this.cullEye,
+      view.k,
+      (part) => this.handles[part].glowing,
+      (part, culled) => this.handles[part].setCulled(culled),
+    );
+  }
+
+  /**
+   * Measure every candidate part's sphere once, in the root's space, and sort them by radius.
+   *
+   * Once per model and once per part that moves, and never per frame: a sphere comes from a
+   * geometry's own box, which three computes once and caches on the geometry, so a build is a
+   * matrix apply per part rather than a walk of the file's vertices.
+   */
+  private buildCullIndex(): void {
+    // The whole subtree and not just the root: a sphere is measured off each part's own
+    // matrixWorld, and a part that has never been drawn has one three has not composed yet.
+    this.root.updateMatrixWorld(true);
+    this.cullInverse.copy(this.root.matrixWorld).invert();
+    // A world radius comes back into the root's space by the root's own scale, the same way a
+    // world centre comes back through the inverse matrix. Uniform scale is the rule everywhere
+    // in this app — a model's scale is one number — and the largest axis is taken so a file that
+    // broke the rule would under-cull rather than hide something big.
+    scratchScale.setFromMatrixScale(this.root.matrixWorld);
+    const scale = Math.max(scratchScale.x, scratchScale.y, scratchScale.z) || 1;
+    this.cullIndex.begin();
+    for (let part = 0; part < this.handles.length; part += 1) {
+      const object = this.handles[part].object;
+      const mesh = object as Mesh;
+      // Its OWN geometry, and a part with none is not a candidate at all: `Box3.setFromObject`
+      // would descend, and a group's descendants are each a candidate in their own right. See
+      // MotionCullIndex.begin for what hiding a group would cost.
+      if (mesh.isMesh !== true || !mesh.geometry) continue;
+      const geometry = mesh.geometry;
+      if (!geometry.boundingBox) geometry.computeBoundingBox();
+      if (!geometry.boundingBox) continue;
+      scratchCullBox.copy(geometry.boundingBox).applyMatrix4(object.matrixWorld);
+      scratchCullBox.getBoundingSphere(scratchSphere);
+      scratchSphere.center.applyMatrix4(this.cullInverse);
+      this.cullIndex.push(
+        part,
+        scratchSphere.center.x,
+        scratchSphere.center.y,
+        scratchSphere.center.z,
+        scratchSphere.radius / scale,
+      );
+    }
+    this.cullIndex.finish();
+    this.cullBuiltAt = this.moved.version;
   }
 
   movedPartIds(): readonly string[] {

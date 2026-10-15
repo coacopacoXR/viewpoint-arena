@@ -56,7 +56,7 @@ const PinMarker: React.FC<{ pin: ReviewPin }> = ({ pin }) => {
 // lerps camera position + orbit-controls target toward it, then releases.
 // Lives inside the existing canvas so it shares its OrbitControls instance.
 const ViewpointAnimator: React.FC<{ controlsRef: React.MutableRefObject<any> }> = ({ controlsRef }) => {
-  const { camera } = useThree();
+  const { camera, invalidate } = useThree();
   const target = useActiveReviewStore((s) => s.jumpTarget);
   const clear = useActiveReviewStore((s) => s.clearJumpTarget);
 
@@ -80,10 +80,16 @@ const ViewpointAnimator: React.FC<{ controlsRef: React.MutableRefObject<any> }> 
     goalLook.current.set(...target.lookAt);
     elapsed.current = 0;
     active.current = true;
-  }, [target, camera, controlsRef]);
+    // The jump lives in activeReviewStore, not in the store the room's other frames are asked
+    // for, so it has to ask for its own first one — under `frameloop="demand"` a camera ride
+    // nobody requested a frame for is a ride that never leaves.
+    invalidate();
+  }, [target, camera, controlsRef, invalidate]);
 
-  useFrame((_, delta) => {
+  useFrame((state, delta) => {
     if (!active.current) return;
+    // And then every frame of the ride, until it lands and clears itself.
+    state.invalidate();
     elapsed.current += delta;
     const t = Math.min(1, elapsed.current / DURATION);
     const k = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;

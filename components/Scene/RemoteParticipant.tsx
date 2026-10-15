@@ -12,6 +12,17 @@ interface Props {
   participantsRef: React.MutableRefObject<Map<string, ParticipantPresence>>;
 }
 
+/**
+ * How close an avatar has to get before it stops asking for frames: squared scene units of
+ * distance, and radians of turn.
+ *
+ * A lerp never arrives, so "arrived" has to be a number. 1e-4 squared is a centimetre, which at
+ * the room's camera distance is well under a pixel, and 1e-3 rad is 0.06° — both far inside
+ * anything a person could see, and far outside the float noise a lerp leaves behind it.
+ */
+const SETTLED_DISTANCE = 1e-4;
+const SETTLED_ANGLE = 1e-3;
+
 // Reads position directly from the ref every frame — no prop updates needed
 function RemoteAvatar({
   userId,
@@ -29,7 +40,7 @@ function RemoteAvatar({
   const agentStyle = useStore(state => state.agentStyle);
   const color = initialPresence.color;
 
-  useFrame(() => {
+  useFrame(({ invalidate }) => {
     if (!groupRef.current) return;
     const p = participantsRef.current.get(userId);
     if (!p) return;
@@ -39,15 +50,31 @@ function RemoteAvatar({
 
     groupRef.current.position.lerp(targetPos.current, 0.15);
 
+    // The angle this frame is turning towards, kept so the settle test below can ask whether the
+    // turn is over as well as whether the walk is.
+    let targetAngle: number | null = null;
     if (agentStyle === AgentStyle.BOX && visualRef.current) {
       visualRef.current.lookAt(0, 0.5, 0);
     } else {
       const dir = targetLookAt.current.clone().sub(groupRef.current.position).normalize();
       if (dir.lengthSq() > 0.001) {
-        const angle = Math.atan2(dir.x, dir.z);
-        groupRef.current.rotation.y = THREE.MathUtils.lerp(groupRef.current.rotation.y, angle, 0.15);
+        targetAngle = Math.atan2(dir.x, dir.z);
+        groupRef.current.rotation.y = THREE.MathUtils.lerp(groupRef.current.rotation.y, targetAngle, 0.15);
       }
     }
+
+    // A lerp is a picture that changes with no input, so it asks for the frames it needs to
+    // finish and then stops asking. PresenceDrivenFrames gets the FIRST frame here — the one
+    // that notices a colleague moved at all — and this carries it the rest of the way, because
+    // one frame of a 0.15 lerp is 15% of the distance and the avatar would otherwise sit there.
+    // Under `frameloop="demand"` neither happens on its own, and the avatar would freeze on the
+    // pose it had until the local person touched their own mouse.
+    const turn = targetAngle === null ? 0 : targetAngle - groupRef.current.rotation.y;
+    const arrived =
+      groupRef.current.position.distanceToSquared(targetPos.current) <= SETTLED_DISTANCE &&
+      // Shortest way round the circle, so a turn through ±π reads as the small angle it is.
+      Math.abs(Math.atan2(Math.sin(turn), Math.cos(turn))) <= SETTLED_ANGLE;
+    if (!arrived) invalidate();
   });
 
   // userData.skipRaycast on the group: lasers traverse children and bail at this tag,

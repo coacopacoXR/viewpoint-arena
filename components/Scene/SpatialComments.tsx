@@ -252,6 +252,12 @@ const PlacementPreview: React.FC = () => {
 
     useFrame((state) => {
         if (!isPlacingMode) return;
+        // The preview marker tracks the pointer, and it has to keep tracking it after the pointer
+        // stops: a pin is dropped where the marker is, so a marker that froze on the last move
+        // would drop the pin somewhere the person is not looking. Asking per frame while a
+        // placement is armed is the cheap way to be right about that, and it stops the moment the
+        // mode does — which is a click, so the frames it costs are frames somebody asked for.
+        state.invalidate();
 
         // Update raycaster
         raycaster.current.setFromCamera(state.pointer, camera);

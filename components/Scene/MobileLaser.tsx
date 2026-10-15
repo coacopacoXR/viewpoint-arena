@@ -19,7 +19,7 @@ const MobileLaser: React.FC = () => {
   const lastHit = useRef(new Vector3());
   const lastFoundId = useRef<string | null>(null);
 
-  useFrame(() => {
+  useFrame(({ invalidate }) => {
     const ndc = mobileLaserRef.ndc;
 
     if (ndc === null) {
@@ -34,6 +34,11 @@ const MobileLaser: React.FC = () => {
     }
 
     wasActive.current = true;
+    // A finger on the glass is a dot that has to follow it, and a touch is not something the
+    // render loop hears about: the ndc sits in a ref the gesture handler writes, so nothing
+    // re-renders and no prop changes. While the finger is down this asks for the frames that
+    // track it, and stops asking on the frame it lifts.
+    invalidate();
 
     raycaster.current.setFromCamera(new Vector2(ndc[0], ndc[1]), camera);
 

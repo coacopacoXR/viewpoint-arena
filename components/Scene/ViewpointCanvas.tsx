@@ -13,6 +13,12 @@ import ReviewArtifacts from './ReviewArtifacts';
 import ReviewModelGizmo from './ReviewModelGizmo';
 import SceneClickSelect from './SceneClickSelect';
 import PerfProbe, { perfProbeEnabled } from './PerfProbe';
+import MotionQuality, {
+  MOTION_DPR_MIN,
+  MOTION_SETTLE_MS,
+  PresenceDrivenFrames,
+  StoreDrivenFrames,
+} from './MotionQuality';
 import { SCENE_TONE_MAPPING, SCENE_TONE_MAPPING_EXPOSURE } from './LightRig';
 import { useStore } from '../../store';
 import { usePresence } from '../../lib/PresenceContext';
@@ -165,7 +171,7 @@ const SceneRenderer = () => {
 
   const { broadcastTakeoverAttempt, localUserId } = usePresence();
 
-  const { gl, scene, camera: defaultCamera, size } = useThree();
+  const { gl, scene, camera: defaultCamera, size, invalidate } = useThree();
   
   // Lazy init secondary camera
   const agentCamRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -393,6 +399,17 @@ const SceneRenderer = () => {
     const controls = controlsRef.current;
     const elapsedTime = state.clock.getElapsedTime();
 
+    // A DRIVEN CAMERA HAS TO ASK FOR ITS OWN FRAMES. Everything below moves the camera — or, in
+    // the split view, moves what the second pane looks at — without anybody touching a mouse, and
+    // under `frameloop="demand"` a frame that is not asked for is a frame that does not happen,
+    // so a follow would freeze on the pose it had when the person last dragged. OrbitControls
+    // covers most of it by accident (three dispatches `change` when its own `update()` finds the
+    // camera has moved, and drei invalidates on that event), but the split view's right pane can
+    // move with the main camera standing still, and a contract that depends on a library's
+    // internal epsilon is not a contract. Free view is the one mode with nothing driven in it,
+    // and it is the only one that stays quiet.
+    if (followingRemoteUserId || viewMode !== ViewMode.FREE || splitScreenTarget) invalidate();
+
     // --- 1. CAMERA MOVEMENT LOGIC (Main View) ---
 
     if (followingRemoteUserId) {
@@ -616,7 +633,7 @@ const RemoteLaserDot: React.FC<{
   const lastColor = useRef<string>('');
   const lastName = useRef<string>('');
 
-  useFrame(({ clock }) => {
+  useFrame(({ clock, invalidate }) => {
     const state = remoteLasers.current.get(userId);
     const pos = state?.position ?? null;
     const participant = remoteParticipants.current.get(userId);
@@ -656,6 +673,10 @@ const RemoteLaserDot: React.FC<{
       } else {
         groupRef.current.visible = false;
       }
+      // A pulse is a picture that changes with no input at all, so while a colleague's dot is up
+      // it asks for the next frame — and stops the moment it goes down. Under
+      // `frameloop="demand"` an animation nobody asked for is an animation nobody sees.
+      if (groupRef.current.visible) invalidate();
     }
 
     // --- Beam from participant avatar body to hit point ---
@@ -782,6 +803,22 @@ const ViewpointCanvas: React.FC = () => {
     <Canvas
       shadows
       dpr={[1, 2]}
+      // RENDER ON DEMAND, and the two numbers that go with it.
+      //
+      // A review room is a picture somebody looks at, not a game: between one drag and the next,
+      // nothing in it changes, and a canvas on the default `frameloop="always"` redraws the whole
+      // of it every interval anyway — measured at 25b6a5d, an untouched room drew 5 256 frames in
+      // five seconds at 3 200 parts and 1 974 at 10 000 (perf/results/README.md, the `idle
+      // frames / 5 s` column). Each one is a shadow pass, a ContactShadows re-render and a laptop
+      // fan, for a picture identical to the one before it. Under demand the same room draws
+      // nothing until something asks, and what asks is listed one by one at the head of
+      // components/Scene/MotionQuality.tsx and in the pumps beside the systems below.
+      //
+      // `performance.min` is the pixel ratio a moving camera draws at and `debounce` how long
+      // after it stops before the full one comes back; drei's <AdaptiveDpr>, which MotionQuality
+      // mounts, is what reads them.
+      frameloop="demand"
+      performance={{ min: MOTION_DPR_MIN, debounce: MOTION_SETTLE_MS }}
       eventPrefix="client"
       style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' }}
       gl={{
@@ -805,6 +842,14 @@ const ViewpointCanvas: React.FC = () => {
             address and would never see the parameter the room was opened with.
             Renders nothing at all without it — see components/Scene/PerfProbe.tsx. */}
         {perfProbeEnabled() && <PerfProbe />}
+
+        {/* What the on-demand loop is allowed to spend while the camera moves, and the two
+            pumps that make it turn when nothing local is moving: a store write the picture
+            depends on, and somebody else in the room moving. Mounted first because they are
+            the frame loop's own plumbing rather than a system in the scene. */}
+        <MotionQuality />
+        <StoreDrivenFrames />
+        <PresenceDrivenFrames />
 
         {/* Systems */}
         <DialogueEngine />

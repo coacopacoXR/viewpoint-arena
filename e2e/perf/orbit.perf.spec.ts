@@ -100,6 +100,30 @@ const IMPORT_TIMEOUT_MS = 12 * 60_000;
 const VIEWPORT = { width: 1600, height: 900 };
 
 /**
+ * How long the camera is left alone to see whether the scene still draws itself.
+ *
+ * The other half of "cheaper frames while the camera moves": a scene that renders on demand
+ * costs NOTHING while nobody moves, and a scene that renders always costs a full frame every
+ * interval whether or not one pixel of it changed. The orbit rows above cannot tell those two
+ * apart — both are being dragged, so both draw every frame — so the orbit scenario also counts
+ * the frames the renderer produces over this window with no input at all. It is a GPU-usage
+ * proxy rather than a GPU measurement: `renderer.info.render.frame` is three's own count of
+ * `WebGLRenderer.render` calls, which is the only thing this page can see from inside, and one
+ * standard-view frame is exactly one of those.
+ */
+const IDLE_WINDOW_MS = 5_000;
+
+/**
+ * How long the pointer is left still before that count starts.
+ *
+ * OrbitControls runs with `enableDamping`, so a released drag keeps moving the camera — and
+ * keeps asking for frames — for a few hundred milliseconds after `mouse.up()`. Counting those
+ * would report the tail of the orbit as an idle scene. 1.5 s is well past a `dampingFactor` of
+ * 0.1 converging and costs the run a second and a half.
+ */
+const IDLE_SETTLE_MS = 1_500;
+
+/**
  * An empty room already draws a handful of triangles, so "the model is up" is a
  * threshold well above that and far below the smallest fixture's first part.
  */
@@ -145,6 +169,49 @@ async function sweep(
     await page.waitForTimeout(POINTER_INTERVAL_MS);
   }
   return moves;
+}
+
+/** What the idle window saw: how many frames the renderer drew, and over how long. */
+interface IdleMeasurement {
+  frames: number;
+  windowMs: number;
+  /**
+   * The triangles in the last frame the renderer drew before it went quiet.
+   *
+   * Which, on a scene that renders on demand and hides small parts while the camera moves, is the
+   * frame the SETTLE drew — and so is the proof the parts came back. A cull that never restored
+   * would leave this at the moving frame's count and the orbit's own numbers would look better
+   * than the room does: a benchmark that quietly stopped drawing a third of the model is exactly
+   * the kind that flatters itself, and this is the number that stops it.
+   */
+  triangles: number;
+}
+
+/**
+ * Count the frames the scene draws with no input at all.
+ *
+ * Read off the renderer's own counter rather than off a `requestAnimationFrame` in the page:
+ * rAF keeps ticking under `frameloop="demand"` for as long as anything invalidates, and what
+ * the number is meant to say is how much GPU work an untouched room does, which is the count
+ * of actual `render()` calls. Two samples of `renderer.info.render.frame` around a wait, with
+ * nothing in between them but time.
+ */
+async function measureIdle(page: Page): Promise<IdleMeasurement> {
+  await page.waitForTimeout(IDLE_SETTLE_MS);
+  const probe = () =>
+    page.evaluate(() => {
+      const renderer = window.__vpPerf?.renderer();
+      return { frame: renderer?.frame ?? 0, triangles: renderer?.triangles ?? 0 };
+    });
+  const before = await probe();
+  const startedAt = Date.now();
+  await page.waitForTimeout(IDLE_WINDOW_MS);
+  const after = await probe();
+  return {
+    frames: Math.max(0, after.frame - before.frame),
+    windowMs: Date.now() - startedAt,
+    triangles: after.triangles,
+  };
 }
 
 const git = (args: string[]): string => {
@@ -223,6 +290,15 @@ interface FixtureResult {
   programs: number;
   heapBytes: number | null;
   gpu: PerfRecording["gpu"];
+  /**
+   * Frames drawn with no input, over IDLE_WINDOW_MS — the orbit scenario only.
+   *
+   * Null rather than absent on the rows written before it existed, and null on a laser row
+   * because that scenario never stops moving the pointer: a laser sweep has no idle half to
+   * measure, and a zero there would read as "the scene went quiet" when it was swept the
+   * whole time.
+   */
+  idle: IdleMeasurement | null;
 }
 
 interface RunRecord {
@@ -347,6 +423,11 @@ function record(result: FixtureResult, browser: string): string {
           String(result.drawCalls),
           (result.timeToVisibleMs / 1000).toFixed(1),
           ...tail,
+          // LAST rather than beside the frame times, so the five committed rows above it stay
+          // exactly as they were written and simply read as one cell short. The column is the
+          // idle half of the run — frames drawn with no input — and it belongs to the orbit
+          // table alone.
+          result.idle ? String(result.idle.frames) : "",
         ].join(" | ");
 
   const table = tableFor(result.scenario);
@@ -465,6 +546,7 @@ function summarise(
   moves: number,
   rec: PerfRecording,
   browser: string,
+  idle: IdleMeasurement | null = null,
 ): FixtureResult {
   const frames = [...rec.frameTimesMs].sort((a, b) => a - b);
   expect(
@@ -497,6 +579,7 @@ function summarise(
     programs: rec.renderer.programs,
     heapBytes: rec.memory?.usedJSHeapSize ?? null,
     gpu: rec.gpu,
+    idle,
   };
   const resultsFile = record(result, browser);
 
@@ -508,6 +591,9 @@ function summarise(
       `${result.fps.toFixed(1)} FPS over ${frames.length} frames\n` +
       `[perf:${scenario}]   heap ${result.heapBytes === null ? "n/a" : `${mb(result.heapBytes)} MB`}  ` +
       `gpu ${rec.gpu.renderer}\n` +
+      (idle
+        ? `[perf:${scenario}]   idle: ${idle.frames} frames drawn in ${(idle.windowMs / 1000).toFixed(1)}s of no input\n`
+        : "") +
       `[perf:${scenario}]   → ${resultsFile}\n`,
   );
   return result;
@@ -538,6 +624,14 @@ test.describe("orbit a large assembly", () => {
       const radiusX = VIEWPORT.width * 0.28;
       const radiusY = VIEWPORT.height * 0.18;
 
+      // What one frame draws with the camera standing still and nothing culled, which is the
+      // number the settle has to come back to. Sampled outside the recording on purpose: the
+      // recording's own last sample is a moving frame, and on a scene that hides small parts
+      // while the camera moves the two are not the same number any more.
+      const stillTriangles = await page.evaluate(
+        () => window.__vpPerf?.renderer().triangles ?? 0,
+      );
+
       await page.evaluate(() => window.__vpPerf?.start());
       await page.mouse.move(cx, cy);
       await page.mouse.down();
@@ -557,6 +651,12 @@ test.describe("orbit a large assembly", () => {
       expect(recording, "the perf probe went away mid-orbit").toBeDefined();
       const rec = recording as PerfRecording;
 
+      // ── idle ──────────────────────────────────────────────────────────────
+      // After the recording is stopped rather than inside it: the probe's own frame-time
+      // samples would otherwise include five seconds of nothing happening, which would drag
+      // a median towards whatever the wait cost and make the orbit number unreadable.
+      const idle = await measureIdle(page);
+
       // ── report ────────────────────────────────────────────────────────────
       const result = summarise(
         "orbit",
@@ -566,7 +666,34 @@ test.describe("orbit a large assembly", () => {
         moves,
         rec,
         `${browserName} ${page.context().browser()?.version() ?? ""}`.trim(),
+        idle,
       );
+
+      // ── the cull gave the parts back ──────────────────────────────────────
+      // Three numbers from one run: what a frame drew standing still, what it drew while the
+      // camera moved, and what the frame the SETTLE drew afterwards. The first and the last are
+      // the same picture with nothing hidden and the middle one is not, which is the point of the
+      // run. If the last ever equals the middle, the motion cull has stopped restoring, and every
+      // orbit row below it is a flattering picture of a model with a third of its parts missing —
+      // so this is asserted rather than only printed.
+      console.log(
+        `[perf:orbit]   triangles: ${stillTriangles.toLocaleString("en-US")} still, ` +
+          `${rec.renderer.triangles.toLocaleString("en-US")} while moving, ` +
+          `${idle.triangles.toLocaleString("en-US")} after the settle\n`,
+      );
+      expect(
+        rec.renderer.triangles,
+        `a frame drawn while orbiting the ${parts}-part fixture cost no fewer triangles than one ` +
+          `drawn standing still (${stillTriangles}), so nothing was culled and the orbit's frame ` +
+          `times are not measuring the motion work at all`,
+      ).toBeLessThan(stillTriangles);
+      expect(
+        idle.triangles,
+        `the frame the settle drew had ${idle.triangles.toLocaleString("en-US")} triangles and the ` +
+          `one before the orbit had ${stillTriangles.toLocaleString("en-US")}: the motion cull did ` +
+          `not give every part back when the camera stopped, so the room is sitting there with ` +
+          `pieces of the model missing and the frame times above are describing that`,
+      ).toBe(stillTriangles);
 
       // CHANGED BY TASK 04b STAGE 4, and the change is the point of the task rather than a
       // convenience. This asserted `geometries >= parts` — "every part is its own mesh with

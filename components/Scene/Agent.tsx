@@ -109,6 +109,13 @@ const Agent: React.FC<AgentProps> = ({ initialState, allAgents }) => {
   useFrame((state, delta) => {
     if (!groupRef.current) return;
 
+    // A playing agent walks, and walking is a picture that changes with no input at all, so it
+    // asks for its own frames. Paused is the one state in which nothing here moves, and the
+    // translucency below is the one thing that still can — which asks separately, and only for
+    // as long as it takes to arrive. Under `frameloop="demand"` an agent that did not ask would
+    // stand still, and a room left alone would look exactly like a room somebody had paused.
+    if (isPlaying) state.invalidate();
+
     // --- Translucency Logic ---
     const camera = state.camera;
     const camPos = camera.position;
@@ -131,8 +138,12 @@ const Agent: React.FC<AgentProps> = ({ initialState, allAgents }) => {
 
     if (materialRef.current) {
         materialRef.current.opacity = THREE.MathUtils.lerp(materialRef.current.opacity, targetOpacity, delta * 5);
-        materialRef.current.transparent = true; 
+        materialRef.current.transparent = true;
         materialRef.current.depthWrite = materialRef.current.opacity > 0.8;
+        // A fade is the one thing here that still moves while the meeting is paused, so it asks
+        // for the frames it needs to finish and no more. 1/255th is the smallest step an 8-bit
+        // channel can show, which makes "arrived" a number rather than a lerp that never lands.
+        if (Math.abs(materialRef.current.opacity - targetOpacity) > 1 / 255) state.invalidate();
     }
 
     if (visualRef.current && agentStyle === AgentStyle.BOX) {

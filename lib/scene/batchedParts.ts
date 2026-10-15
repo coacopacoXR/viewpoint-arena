@@ -54,6 +54,7 @@ import {
   Mesh,
   Object3D,
   Quaternion,
+  Sphere,
   Vector3,
   type EulerOrder,
   type Material,
@@ -62,9 +63,12 @@ import type { SceneNode } from '../../types';
 import {
   HighlightMaterials,
   MeshPartRegistry,
+  MotionCullIndex,
+  MovedParts,
   PartGraph,
   isIgnorable,
   treeNames,
+  type MotionCullView,
   type PartHandle,
   type PartRegistry,
   type PartState,
@@ -247,6 +251,13 @@ interface PartRecord {
   readonly matrix: Matrix4;
   /** Whether the tree currently has this part shown. What a slot goes back to on unhighlight. */
   visible: boolean;
+  /**
+   * Whether a motion cull is hiding this part, which is a RENDER-ONLY flag and not this one's
+   * business: `visible` is what the Model Tree says and stays what it says while the camera
+   * moves. Kept apart so that restoring the culled parts when the camera settles can never
+   * un-hide a part somebody turned off — see PartRegistry.motionCull.
+   */
+  culled: boolean;
   /** The overlay drawing this part's highlight, or null while it is not highlighted. */
   overlay: Mesh | null;
   /** Whether a part batching left alone is currently on its clone rather than the file's. */
@@ -456,13 +467,29 @@ export class BatchedPartRegistry implements PartRegistry {
   private readonly batches: Batch[] = [];
   private readonly batchOf = new Map<Object3D, Batch>();
   private readonly highlighted = new HighlightMaterials();
-  private readonly moved = new Set<string>();
+  private readonly moved = new MovedParts();
   /** How many parts batching could not take. Answered, not fixed — see `batchable`. */
   private unbatched = 0;
   /** Which part each highlight overlay stands in for, so a hit on one resolves to it. */
   private readonly overlayIndex = new Map<Object3D, number>();
   /** How many overlays are up, against MAX_OVERLAY_PARTS. See `writeHighlight`. */
   private overlayCount = 0;
+  /** The parts' spheres, in the root's space, sorted by radius. Built at the first cull. */
+  private readonly cullIndex: MotionCullIndex;
+  /** How many parts had been moved when `cullIndex` was built. See `motionCull`. */
+  private cullBuiltAt = -1;
+  /**
+   * A geometry's own sphere, keyed on the box it was measured from.
+   *
+   * `localBox` is shared by every part built from the same BufferGeometry, so a file that
+   * repeats one bolt four thousand times measures one sphere and not four thousand — the same
+   * sharing the box already has, and the reason a cull build is per TEMPLATE plus a matrix
+   * apply per part rather than a box-to-sphere per part.
+   */
+  private readonly cullSpheres = new Map<Box3, Sphere>();
+  /** Scratch for the cull, so neither a build nor a frame allocates. */
+  private readonly cullEye = new Vector3();
+  private readonly cullInverse = new Matrix4();
   private proxy: Object3D | null = null;
   private anchor: Object3D | null = null;
 
@@ -511,6 +538,7 @@ export class BatchedPartRegistry implements PartRegistry {
         // instance matrix ever has to be touched again.
         matrix: new Matrix4().multiplyMatrices(rootInverse, object.matrixWorld),
         visible: true,
+        culled: false,
         overlay: null,
         glowing: false,
       };
@@ -543,6 +571,9 @@ export class BatchedPartRegistry implements PartRegistry {
     this.graph = new PartGraph(ids, parentOf);
     this.buildBatches();
     this.pruneEmptied();
+    // Sized here rather than as a field initialiser, because the records it indexes are the
+    // ones the traverse above just built.
+    this.cullIndex = new MotionCullIndex(this.records.length);
   }
 
   /**
@@ -670,6 +701,74 @@ export class BatchedPartRegistry implements PartRegistry {
     });
   }
 
+  // The spheres are in the ROOT's space and so is the eye, which is what makes a model that has
+  // been placed, dragged or scaled cost nothing here: `record.matrix` is already the root-relative
+  // matrix every box and slot reads. Only a part that MOVED stales a sphere, and a part moves
+  // through `writeTransform`, which is the one place `moved` grows — so comparing its size is a
+  // complete dirtiness test with no bookkeeping at the write site.
+  motionCull(view: MotionCullView | null): number {
+    if (view === null) {
+      return this.cullIndex.restore((part) => this.writeCulled(this.records[part], false));
+    }
+    if (this.cullBuiltAt !== this.moved.version) this.buildCullIndex();
+    this.root.updateWorldMatrix(true, false);
+    this.cullInverse.copy(this.root.matrixWorld).invert();
+    this.cullEye.copy(view.eye).applyMatrix4(this.cullInverse);
+    return this.cullIndex.apply(
+      this.cullEye,
+      view.k,
+      // A part drawing from an overlay — a batched one — or from a swapped material — one
+      // batching left alone — is a part somebody is looking at, and is the one part that must
+      // not vanish for being small.
+      (part) => this.records[part].overlay !== null || this.records[part].glowing,
+      (part, culled) => this.writeCulled(this.records[part], culled),
+    );
+  }
+
+  /** The cull's own write, which is the composition `applyPart` exists to keep in one place. */
+  private writeCulled(record: PartRecord, culled: boolean): void {
+    record.culled = culled;
+    this.applyPart(record);
+  }
+
+  /**
+   * Measure every candidate part's sphere once, in the root's space, and sort them by radius.
+   *
+   * Cheap here in a way it is not in MeshPartRegistry: `localBox` was already measured per
+   * GEOMETRY when the batches were built, and a box to a sphere is a centre and a diagonal with
+   * no vertices in it. So a build is one sphere per template plus one matrix apply per part —
+   * a few hundred spheres and ten thousand multiplies — rather than a walk of the file's geometry.
+   */
+  private buildCullIndex(): void {
+    this.cullIndex.begin();
+    for (const record of this.records) {
+      // A part with no geometry of its own — a group, or the model's root — is not a candidate:
+      // see MotionCullIndex.begin. Skipping it here is what stops the root from being measured as
+      // a point at its own origin, which is the smallest sphere in the file and would have been
+      // the first thing a cull hid, taking the whole model with it.
+      if (!record.localBox) continue;
+      let sphere = this.cullSpheres.get(record.localBox);
+      if (!sphere) {
+        sphere = record.localBox.getBoundingSphere(new Sphere());
+        this.cullSpheres.set(record.localBox, sphere);
+      }
+      scratchPosition.copy(sphere.center).applyMatrix4(record.matrix);
+      // The part's own scale, which is the only thing between its geometry's space and the
+      // root's. Largest axis, so a non-uniform one under-culls rather than hides something big.
+      scratchScale.setFromMatrixScale(record.matrix);
+      const scale = Math.max(scratchScale.x, scratchScale.y, scratchScale.z) || 1;
+      this.cullIndex.push(
+        record.index,
+        scratchPosition.x,
+        scratchPosition.y,
+        scratchPosition.z,
+        sphere.radius * scale,
+      );
+    }
+    this.cullIndex.finish();
+    this.cullBuiltAt = this.moved.version;
+  }
+
   movedPartIds(): readonly string[] {
     return [...this.moved];
   }
@@ -763,6 +862,8 @@ export class BatchedPartRegistry implements PartRegistry {
     }
     this.overlayCount = 0;
     this.overlayIndex.clear();
+    // The spheres a cull build measured, which are keyed on the boxes those records carried.
+    this.cullSpheres.clear();
     this.records.length = 0;
     this.handles.length = 0;
     this.byId.clear();
@@ -961,9 +1062,29 @@ export class BatchedPartRegistry implements PartRegistry {
   writeVisible(index: number, visible: boolean): void {
     const record = this.records[index];
     record.visible = visible;
-    if (record.batch && record.slot >= 0) record.batch.mesh.setVisibleAt(record.slot, visible);
-    if (record.object) record.object.visible = visible;
-    if (record.overlay) record.overlay.visible = visible;
+    this.applyPart(record);
+  }
+
+  /**
+   * Write what a part is drawn as, from the three flags that decide it.
+   *
+   * ONE place rather than one per flag, because they compose and a caller writing its own would
+   * be a fourth answer to "is this part on the screen": the tree's visibility, the motion cull's,
+   * and whether a highlight overlay is standing in for the slot. A part is drawn iff the tree has
+   * it visible AND the motion cull has not taken it; its SLOT is off whenever an overlay is up
+   * whatever those two say, because the overlay IS the part being drawn (see `writeHighlight`).
+   *
+   * The overlay follows the tree alone and not the cull, and that is safe rather than a hole: a
+   * part with an overlay is never culled, because raising one clears the flag and `motionCull`
+   * refuses to set it again.
+   */
+  private applyPart(record: PartRecord): void {
+    const drawn = record.visible && !record.culled;
+    if (record.batch && record.slot >= 0) {
+      record.batch.mesh.setVisibleAt(record.slot, drawn && record.overlay === null);
+    }
+    if (record.object) record.object.visible = drawn;
+    if (record.overlay) record.overlay.visible = record.visible;
   }
 
   writeVisibleSubtree(index: number, visible: boolean): void {
@@ -1017,8 +1138,9 @@ export class BatchedPartRegistry implements PartRegistry {
       record.overlay = null;
       this.overlayCount -= 1;
       // Back to whatever the tree says about this part, which is not necessarily "shown": a
-      // selection can be cleared while the part it was on is hidden.
-      batch.mesh.setVisibleAt(record.slot, record.visible);
+      // selection can be cleared while the part it was on is hidden — or while a motion cull is
+      // holding it, which `applyPart` composes in rather than this call having to know about.
+      this.applyPart(record);
       return;
     }
 
@@ -1044,7 +1166,9 @@ export class BatchedPartRegistry implements PartRegistry {
     record.overlay = overlay;
     this.overlayIndex.set(overlay, index);
     this.overlayCount += 1;
-    batch.mesh.setVisibleAt(record.slot, false);
+    // The slot goes off because the overlay is up. Through `applyPart` rather than a write of
+    // its own so that this does not have to know what else is hiding the part.
+    this.applyPart(record);
   }
 
   // ─── reads ────────────────────────────────────────────────────────────────────

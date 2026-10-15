@@ -217,7 +217,7 @@ function RemoteXRAvatar({ userId }: { userId: string }) {
   const headPos = useRef(new THREE.Vector3());
   const headQuat = useRef(new THREE.Quaternion());
 
-  useFrame(() => {
+  useFrame(({ invalidate }) => {
     const data = remoteXRParticipants.get(userId);
     if (!data) return;
 
@@ -227,6 +227,17 @@ function RemoteXRAvatar({ userId }: { userId: string }) {
     if (headRef.current) {
       headRef.current.position.lerp(headPos.current, 0.2);
       headRef.current.quaternion.slerp(headQuat.current, 0.2);
+      // A lerp is a picture that changes with no input at all, and a headset's pose arrives in a
+      // module-level map that no React render sees — so under `frameloop="demand"` this has to ask
+      // for the frames it takes to arrive, and stop asking once it has. The head is the measure
+      // because both controllers ride the same 0.2 lerp beside it; the turn is measured as well
+      // as the walk, because a headset turning in place moves nothing and still has to be drawn.
+      if (
+        headRef.current.position.distanceToSquared(headPos.current) > 1e-4 ||
+        headRef.current.quaternion.angleTo(headQuat.current) > 1e-3
+      ) {
+        invalidate();
+      }
     }
     if (nameRef.current) {
       nameRef.current.position.copy(headPos.current).add(new THREE.Vector3(0, 0.25, 0));

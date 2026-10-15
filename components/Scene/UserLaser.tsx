@@ -184,6 +184,14 @@ const UserLaser: React.FC = () => {
 
     useFrame((state) => {
         const frameNow = Date.now();
+        // The laser raycasts and moves a dot, a beam and a part name every frame it is up, and
+        // the hover-dwell below needs a frame per sample to notice that a pointer has STOPPED —
+        // which is the one thing no input event can report, because the absence of an event is
+        // not an event. Neither is anything the render loop hears about, so while either is
+        // armed this asks for the next frame itself. Both are things a person is holding (a key,
+        // two mouse buttons, a raised finger, an opt-in setting), so "armed" is "pointing", and
+        // letting go stops the asking on the same frame it stops the raycasting.
+        if (isLaserActive || hoverPointingEnabled) state.invalidate();
         // What turns a raycast hit into a part. Read once here because two raycasts
         // below resolve through it — the hover-dwell check and the laser's own pick —
         // and they have to agree, which is the whole reason the walk they each used to

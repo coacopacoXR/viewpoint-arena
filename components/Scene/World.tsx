@@ -38,6 +38,15 @@ const World: React.FC<WorldProps> = ({ hideAgents: hideAgentsOverride, modelGrou
   // Ref to track throttle
   const lastTimeUpdate = useRef(0);
 
+  // THE CLOCK MUST NOT ASK FOR A FRAME, and the room renders on demand
+  // (`frameloop="demand"` in components/Scene/ViewpointCanvas.tsx), so that is a live constraint
+  // rather than a taste: this runs inside useFrame, so a frame that wrote the clock and then
+  // asked for another one would keep an untouched room turning at ten frames a second forever.
+  // It does not ask — nothing here calls `invalidate()` — and components/Scene/MotionQuality.tsx's
+  // `StoreDrivenFrames` skips `time` when it decides whether a store write means the picture
+  // changed, which is the other half of the same rule. Nothing draws the clock; it is a number
+  // four UI components read. If this ever grows a visual, the visual asks for its own frames and
+  // the clock stays quiet.
   useFrame((state) => {
     if (isPlaying) {
       // Only update React state (store.time) every 100ms to prevent crash

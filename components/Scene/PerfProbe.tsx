@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
-import { Vector3 } from 'three';
+import { Raycaster, Vector3 } from 'three';
 import { useStore } from '../../store';
 import { partRegistries } from '../../lib/scene/partRegistry';
 import { reviewModelBounds } from '../../lib/scene/modelBounds';
@@ -26,7 +26,9 @@ import { reviewModelBounds } from '../../lib/scene/modelBounds';
  *
  * Besides the renderer's counters it publishes where the model actually is on
  * screen (`modelScreenRect`), which the laser scenario aims its sweep at instead
- * of at a pixel radius guessed from the viewport.
+ * of at a pixel radius guessed from the viewport, and what one whole-scene raycast
+ * costs on its own (`raycastMs`), which is the pick path separated from the frame it
+ * lives in.
  */
 
 export interface PerfRendererInfo {
@@ -94,6 +96,22 @@ export interface VpPerf {
    * lost the triangles" and is not.
    */
   modelScreenRect(): PerfScreenRect | null;
+  /**
+   * What ONE whole-scene raycast costs, in ms, averaged over `samples`.
+   *
+   * The laser scenario's frame time is everything a frame does — the raycast, the
+   * selection it writes, the React that follows it, the draw — and task 05c left the
+   * raycast and the highlight as its two candidates without a number on either. This is
+   * the raycast's own number, taken the way components/Scene/UserLaser.tsx takes it
+   * (`setFromCamera` on the live pointer, `intersectObjects(scene.children, true)`), so a
+   * change to the pick path can be read against it instead of against a frame that also
+   * contains a store write.
+   *
+   * Measured on demand rather than sampled every frame: `intersectObjects` allocates its
+   * result array, and running it twice per frame to time one of them would put the timing
+   * inside the thing being timed.
+   */
+  raycastMs(samples?: number): number;
   start(): void;
   stop(): PerfRecording;
   isRecording(): boolean;
@@ -135,6 +153,9 @@ const PerfProbe: React.FC = () => {
   const camera = useThree(state => state.camera);
   const scene = useThree(state => state.scene);
   const size = useThree(state => state.size);
+  // The live pointer, which R3F mutates in place on every pointer event, so the one object
+  // this reads at mount is still where the pointer is when a measurement is asked for.
+  const pointer = useThree(state => state.pointer);
 
   const recording = useRef(false);
   const frameTimes = useRef<number[]>([]);
@@ -222,12 +243,26 @@ const PerfProbe: React.FC = () => {
       return { left, top, width: right - left, height: bottom - top };
     };
 
+    // One raycaster rather than one per sample: UserLaser keeps a single Raycaster in a ref
+    // for exactly this reason, and a measurement that allocated differently from the code it
+    // is measuring would be measuring its own garbage collection.
+    const probeRaycaster = new Raycaster();
+    const raycastMs = (samples = 5): number => {
+      const started = performance.now();
+      for (let at = 0; at < samples; at += 1) {
+        probeRaycaster.setFromCamera(pointer, camera);
+        probeRaycaster.intersectObjects(scene.children, true);
+      }
+      return (performance.now() - started) / Math.max(1, samples);
+    };
+
     window.__vpPerf = {
       enabled: true,
       renderer,
       memory: readMemory,
       gpu,
       modelScreenRect,
+      raycastMs,
       isRecording: () => recording.current,
       start: () => {
         frameTimes.current = [];
@@ -251,7 +286,7 @@ const PerfProbe: React.FC = () => {
     return () => {
       delete window.__vpPerf;
     };
-  }, [gl, camera, scene, size]);
+  }, [gl, camera, scene, size, pointer]);
 
   return null;
 };

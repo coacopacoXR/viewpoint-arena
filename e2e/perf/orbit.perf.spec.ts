@@ -87,6 +87,22 @@ const LASER_SWEEP_MS = 10_000;
  */
 const LASER_WARM_UP_MS = 4_000;
 /**
+ * How long the first-hover pass may sweep before it is reported as never having named a part.
+ *
+ * Generous on purpose: the pass runs on a page that has just imported a hundred megabytes and
+ * whose first touch of a model costs whatever this task is trying to find out, so a second or
+ * two of stall inside it is the measurement and not a failure.
+ */
+const FIRST_HOVER_TIMEOUT_MS = 30_000;
+/**
+ * How much sweeping happens between two looks at the watcher during that pass.
+ *
+ * Short because the pass stops at the first hit and every millisecond swept past it is a frame
+ * in the recording that is not the first touch. 100 ms is inside one ordinary frame at either
+ * fixture size, so what it adds to the recording is a handful of frames rather than a second.
+ */
+const FIRST_HOVER_CHUNK_MS = 100;
+/**
  * Pointer moves are paced rather than sent flat out. A drag arriving faster than
  * a real mouse can report would spend the frame budget on event dispatch instead
  * of on drawing, and the result would measure Playwright. Each move is also a
@@ -214,6 +230,72 @@ async function measureIdle(page: Page): Promise<IdleMeasurement> {
   };
 }
 
+/**
+ * What the laser's FIRST touch of a part cost — the laser scenario only.
+ *
+ * Everything a first touch pays for lands in one or two frames: the overlay's material and its
+ * slice of the merged buffer, the Model Tree expanding the part's ancestors and mounting a DOM
+ * row per part, and any shader program new to the renderer. LASER_WARM_UP_MS exists to keep
+ * those frames out of the timed sweep, which is why the sweep's own rows have never said what
+ * they cost — and task 05c's profile found ~960 ms of `gl.getProgramInfoLog` in there, i.e. a
+ * program being compiled during a sweep. This is that frame, measured on a recording that holds
+ * nothing else.
+ */
+interface FirstHoverMeasurement {
+  /**
+   * The longest frame in the cold recording, which is the stall the first touch makes.
+   *
+   * The longest rather than a frame picked out by name, because the things it pays for do not
+   * all happen in the same one: the store write that selects the part and the React pass that
+   * raises the overlay can land either side of a render. What makes the longest frame the right
+   * answer is that the recording holds no other candidate — a few ordinary frames of a sweep
+   * aimed at the model, and one first touch.
+   */
+  ms: number;
+  /** Which frame of the cold recording that was, so a run where it is NOT the first touch says so. */
+  frameIndex: number;
+  /** How many frames the cold recording held at all. */
+  frames: number;
+  /**
+   * Shader programs either side of it.
+   *
+   * The half that decides whether a compile is real rather than inferred: three builds a
+   * WebGLProgram only for a material-and-geometry combination it has not seen, so a first hover
+   * that compiles one is a count that grew, and one that does not is a first hover whose cost is
+   * somewhere else. Both are recorded because a difference is the number and neither end of it
+   * means anything on its own.
+   */
+  programsBefore: number;
+  programsAfter: number;
+  /** The part the first touch named. */
+  named: string;
+}
+
+/**
+ * The numbers only one of the two scenarios has.
+ *
+ * One object rather than more trailing parameters on `summarise`, which the orbit scenario
+ * would then have to pass three nulls through to reach its own.
+ */
+interface ScenarioExtras {
+  /** Frames drawn with no input — the orbit scenario, see `measureIdle`. */
+  idle: IdleMeasurement | null;
+  /** The first-touch stall — the laser scenario, see `FirstHoverMeasurement`. */
+  firstHover: FirstHoverMeasurement | null;
+  /**
+   * What ONE whole-scene raycast cost with the pointer on the model, in ms.
+   *
+   * Taken between the warm-up and the timed sweep, so it describes the pick path in the state a
+   * sweeping frame finds it: the tree mounted, the overlays up, the pointer inside the model.
+   * It is the raycast's share of a frame that also contains a store write and a React pass, and
+   * the number a broad phase is measured against — a laser median that moved without this moving
+   * moved for some other reason.
+   */
+  raycastMs: number | null;
+}
+
+const NO_EXTRAS: ScenarioExtras = { idle: null, firstHover: null, raycastMs: null };
+
 const git = (args: string[]): string => {
   try {
     return execFileSync("git", args, { cwd: REPO_ROOT, encoding: "utf8" }).trim();
@@ -269,8 +351,17 @@ never raycasts and never selects, so its frames are what a picture costs to DRAW
 are what one costs to POINT AT. Same machine, same browser, close in time, or the pair means
 nothing.
 
-| date | git sha | parts | tris | calls | visible s | median ms | p95 ms | FPS | heap MB | gpu |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+The last two columns are task 05d's, and they are the two halves the median cannot show.
+**first hover ms** is the longest frame in a separate recording that holds nothing but the
+laser's FIRST touch of a part — before the warm-up, so the warm-up is not hiding it — which
+is where an overlay's material, its slice of the merged buffer, the tree's one-time mount of
+a row per part and any new shader program all land. **raycast ms** is one whole-scene
+\`intersectObjects(scene.children, true)\` on its own, with the pointer on the model and the
+scene already warm, i.e. the pick path's share of a frame that also contains a store write
+and a React pass. Rows written before they existed are two cells short.
+
+| date | git sha | parts | tris | calls | visible s | median ms | p95 ms | FPS | heap MB | gpu | first hover ms | raycast ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
 `;
 
 interface FixtureResult {
@@ -299,6 +390,10 @@ interface FixtureResult {
    * whole time.
    */
   idle: IdleMeasurement | null;
+  /** The first-touch stall — the laser scenario only, null on every row written before it. */
+  firstHover: FirstHoverMeasurement | null;
+  /** One whole-scene raycast in ms — the laser scenario only, null before it. */
+  raycastMs: number | null;
 }
 
 interface RunRecord {
@@ -413,6 +508,11 @@ function record(result: FixtureResult, browser: string): string {
           String(result.drawCalls),
           (result.timeToVisibleMs / 1000).toFixed(1),
           ...tail,
+          // LAST rather than beside the frame times, for the reason the orbit table gives: the
+          // rows already committed to laser.md stay exactly as they were written and simply read
+          // two cells short.
+          result.firstHover ? result.firstHover.ms.toFixed(2) : "",
+          result.raycastMs === null ? "" : result.raycastMs.toFixed(2),
         ].join(" | ")
       : [
           runDate,
@@ -546,7 +646,7 @@ function summarise(
   moves: number,
   rec: PerfRecording,
   browser: string,
-  idle: IdleMeasurement | null = null,
+  extras: ScenarioExtras = NO_EXTRAS,
 ): FixtureResult {
   const frames = [...rec.frameTimesMs].sort((a, b) => a - b);
   expect(
@@ -579,7 +679,7 @@ function summarise(
     programs: rec.renderer.programs,
     heapBytes: rec.memory?.usedJSHeapSize ?? null,
     gpu: rec.gpu,
-    idle,
+    ...extras,
   };
   const resultsFile = record(result, browser);
 
@@ -591,9 +691,18 @@ function summarise(
       `${result.fps.toFixed(1)} FPS over ${frames.length} frames\n` +
       `[perf:${scenario}]   heap ${result.heapBytes === null ? "n/a" : `${mb(result.heapBytes)} MB`}  ` +
       `gpu ${rec.gpu.renderer}\n` +
-      (idle
-        ? `[perf:${scenario}]   idle: ${idle.frames} frames drawn in ${(idle.windowMs / 1000).toFixed(1)}s of no input\n`
+      (extras.idle
+        ? `[perf:${scenario}]   idle: ${extras.idle.frames} frames drawn in ${(extras.idle.windowMs / 1000).toFixed(1)}s of no input\n`
         : "") +
+      (extras.firstHover
+        ? `[perf:${scenario}]   first hover: ${extras.firstHover.ms.toFixed(2)} ms ` +
+          `(frame ${extras.firstHover.frameIndex + 1} of ${extras.firstHover.frames}, ` +
+          `programs ${extras.firstHover.programsBefore} → ${extras.firstHover.programsAfter}, ` +
+          `named ${extras.firstHover.named || "(never)"})\n`
+        : "") +
+      (extras.raycastMs === null
+        ? ""
+        : `[perf:${scenario}]   one whole-scene raycast: ${extras.raycastMs.toFixed(2)} ms\n`) +
       `[perf:${scenario}]   → ${resultsFile}\n`,
   );
   return result;
@@ -666,7 +775,7 @@ test.describe("orbit a large assembly", () => {
         moves,
         rec,
         `${browserName} ${page.context().browser()?.version() ?? ""}`.trim(),
-        idle,
+        { ...NO_EXTRAS, idle },
       );
 
       // ── the cull gave the parts back ──────────────────────────────────────
@@ -687,13 +796,25 @@ test.describe("orbit a large assembly", () => {
           `drawn standing still (${stillTriangles}), so nothing was culled and the orbit's frame ` +
           `times are not measuring the motion work at all`,
       ).toBeLessThan(stillTriangles);
+      // WITHIN HALF A PERCENT rather than exactly, and the slack is not a fudge: the two samples
+      // are not guaranteed to be the same picture. `renderer.info.render.triangles` reports
+      // whichever render happened LAST, and on a scene that renders on demand nothing says that
+      // was the room's own — a thumbnail capture does its own synchronous gl.render from another
+      // camera, and the orbit leaves the camera at a pose it did not start at, so frustum culling
+      // can legitimately differ by one small part. Measured on the run that found this: 12
+      // triangles of 3 559 014, with the settle frame on exactly the count every earlier 3 200-part
+      // row reported, i.e. the cull HAD given everything back and the BEFORE sample was the odd
+      // one. What this assertion exists to catch is a cull that stopped restoring, and that is
+      // 21–30 % of the model — two orders of magnitude above a pose difference — so a tolerance
+      // this size still fails it, and the `toBeLessThan` above still fails a cull that never ran.
+      const RESTORE_TOLERANCE = 0.005;
       expect(
-        idle.triangles,
+        Math.abs(idle.triangles - stillTriangles),
         `the frame the settle drew had ${idle.triangles.toLocaleString("en-US")} triangles and the ` +
           `one before the orbit had ${stillTriangles.toLocaleString("en-US")}: the motion cull did ` +
           `not give every part back when the camera stopped, so the room is sitting there with ` +
           `pieces of the model missing and the frame times above are describing that`,
-      ).toBe(stillTriangles);
+      ).toBeLessThanOrEqual(stillTriangles * RESTORE_TOLERANCE);
 
       // CHANGED BY TASK 04b STAGE 4, and the change is the point of the task rather than a
       // convenience. This asserted `geometries >= parts` — "every part is its own mesh with
@@ -817,6 +938,69 @@ test.describe("sweep a laser across a large assembly", () => {
       const radiusX = (box.width / 2) * 0.42;
       const radiusY = (box.height / 2) * 0.42;
 
+      // ── first hover, on a recording of its own ────────────────────────────
+      // BEFORE the warm-up, because the warm-up is exactly what hides it. Everything the
+      // laser's first touch of a part pays for lands in one or two frames — the overlay's
+      // material, its slice of the merged buffer, the Model Tree expanding the part's
+      // ancestors and mounting a DOM row per part of the model, and any shader program new
+      // to the renderer — and LASER_WARM_UP_MS was added to keep that out of the timed
+      // window, which is why the sweep's rows have never said what a first touch costs.
+      // Task 05c's profile put ~960 ms of `gl.getProgramInfoLog` in there, i.e. a program
+      // being compiled during a sweep; this is the measurement that says whether it still
+      // is, and what the rest of the stall is if it is not.
+      //
+      // The pointer is off the model when the pass starts (nothing has moved it since the
+      // page loaded) and the pass stops at the watcher's first hit, so the recording holds a
+      // few ordinary frames and one first touch — which is what makes its LONGEST frame the
+      // first touch rather than a guess at which frame it was. `frameIndex` is kept beside
+      // the number so a run where the longest frame is somewhere else says so.
+      const programsBefore = await page.evaluate(
+        () => window.__vpPerf?.renderer().programs ?? 0,
+      );
+      await page.evaluate(() => window.__vpPerf?.start());
+      const coldEndsAt = Date.now() + FIRST_HOVER_TIMEOUT_MS;
+      let coldMoves = 0;
+      let coldHits = 0;
+      while (Date.now() < coldEndsAt && coldHits === 0) {
+        coldMoves += await sweep(page, cx, cy, radiusX, radiusY, FIRST_HOVER_CHUNK_MS);
+        coldHits = (await laserState()).hits;
+      }
+      const coldRecording = await page.evaluate(() => window.__vpPerf?.stop());
+      expect(
+        coldRecording,
+        "the perf probe went away during the first-hover pass",
+      ).toBeDefined();
+      const cold = coldRecording as PerfRecording;
+      const coldNamed = (await laserState()).named;
+      expect(
+        cold.frameTimesMs.length,
+        `the first-hover pass swept ${coldMoves} times and recorded no frames, so there is no ` +
+          `first touch to time — the laser was engaged and aimed at a ` +
+          `${box.width.toFixed(0)}×${box.height.toFixed(0)} px box`,
+      ).toBeGreaterThan(0);
+      let firstHoverMs = 0;
+      let firstHoverFrame = -1;
+      cold.frameTimesMs.forEach((ms, at) => {
+        if (ms > firstHoverMs) {
+          firstHoverMs = ms;
+          firstHoverFrame = at;
+        }
+      });
+      const firstHover: FirstHoverMeasurement = {
+        ms: Number(firstHoverMs.toFixed(3)),
+        frameIndex: firstHoverFrame,
+        frames: cold.frameTimesMs.length,
+        programsBefore,
+        programsAfter: cold.renderer.programs,
+        named: coldNamed,
+      };
+      expect(
+        coldNamed,
+        `the first-hover pass swept ${coldMoves} times over ${FIRST_HOVER_TIMEOUT_MS / 1000}s ` +
+          `and never named a part, so its longest frame (${firstHover.ms.toFixed(2)} ms) is ` +
+          `not a first touch and the number would be describing an ordinary sweep`,
+      ).not.toBe("");
+
       // ── warm up, untimed ──────────────────────────────────────────────────
       // See LASER_WARM_UP_MS. Counters are reset afterwards so what the row reports is the
       // timed sweep's answer and not the warm-up's.
@@ -827,6 +1011,15 @@ test.describe("sweep a laser across a large assembly", () => {
         ).__vpLaser;
         if (state) Object.assign(state, { named: "", hits: 0, scans: 0 });
       });
+
+      // ── what one ray costs, on its own ────────────────────────────────────
+      // Parked at the model's centre rather than left where the warm-up's Lissajous dropped
+      // it, so two runs measure the same ray: one that enters the model, which is the
+      // expensive case and the one a person pointing at a part is in. Outside the recording,
+      // because timing five raycasts inside the window being timed would put the measurement
+      // in its own result.
+      await page.mouse.move(cx, cy);
+      const raycastMs = await page.evaluate(() => window.__vpPerf?.raycastMs(5) ?? null);
 
       // ── sweep ─────────────────────────────────────────────────────────────
       // THE CAMERA DOES NOT MOVE, AND CANNOT. components/Scene/ViewpointCanvas.tsx sets
@@ -865,6 +1058,7 @@ test.describe("sweep a laser across a large assembly", () => {
         moves,
         rec,
         `${browserName} ${page.context().browser()?.version() ?? ""}`.trim(),
+        { ...NO_EXTRAS, firstHover, raycastMs },
       );
       console.log(
         `[perf:laser]   model ${box.width.toFixed(0)}×${box.height.toFixed(0)} px at ` +

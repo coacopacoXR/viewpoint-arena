@@ -7,7 +7,7 @@ import {
     sceneModelVisible,
     useStore,
 } from '../../store';
-import { SceneNode } from '../../types';
+import { ObjectState, SceneNode } from '../../types';
 import { ChevronRight, ChevronDown, Eye, EyeOff, Box, Layers, CircleDot, Upload, FileBox, Loader2, AlertCircle, AlertTriangle, CheckCircle2, X, GitCompare, Trash2, Users, Lock, Globe, Sparkles } from 'lucide-react';
 import { clsx } from 'clsx';
 import { largeCadWarningFor, parseModelFile, validateModelFile, type ModelImportResult } from '../../utils/modelLoader';
@@ -105,8 +105,14 @@ function latestOfLine(models: SceneModel[], line: string): SceneModel | null {
  * The props are the two that are stable by construction: `node` is an object out of the
  * parsed scene tree, which is a new object only when the model is, and `depth` is a number.
  * So a memo compare is enough and the row re-renders exactly when its own entry does.
+ *
+ * `hideChildren` is the third, and `ModelPartRows` below is the only caller that passes it:
+ * once a tree is big enough to be windowed, the rows are listed flat by the window and each
+ * one draws itself alone, because a row that also rendered its own descendants would render
+ * the whole subtree the window exists to leave out. It is a stable boolean, so the memo's
+ * shallow compare still answers correctly.
  */
-const TreeNode: React.FC<{ node: SceneNode; depth: number }> = React.memo(({ node, depth }) => {
+const TreeNode: React.FC<{ node: SceneNode; depth: number; hideChildren?: boolean }> = React.memo(({ node, depth, hideChildren }) => {
     const objectState = useStore(state => state.objectStates[node.id]);
     const toggleVisibility = useStore(state => state.toggleNodeVisibility);
     const toggleExpanded = useStore(state => state.toggleNodeExpanded);
@@ -191,7 +197,7 @@ const TreeNode: React.FC<{ node: SceneNode; depth: number }> = React.memo(({ nod
             </div>
 
             {/* Children */}
-            {isGroup && isExpanded && node.children && (
+            {isGroup && isExpanded && !hideChildren && node.children && (
                 <div className="flex flex-col relative">
                     {/* Tree Guide Line */}
                     <div className="absolute left-[calc(12px*var(--depth)+9px)] top-0 bottom-0 w-px bg-gray-200" style={{'--depth': depth} as React.CSSProperties}></div>
@@ -203,6 +209,188 @@ const TreeNode: React.FC<{ node: SceneNode; depth: number }> = React.memo(({ nod
         </div>
     );
 });
+
+/**
+ * How many part rows one expanded model may have MOUNTED at once.
+ *
+ * WHY THERE IS A NUMBER AT ALL. `initObjectStates` (store.ts) starts every node expanded, so
+ * opening a model's row mounts one DOM row per part of it: task 05c measured 3 575 rows and
+ * 18 782 divs at 3 200 parts, and a 10 000-part fixture mounts 10 937 rows and 56 695 divs.
+ * Every one of those rows holds its own zustand subscription, and zustand runs EVERY
+ * subscriber's selector on EVERY write — it cannot know a slice did not move without asking.
+ * The room writes often while a person is pointing at something: `setUserInteractionPoint` on
+ * each pointer move (components/Scene/World.tsx, ~125/s during a sweep), `setTime` ten times a
+ * second, and `selectNode` on each part the laser crosses. Task 05d profiled a 10 000-part
+ * sweep and those three writes were 1 788 ms of a 6 518 ms profile — 27 % of the main thread
+ * spent telling rows that nothing had happened to them.
+ *
+ * So the number is a bound on the cost of a store write, and 400 is where the bound stops
+ * mattering: 400 subscribers is under a tenth of a millisecond per write, and the panel is
+ * 35vh tall, so 400 rows is already ten screens of parts. Below it nothing changes at all — a
+ * tree that fits renders exactly the markup it always did.
+ *
+ * WHAT IT COSTS THE USER: a bigger tree is paged rather than scrolled. The window follows the
+ * selection, so a part selected in the 3D view is always mounted and still scrolls into view,
+ * and the two buttons walk the rest. That is a real trade, and it is the cheap half of the
+ * proper fix: a scroll-position-driven virtual list would keep one scrollbar, and needs the
+ * rows flat, measured and absolutely positioned inside a scroller that also holds the model
+ * rows and the compare picker.
+ */
+export const TREE_ROW_WINDOW = 400;
+
+/** One row of a flattened tree: the node, and how far in it is indented. */
+interface FlatRow {
+    node: SceneNode;
+    depth: number;
+}
+
+/**
+ * The guide-line offsets, one per depth.
+ *
+ * A table rather than an `Array.from` per row because the windowed branch re-renders on every
+ * selection change and this is the only part of it that would otherwise allocate per row. 32
+ * deep is past any parse this app accepts and a row deeper than the table simply draws fewer
+ * guides, which is a missing hairline and not a wrong tree.
+ */
+const GUIDE_OFFSETS: number[] = Array.from({ length: 32 }, (_, depth) => depth * 12 + 9);
+
+/**
+ * The rows a tree shows, in the order it shows them — the flat answer to the same question
+ * TreeNode answers recursively.
+ *
+ * The two tests inside are TreeNode's own, copied rather than shared, because a window that
+ * listed a row TreeNode would refuse to render (or hid one it would show) would be a different
+ * tree: no state is no row, and a group's descendants are there only while it is expanded.
+ * Pre-order, which is the order the recursive version paints in.
+ */
+function flattenTreeRows(
+    nodes: readonly SceneNode[] | undefined,
+    states: Record<string, ObjectState | undefined>,
+    depth: number,
+    out: FlatRow[],
+): FlatRow[] {
+    for (const node of nodes ?? []) {
+        const state = states[node.id];
+        if (!state) continue;
+        out.push({ node, depth });
+        if (node.type === 'GROUP' && state.expanded) {
+            flattenTreeRows(node.children, states, depth + 1, out);
+        }
+    }
+    return out;
+}
+
+/**
+ * An expanded model's part tree, mounted a window at a time.
+ *
+ * ONE component subscribing to the whole `objectStates` map, rather than one subscription per
+ * row: a map write re-renders this and this alone, and the rows it renders are memoised on
+ * their own props, so only the ones whose entry moved actually run. Under TREE_ROW_WINDOW it
+ * hands back the recursive markup that was here before it existed — same containers, same
+ * guide line, same TreeNode — so a small model's tree is not merely equivalent but identical.
+ *
+ * The flatten is O(parts) and runs on every selection change, which is the one cost this adds.
+ * It is a walk of objects already in memory allocating one small record per row, and it
+ * replaces ~11 000 selector runs per write with one, so it is the cheap side of that trade.
+ */
+const ModelPartRows: React.FC<{ tree: SceneNode }> = ({ tree }) => {
+    const objectStates = useStore(state => state.objectStates);
+
+    const { rows, selectedIndex } = useMemo(() => {
+        const flat = flattenTreeRows(tree.children, objectStates, 1, []);
+        // Found in the same pass rather than through `selectedNodeId`, whose scan of every key
+        // would then be a SELECTOR and run on every store write — the exact cost this exists to
+        // remove. Here it runs when the map moves, which is when the answer could have moved.
+        let selected: string | null = null;
+        for (const id of Object.keys(objectStates)) {
+            if (objectStates[id]?.selected) { selected = id; break; }
+        }
+        return {
+            rows: flat,
+            selectedIndex: selected === null ? -1 : flat.findIndex(row => row.node.id === selected),
+        };
+    }, [tree, objectStates]);
+
+    const lastStart = Math.max(0, rows.length - TREE_ROW_WINDOW);
+    const clampStart = (at: number) => Math.max(0, Math.min(at, lastStart));
+    // START WHERE THE SELECTION ALREADY IS rather than at the top of the list. This component is
+    // mounted by the panel's auto-expand effect, which runs because something was just selected,
+    // so the first render is nearly always the one that has to show it — and starting at 0 would
+    // mount 400 rows and then throw them away for 400 others on the effect below. Measured, that
+    // is what made a first hover cost more with a window than without one: 60.80 ms became
+    // 122.20 ms at 3 200 parts, and a first hover is the one frame a person waits for.
+    const [start, setStart] = useState(() => clampStart(selectedIndex - Math.floor(TREE_ROW_WINDOW / 2)));
+
+    // The window FOLLOWS the selection rather than the selection being clipped by the window: a
+    // part picked in the 3D view, dropped a pin on or named by a colleague has to be mounted,
+    // because TreeNode's own effect is what scrolls it into view and an unmounted row scrolls
+    // nowhere. Centred rather than placed at the edge, so a selection moving one row at a time
+    // through the tree does not re-window on every step.
+    useEffect(() => {
+        if (selectedIndex < 0) return;
+        if (selectedIndex >= start && selectedIndex < start + TREE_ROW_WINDOW) return;
+        setStart(clampStart(selectedIndex - Math.floor(TREE_ROW_WINDOW / 2)));
+        // `clampStart` closes over `rows.length`, which is a dependency in its own right, and
+        // listing the closure rather than the value would re-run this on every render.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedIndex, start, rows.length]);
+
+    if (rows.length <= TREE_ROW_WINDOW) {
+        return (
+            <div className="flex flex-col relative">
+                <div className="absolute left-[9px] top-0 bottom-0 w-px bg-gray-200"></div>
+                {(tree.children ?? []).map(child => (
+                    <TreeNode key={child.id} node={child} depth={1} />
+                ))}
+            </div>
+        );
+    }
+
+    const end = Math.min(rows.length, start + TREE_ROW_WINDOW);
+    const pageButton =
+        "px-3 py-1 text-[9px] font-mono text-gray-500 hover:text-gray-700 hover:bg-gray-50 text-left";
+    return (
+        <div className="flex flex-col relative">
+            {start > 0 && (
+                <button
+                    type="button"
+                    data-testid="tree-rows-earlier"
+                    className={pageButton}
+                    onClick={() => setStart(clampStart(start - TREE_ROW_WINDOW))}
+                >
+                    ↑ {start.toLocaleString()} earlier parts
+                </button>
+            )}
+            {rows.slice(start, end).map(({ node, depth }) => (
+                <div key={node.id} className="relative">
+                    {/* The guide lines the nested version drew as one per expanded group. A row at
+                        depth D sat inside D of them, at these same offsets: the group at depth A
+                        drew its line at 12A+9 and every one of its descendants is a row deeper
+                        than A. Per row rather than per group because a window holds rows, not the
+                        groups that were holding them. */}
+                    {GUIDE_OFFSETS.slice(0, depth).map(left => (
+                        <div
+                            key={left}
+                            className="absolute top-0 bottom-0 w-px bg-gray-200"
+                            style={{ left: `${left}px` }}
+                        ></div>
+                    ))}
+                    <TreeNode node={node} depth={depth} hideChildren />
+                </div>
+            ))}
+            {end < rows.length && (
+                <button
+                    type="button"
+                    data-testid="tree-rows-more"
+                    className={pageButton}
+                    onClick={() => setStart(clampStart(start + TREE_ROW_WINDOW))}
+                >
+                    ↓ {(rows.length - end).toLocaleString()} more parts
+                </button>
+            )}
+        </div>
+    );
+};
 
 /**
  * One top-level row per model in the scene: "Bracket · Rev B".
@@ -356,14 +544,7 @@ const SceneModelRow: React.FC<{ model: SceneModel; onCompare: (line: string) => 
                 </div>
             </div>
 
-            {expanded && entry && (
-                <div className="flex flex-col relative">
-                    <div className="absolute left-[9px] top-0 bottom-0 w-px bg-gray-200"></div>
-                    {(entry.sceneTree.children ?? []).map(child => (
-                        <TreeNode key={child.id} node={child} depth={1} />
-                    ))}
-                </div>
-            )}
+            {expanded && entry && <ModelPartRows tree={entry.sceneTree} />}
         </div>
     );
 });

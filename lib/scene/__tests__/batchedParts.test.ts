@@ -32,6 +32,8 @@ import { countParts } from '../../../store';
 import { applyPartTransforms, usablePartScale } from '../partTransforms';
 import { MeshPartRegistry, hitParts, isPointableHit, type PartHandle, type PartRegistry, type PartState } from '../partRegistry';
 import { BATCH_MIN_PARTS, BatchedPartRegistry, MAX_OVERLAY_PARTS, partRegistryFor } from '../batchedParts';
+import { partHighlightFlags, partHighlightMaterial } from '../materialHighlight';
+import { hideEditingHelpers } from '../captureClean';
 import { sceneModelPrefix } from '../roomScene';
 import type { SceneNode } from '../../../types';
 
@@ -698,8 +700,9 @@ describe('D1: a highlight belongs to the part that was selected', () => {
   it('bounds the overlays when a whole model is selected, and gives the budget back', () => {
     // Selection inherits downward, so clicking the Model Tree's top row selects every part —
     // and one overlay Mesh per part would put the draw calls straight back where batching
-    // found them. Past MAX_OVERLAY_PARTS a part is left drawing normally rather than glowing,
-    // which is a smaller wrong than a ten-thousand-draw-call frame.
+    // found them. The OVERLAYS stay bounded at MAX_OVERLAY_PARTS and the parts past it glow
+    // inside their batch instead (the tests below), which is what keeps the bound a bound on
+    // draw calls rather than a bound on how much of a selection anybody can see.
     const fixture = assembly(400, 1);
     const registry = new BatchedPartRegistry(fixture.root, fixture.tree);
     const ids = idsOf(registry);
@@ -722,6 +725,407 @@ describe('D1: a highlight belongs to the part that was selected', () => {
     const one = registry.parts()[1];
     one.setHighlight(GLOW);
     expect(drawables(fixture.root).filter((x) => x.name === 'PartHighlight')).toHaveLength(1);
+  });
+});
+
+// ─── task 04c: past the cap, the glow moves inside the batch ────────────────
+
+/** What three hands `onBeforeCompile`, shaped from three's own standard-material source. */
+interface CompiledShader {
+  vertexShader: string;
+  fragmentShader: string;
+  uniforms: Record<string, { value: unknown }>;
+}
+
+/**
+ * Run one material's patch the way three runs it, against the REAL r181 source.
+ *
+ * three's own ShaderLib text rather than a stub that happens to contain the anchors: a patch
+ * anchored on a line three renamed is a patch that silently stops being applied, and a stub
+ * would keep passing through that. `MeshStandardMaterial` compiles `ShaderLib.physical`, which
+ * is what every material utils/modelLoader leaves on an imported part is.
+ */
+function compile(material: THREE.Material): CompiledShader {
+  const shader: CompiledShader = {
+    vertexShader: THREE.ShaderLib.physical.vertexShader,
+    fragmentShader: THREE.ShaderLib.physical.fragmentShader,
+    uniforms: {},
+  };
+  material.onBeforeCompile(shader as never, undefined as never);
+  return shader;
+}
+
+/** The flag texels a batch's material reads, or null for a batch still on the file's material. */
+function flagsOf(batch: THREE.BatchedMesh): Uint8Array | null {
+  const material = batch.material as THREE.Material;
+  const uniform = compile(material).uniforms.partHighlightTexture as { value: THREE.DataTexture } | undefined;
+  return (uniform?.value.image.data as Uint8Array | undefined) ?? null;
+}
+
+/** Which slots of a batch are flagged, which is the only thing a flag texture has to say. */
+const flaggedSlotsOf = (batch: THREE.BatchedMesh): number[] => {
+  const data = flagsOf(batch);
+  if (!data) return [];
+  const out: number[] = [];
+  data.forEach((byte, slot) => {
+    if (byte !== 0) out.push(slot);
+  });
+  return out;
+};
+
+const range = (from: number, to: number): number[] =>
+  Array.from({ length: to - from }, (_, at) => from + at);
+
+/** Every id selected, which is what clicking the Model Tree's top row writes. */
+const allSelected = (ids: readonly string[], rootId: string) => statesFor(ids, [[rootId, { selected: true }]]);
+
+/**
+ * What a C preprocessor makes of `source` when `define` is NOT defined: every `#ifdef define`
+ * block comes out, nested conditionals with it.
+ *
+ * Here to prove the patch is a no-op rather than to claim it — the assertion that follows it is
+ * that what is left is three's own source, byte for byte, which is the whole of the reason a
+ * material anything else draws with is safe to hand this patch.
+ */
+function stripIfdef(source: string, define: string): string {
+  const kept: string[] = [];
+  let skipping = false;
+  let nested = 0;
+  for (const line of source.split('\n')) {
+    const trimmed = line.trim();
+    if (skipping) {
+      if (trimmed.startsWith('#if')) nested += 1;
+      else if (trimmed === '#endif') {
+        nested -= 1;
+        if (nested < 0) skipping = false;
+      }
+      continue;
+    }
+    if (trimmed === `#ifdef ${define}`) {
+      skipping = true;
+      nested = 0;
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join('\n');
+}
+
+describe('past MAX_OVERLAY_PARTS: the glow moves inside the batch', () => {
+  it('glows every part of a whole-model selection and adds no object for the ones past the cap', () => {
+    const fixture = assembly(400, 1);
+    const registry = new BatchedPartRegistry(fixture.root, fixture.tree);
+    const ids = idsOf(registry);
+    expect(drawables(fixture.root)).toHaveLength(1);
+
+    registry.syncStates(allSelected(ids, fixture.tree.id), GLOW);
+
+    const overlays = drawables(fixture.root).filter((one) => one.name === 'PartHighlight');
+    expect(overlays).toHaveLength(MAX_OVERLAY_PARTS);
+    // The 336 parts past the cap add nothing to the graph at all: they glow in the batch they
+    // were already drawn by, which is the difference between this and ten thousand draw calls.
+    expect(drawables(fixture.root)).toHaveLength(1 + MAX_OVERLAY_PARTS);
+    expect(registry.flaggedParts()).toBe(ids.length - 1 - MAX_OVERLAY_PARTS);
+
+    const batch = batchesOf(fixture.root)[0];
+    // Every part of the model is on one path or the other, and the two paths do not overlap:
+    // 400 parts, the first 64 as overlays, the rest as flagged slots of the one batch.
+    expect(flaggedSlotsOf(batch)).toEqual(range(MAX_OVERLAY_PARTS, 400));
+    expect(overlays.length + registry.flaggedParts()).toBe(ids.length - 1);
+  });
+
+  it('clears every flag when the selection goes, and glows the same parts when it comes back', () => {
+    const fixture = assembly(400, 1);
+    const registry = new BatchedPartRegistry(fixture.root, fixture.tree);
+    const ids = idsOf(registry);
+    const batch = batchesOf(fixture.root)[0];
+
+    registry.syncStates(allSelected(ids, fixture.tree.id), GLOW);
+    expect(registry.flaggedParts()).toBe(336);
+
+    registry.syncStates(statesFor(ids, []), GLOW);
+    expect(registry.flaggedParts()).toBe(0);
+    // Not "the store was thrown away" but "every texel was written back to 0": a flag left set
+    // is a part glowing after it was deselected, and nothing in the graph would show it.
+    expect(flagsOf(batch)).not.toBeNull();
+    expect(flaggedSlotsOf(batch)).toEqual([]);
+    expect(drawables(fixture.root)).toHaveLength(1);
+
+    registry.syncStates(allSelected(ids, fixture.tree.id), GLOW);
+    expect(registry.flaggedParts()).toBe(336);
+    expect(flaggedSlotsOf(batch)).toEqual(range(MAX_OVERLAY_PARTS, 400));
+  });
+
+  it("keeps one batch's flags out of another batch drawing the same source material", () => {
+    // Two batches on ONE material object, which is not a hypothetical: `batchKeyOf` splits on
+    // the shadow flags and on the geometry's attribute signature, so a file that mixes either
+    // draws one material under two BatchedMeshes. A uniform lives on a MATERIAL, so a flag
+    // texture hung off the shared one would be the audit's D1 leak wearing a different hat.
+    const fixture = assembly(200, 1);
+    const source = (fixture.root.children[0] as THREE.Mesh).material as THREE.MeshStandardMaterial;
+    for (const index of range(100, 200)) (fixture.root.children[index] as THREE.Mesh).castShadow = true;
+    const registry = new BatchedPartRegistry(fixture.root, fixture.tree);
+    const ids = idsOf(registry);
+    const [plain, shadowed] = batchesOf(fixture.root);
+    expect([plain.castShadow, shadowed.castShadow]).toEqual([false, true]);
+
+    // Only the first batch's parts, which is the first 100 ids after the model's own.
+    registry.syncStates(
+      statesFor(ids, ids.slice(1, 101).map((id) => [id, { selected: true }] as [string, Partial<PartState>])),
+      GLOW,
+    );
+    expect(flaggedSlotsOf(plain)).toEqual(range(MAX_OVERLAY_PARTS, 100));
+    // The other batch was never even given a clone, so there is nothing for a flag to reach.
+    expect(flagsOf(shadowed)).toBeNull();
+    expect(shadowed.material).toBe(source);
+    expect(plain.material).not.toBe(source);
+
+    registry.syncStates(allSelected(ids, fixture.tree.id), GLOW);
+    const [plainFlags, shadowedFlags] = [flagsOf(plain), flagsOf(shadowed)];
+    expect(plainFlags).not.toBeNull();
+    expect(shadowedFlags).not.toBeNull();
+    // Two stores, and each holds only its own batch's slots: one shared texture would answer
+    // 136 set bytes on both sides instead of 36 on one and 100 on the other.
+    expect(plainFlags).not.toBe(shadowedFlags);
+    expect(flaggedSlotsOf(plain)).toEqual(range(MAX_OVERLAY_PARTS, 100));
+    expect(flaggedSlotsOf(shadowed)).toEqual(range(0, 100));
+    expect(plain.material).not.toBe(shadowed.material);
+    expect(registry.flaggedParts()).toBe(136);
+  });
+
+  it("never writes to the file's own material, so a mesh outside the batch cannot glow", () => {
+    // A material array is how a part ends up sharing a material with a batch and not being in
+    // it: utils/cadToThree splits a solid whose faces differ in colour, and the split part is
+    // exactly the one batching refuses. It keeps its own Object3D and draws the SAME material
+    // object the batch was built from.
+    const root = new THREE.Group();
+    root.name = 'Mixed';
+    const geometry = new THREE.BoxGeometry(1, 1, 1);
+    const steel = new THREE.MeshStandardMaterial({ color: 0x8899aa });
+    const brass = new THREE.MeshStandardMaterial({ color: 0xaa8844 });
+    for (const index of range(0, 100)) {
+      const mesh = new THREE.Mesh(geometry, steel);
+      mesh.name = `Part ${index}`;
+      mesh.position.set(index % 10, Math.floor(index / 10), 0);
+      root.add(mesh);
+    }
+    const split = new THREE.Mesh(geometry, [steel, brass]);
+    split.name = 'Split Face';
+    split.position.set(20, 0, 0);
+    root.add(split);
+    const tree = buildSceneTree(root, { value: 0 }, PREFIX);
+    if (!tree) throw new Error('fixture produced no tree');
+    root.updateMatrixWorld(true);
+
+    const registry = new BatchedPartRegistry(root, tree);
+    registry.syncStates(allSelected(idsOf(registry), tree.id), GLOW);
+    expect(registry.flaggedParts()).toBe(100 - MAX_OVERLAY_PARTS);
+
+    // The batch draws a clone; the file's material was never told anything. That is what makes
+    // the patch safe on a material a non-batched mesh shares, before the shader is even
+    // considered: the mesh outside the batch is still drawing an unpatched, unhighlighted
+    // material object, and the audit's D1 is what put it there.
+    expect(batchesOf(root)[0].material).not.toBe(steel);
+    expect(steel.emissive.getHex()).toBe(0x000000);
+    expect(steel.userData.originalEmissive).toBeUndefined();
+    expect(steel.onBeforeCompile).toBe(THREE.Material.prototype.onBeforeCompile);
+    expect(steel.customProgramCacheKey).toBe(THREE.Material.prototype.customProgramCacheKey);
+    // `defines` is the channel the patch uses to reach three's fragment prefix, and a standard
+    // material carries its own (`STANDARD`), so the assertion is that the patch's define is not
+    // among them rather than that there are none.
+    const defines = (steel as THREE.Material & { defines?: Record<string, unknown> }).defines;
+    expect(Object.keys(defines ?? {})).not.toContain('USE_PART_HIGHLIGHT');
+  });
+
+  it('answers a pick of a flagged part as the part itself, because its slot never went off', () => {
+    const fixture = assembly(200, 1);
+    const registry = new BatchedPartRegistry(fixture.root, fixture.tree);
+    const ids = idsOf(registry);
+    registry.syncStates(allSelected(ids, fixture.tree.id), GLOW);
+    const target = registry.parts()[ids.length - 1];
+    expect(registry.flaggedParts()).toBeGreaterThan(0);
+
+    // An overlay has to be pickable in its own right because it turns the slot off underneath.
+    // A flagged part needs no such machinery: the ray hits the batch, at the part's own slot,
+    // and `partChainForHit` answers from `partAtSlot` exactly as it did before the selection.
+    const center = target.getBoundingBox(new THREE.Box3()).getCenter(new THREE.Vector3());
+    const raycaster = new THREE.Raycaster(center.clone().setZ(center.z + 50), new THREE.Vector3(0, 0, -1));
+    const first = raycaster.intersectObjects([fixture.root], true).find(isPointableHit);
+    expect((first?.object as THREE.BatchedMesh).isBatchedMesh).toBe(true);
+    expect(hitParts(first!, [registry]).chain[0]).toBe(target.id);
+    expect(hitParts(first!, [registry]).handle?.name).toBe(target.name);
+  });
+
+  it('frees the flag texture and the material clone on dispose', () => {
+    const fixture = assembly(200, 1);
+    const source = (fixture.root.children[0] as THREE.Mesh).material as THREE.Material;
+    const registry = new BatchedPartRegistry(fixture.root, fixture.tree);
+    registry.syncStates(allSelected(idsOf(registry), fixture.tree.id), GLOW);
+
+    const batch = batchesOf(fixture.root)[0];
+    const clone = batch.material as THREE.Material;
+    expect(clone).not.toBe(source);
+    // Read before the dispose, because afterwards there is no batch left to ask.
+    const texture = compile(clone).uniforms.partHighlightTexture as { value: THREE.DataTexture };
+    const cloneDisposed = vi.spyOn(clone, 'dispose');
+    const textureDisposed = vi.spyOn(texture.value, 'dispose');
+
+    registry.dispose();
+
+    expect(cloneDisposed).toHaveBeenCalled();
+    expect(textureDisposed).toHaveBeenCalled();
+    expect(registry.flaggedParts()).toBe(0);
+  });
+
+  it('is still the motion cull\'s to take while the camera moves, and comes back glowing', () => {
+    // The decision the 10 000-part orbit made: an exemption that covered flags would name every
+    // part of a whole-model selection as "being looked at" and switch the cull off for the whole
+    // assembly, which is 7 ms becoming 17. So a flagged part is culled like the unglowing part it
+    // was before this existed, while an overlay keeps the immunity it always had.
+    const fixture = assembly(200, 1);
+    const registry = new BatchedPartRegistry(fixture.root, fixture.tree);
+    const ids = idsOf(registry);
+    registry.syncStates(allSelected(ids, fixture.tree.id), GLOW);
+    expect(registry.flaggedParts()).toBe(200 - MAX_OVERLAY_PARTS);
+    fixture.root.updateMatrixWorld(true);
+
+    const flagged = registry.parts()[ids.length - 1];
+    const overlaid = registry.parts()[1];
+    const above = (part: PartHandle) =>
+      part.getBoundingBox(new THREE.Box3()).getCenter(new THREE.Vector3()).setZ(50);
+    const pickable = (part: PartHandle) =>
+      new THREE.Raycaster(above(part), new THREE.Vector3(0, 0, -1))
+        .intersectObjects([fixture.root], true)
+        .some((hit) => hitParts(hit, [registry]).chain[0] === part.id);
+
+    // Every part of this fixture is the same size and all of them are under the threshold from
+    // 1000 units out, so the cull wants the whole model — and takes everything but the overlays.
+    expect(registry.motionCull({ eye: new THREE.Vector3(0, 0, 1000), k: 0.001 })).toBe(
+      200 - MAX_OVERLAY_PARTS,
+    );
+    expect(pickable(flagged)).toBe(false);
+    expect(pickable(overlaid)).toBe(true);
+    // The flag survives the cull: it is a highlight, not a visibility state, and the restore is
+    // what has to give the part back rather than what has to re-light it.
+    expect(registry.flaggedParts()).toBe(200 - MAX_OVERLAY_PARTS);
+
+    registry.motionCull(null);
+    expect(pickable(flagged)).toBe(true);
+    expect(registry.flaggedParts()).toBe(200 - MAX_OVERLAY_PARTS);
+  });
+
+  it('is calmed by a thumbnail capture and given back afterwards, like every other highlight', () => {
+    // lib/scene/captureClean.ts looks for a material whose live emissive differs from the one it
+    // remembers, which is what a flag clone is while any of its parts is flagged. So the lobby's
+    // picture of a room keeps the selection glow out of it on the flag path too, without that
+    // file knowing the flag path exists.
+    const fixture = assembly(200, 1);
+    const registry = new BatchedPartRegistry(fixture.root, fixture.tree);
+    registry.syncStates(allSelected(idsOf(registry), fixture.tree.id), GLOW);
+    const clone = batchesOf(fixture.root)[0].material as THREE.MeshStandardMaterial;
+    expect(clone.emissive.getHex()).toBe(0x0044aa);
+
+    const clean = hideEditingHelpers(fixture.root);
+    expect(clone.emissive.getHex()).toBe(0x000000);
+    clean.restore();
+    expect(clone.emissive.getHex()).toBe(0x0044aa);
+    expect(clone.emissiveIntensity).toBe(GLOW.intensity);
+  });
+});
+
+describe('the flag store and the shader patch it is read by', () => {
+  it("sizes one batch's store to its slots, and writes the texel the shader fetches", () => {
+    // Square, the way three sizes its own per-instance textures, so a 40 000-slot batch asks
+    // for 200 × 200 rather than for a texture 40 000 pixels wide.
+    const flags = partHighlightFlags(400);
+    expect(flags.texture.image.width).toBe(20);
+    expect(flags.texture.image.height).toBe(20);
+    expect(flags.data).toHaveLength(400);
+    expect(Array.from(flags.data).every((byte) => byte === 0)).toBe(true);
+
+    const before = flags.texture.version;
+    flags.write(399, true);
+    // Slot 399 is texel (19, 19) of a 20 × 20 texture, which is byte 399 of the flat array —
+    // the same arithmetic the patch does with `index % width` and `index / width`.
+    expect(flags.data[399]).toBe(255);
+    expect(flags.texture.version).toBeGreaterThan(before);
+    flags.write(399, false);
+    expect(flags.data[399]).toBe(0);
+  });
+
+  it("rewrites three's own standard-material shader at the anchors it names", () => {
+    const flags = partHighlightFlags(4);
+    const material = partHighlightMaterial(
+      new THREE.MeshStandardMaterial({ color: 0x8899aa, emissive: 0x112233, emissiveIntensity: 2 }),
+      GLOW,
+      flags,
+    );
+    expect(material).not.toBeNull();
+
+    const shader = compile(material!);
+    expect(shader.vertexShader).toContain('uniform highp sampler2D partHighlightTexture;');
+    // The instance index and NOT `gl_DrawID`: a BatchedMesh compacts the visible instances into
+    // its indirect-draw list every frame, so reading the draw id as a slot would put a hidden
+    // part's flag on whichever neighbour took its place in the list.
+    expect(shader.vertexShader).toContain('int partIndex = int( getIndirectIndex( gl_DrawID ) );');
+    expect(shader.vertexShader).toContain(
+      'texelFetch( partHighlightTexture, ivec2( partIndex % partHighlightWidth, partIndex / partHighlightWidth ), 0 )',
+    );
+    expect(shader.fragmentShader).toContain(
+      'totalEmissiveRadiance = mix( partBaseEmissive, totalEmissiveRadiance, vPartHighlight );',
+    );
+    expect(shader.uniforms.partHighlightTexture).toEqual({ value: flags.texture });
+    // The store's width as a uniform: one texture-unit query per vertex of a ten-thousand-part
+    // batch is a query the store already knew the answer to.
+    expect(shader.uniforms.partHighlightWidth).toEqual({ value: flags.side });
+
+    // A flagged instance gets what `setEmissiveHighlight` puts on the overlay's clone — the
+    // highlight in the material's own emissive — and an unflagged one gets what three would have
+    // uploaded for this material untouched: its own colour times its own intensity.
+    expect((material as THREE.MeshStandardMaterial).emissive.getHex()).toBe(0x0044aa);
+    expect((material as THREE.MeshStandardMaterial).emissiveIntensity).toBe(0.5);
+    const base = shader.uniforms.partBaseEmissive as { value: THREE.Color };
+    expect(base.value.equals(new THREE.Color(0x112233).multiplyScalar(2))).toBe(true);
+  });
+
+  it('answers null for a material with no emissive to glow with, and leaves the source alone', () => {
+    // The same answer an overlay gives: `setEmissiveHighlight` is a no-op on a material with no
+    // emissive channel, so a part like this looks the same on either side of the cap. What must
+    // NOT happen is the batch drawing an unpatched clone, whose emissive IS the highlight.
+    const flags = partHighlightFlags(4);
+    const basic = new THREE.MeshBasicMaterial({ color: 0x8899aa });
+    const disposed = vi.spyOn(basic, 'dispose');
+    expect(partHighlightMaterial(basic, GLOW, flags)).toBeNull();
+    expect('emissive' in basic).toBe(false);
+    expect(disposed).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op with its own define off, which is what makes it safe on a shared material', () => {
+    const flags = partHighlightFlags(4);
+    const source = new THREE.MeshStandardMaterial({ color: 0x8899aa });
+    const material = partHighlightMaterial(source, GLOW, flags)!;
+    // The define the patch added, found by difference rather than by name: a standard material
+    // arrives with `STANDARD` of its own and `Material.copy` carries the bag across.
+    const definesOf = (one: THREE.Material): string[] =>
+      Object.keys((one as THREE.Material & { defines?: Record<string, unknown> }).defines ?? {});
+    const added = definesOf(material).filter((name) => !definesOf(source).includes(name));
+    expect(added).toHaveLength(1);
+    const define = added[0];
+
+    const shader = compile(material);
+    // Byte for byte three's own source once the patch's blocks are preprocessed out. `defines`
+    // goes into BOTH of three's shader prefixes, so a mesh that is not a BatchedMesh compiles
+    // this same source with the define on and `USE_BATCHING` off — and the next assertion is
+    // why that is still a no-op rather than a black emissive.
+    expect(stripIfdef(shader.vertexShader, define)).toBe(THREE.ShaderLib.physical.vertexShader);
+    expect(stripIfdef(shader.fragmentShader, define)).toBe(THREE.ShaderLib.physical.fragmentShader);
+
+    // `USE_BATCHING` is defined in three's VERTEX prefix only, so the fragment half cannot test
+    // it. The varying defaults to 0 outside the batching guard instead, which mixes all the way
+    // back to the material's own emissive: a plain Mesh drawing with this material renders
+    // exactly what it would have rendered unpatched.
+    const injected = shader.vertexShader.slice(shader.vertexShader.indexOf(`#ifdef ${define}`));
+    expect(injected.indexOf('vPartHighlight = 0.0;')).toBeLessThan(injected.indexOf('#ifdef USE_BATCHING'));
   });
 });
 

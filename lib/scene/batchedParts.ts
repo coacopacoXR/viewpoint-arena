@@ -31,7 +31,11 @@
 //   • A batch has one material, so a highlighted part cannot be recoloured in place. It is
 //     drawn as an overlay Mesh carrying a clone of the file's material and its slot is
 //     turned off underneath — the render audit's decision 1(c), and the same seam
-//     MeshPartRegistry uses, so the audit's D1 stays fixed at either size.
+//     MeshPartRegistry uses, so the audit's D1 stays fixed at either size. Past
+//     MAX_OVERLAY_PARTS an overlay per part would put the draw calls batching removed
+//     straight back, so those parts glow INSIDE their batch instead: one flagged byte per
+//     slot in a texture the batch's own clone of the material reads, and no new object at
+//     all (lib/scene/materialHighlight.ts's `partHighlightMaterial`).
 //   • A box measured by walking geometry describes the merged buffer, not the parts (the
 //     audit's R1), so every box here is composed from the geometry's own box and the part's
 //     matrix instead.
@@ -74,7 +78,13 @@ import {
   type PartState,
   type PickHit,
 } from './partRegistry';
-import type { EmissiveHighlight } from './materialHighlight';
+import {
+  partHighlightFlags,
+  partHighlightMaterial,
+  setEmissiveHighlight,
+  type EmissiveHighlight,
+  type PartHighlightFlags,
+} from './materialHighlight';
 import type { StoredLocalTransform } from './partTransforms';
 
 /**
@@ -90,7 +100,7 @@ import type { StoredLocalTransform } from './partTransforms';
 export const BATCH_MIN_PARTS = 512;
 
 /**
- * How many parts one model may draw as highlight overlays at the same time.
+ * How many parts of one model take the OVERLAY path before the rest take the flag path.
  *
  * The overlay is the right answer for a selection and the wrong one for a big one. A
  * selection is normally one part, or a handful; but visibility and selection both inherit
@@ -99,19 +109,22 @@ export const BATCH_MIN_PARTS = 512;
  * — ten thousand parts selected is ten thousand draw calls again, plus ten thousand objects
  * the scene graph has to walk.
  *
- * Past the cap a part is simply left drawing normally rather than glowing. Bounded and
- * predictable, and it cannot regress the audit's D1: the alternative way to draw a large
- * selection cheaply is to write the emissive onto the batch's own material, which is exactly
- * the shared-material glow that lit four hundred bolts when one was selected.
+ * So the overlay is capped, and a part past the cap glows where it already is instead: one
+ * byte per slot in a DataTexture the batch's own material reads, and a shader patch that
+ * gives a flagged instance the highlight's emissive and an unflagged one the material's own
+ * (`partHighlightMaterial`, in lib/scene/materialHighlight.ts). One clone and one texture per
+ * batch, allocated the first time a part of it lands past the cap, and NO draw call and no
+ * object in the graph either way — which is the difference from the overlay, and the reason
+ * the number can stay as low as it is: what it caps now is how many parts pay for a Mesh of
+ * their own, not how many parts get to glow.
  *
- * KNOWN LIMITATION, and the honest fix is not free: a batch whose parts are ALL highlighted
- * — the whole-model selection, which is the case that hits this cap — looks identical whether
- * the glow is on the material or on ten thousand overlays, so that case could glow the
- * material with no leak at all. Doing it properly needs the registry to know when a batch is
- * fully covered and to move between the two representations as coverage changes, which is
- * more state than stage 4 should quietly add. Until then a whole-model selection glows the
- * first MAX_OVERLAY_PARTS parts and the selection itself — the tree row, the strip's name for
- * it, the gizmo attached to it — is unaffected.
+ * Neither path can regress the audit's D1, and for one reason: the glow is written onto
+ * something that belongs to the PART — a private clone standing on one slot, or one byte of
+ * one batch's flag texture — and never onto a material two parts share. Writing the emissive
+ * onto the batch's own material is what lit four hundred bolts when one was selected, and
+ * that is still what this does not do: the flag texture is read by a clone that is one
+ * batch's alone, so a flag in one batch cannot reach another batch, another model, or the
+ * file's own material.
  */
 export const MAX_OVERLAY_PARTS = 64;
 
@@ -189,6 +202,32 @@ interface Batch {
   partAtSlot: number[];
   /** Overlay geometry per batch geometry id, built the first time one of its parts glows. */
   overlays: Map<number, BufferGeometry>;
+  /**
+   * This batch's per-instance glow, or null until one of its parts lands past
+   * MAX_OVERLAY_PARTS and needs it. Lazy because it costs a clone of the batch's material and
+   * a program compile, and a model whose selections are a part or two never pays either.
+   */
+  glow: BatchGlow | null;
+}
+
+/**
+ * The flag path one batch draws with: a byte per slot, and the material that reads it.
+ *
+ * The material is a CLONE of the batch's own and not the batch's own patched in place, and
+ * that clone is the whole of the D1 guarantee at this size. A uniform belongs to a material,
+ * and one material object can be drawn by more than one batch — `batchKeyOf` splits on the
+ * shadow flags and on the geometry's attribute signature, so the same material ends up under
+ * two batches whenever a file mixes either — by any part batching refused, and by anything
+ * else in the parse that happens to hold it. Two batches reading one flag texture is four
+ * hundred bolts glowing when one was selected, which is the defect this file exists to keep
+ * fixed. One clone per batch makes the texture unreachable from anywhere but the batch it
+ * describes, and costs a Material the registry now owns and disposes.
+ */
+interface BatchGlow {
+  /** What `mesh.material` was replaced with. Carries the highlight in its own emissive. */
+  material: Material;
+  /** One byte per slot. 255 is glowing, 0 is the material's own emissive. */
+  flags: PartHighlightFlags;
 }
 
 /** One part. Everything the Object3D used to carry, minus the Object3D. */
@@ -262,6 +301,13 @@ interface PartRecord {
   overlay: Mesh | null;
   /** Whether a part batching left alone is currently on its clone rather than the file's. */
   glowing: boolean;
+  /**
+   * Whether a batched part is glowing through its batch's flag texture. Kept apart from
+   * `glowing` because the motion cull treats the two oppositely: a part on its clone is the one
+   * part somebody is examining and is never culled, while a flagged part is culled exactly as
+   * it was before it glowed at all — see `motionCull` for the measurement that decided it.
+   */
+  flagged: boolean;
 }
 
 /** What one material-and-flags combination is going to cost, before the batch is built. */
@@ -474,6 +520,8 @@ export class BatchedPartRegistry implements PartRegistry {
   private readonly overlayIndex = new Map<Object3D, number>();
   /** How many overlays are up, against MAX_OVERLAY_PARTS. See `writeHighlight`. */
   private overlayCount = 0;
+  /** How many parts are glowing through a batch's flag texture instead. See `raiseFlag`. */
+  private flaggedCount = 0;
   /** The parts' spheres, in the root's space, sorted by radius. Built at the first cull. */
   private readonly cullIndex: MotionCullIndex;
   /** How many parts had been moved when `cullIndex` was built. See `motionCull`. */
@@ -541,6 +589,7 @@ export class BatchedPartRegistry implements PartRegistry {
         culled: false,
         overlay: null,
         glowing: false,
+        flagged: false,
       };
 
       const parentId = this.taggedAncestorId(object);
@@ -586,6 +635,18 @@ export class BatchedPartRegistry implements PartRegistry {
    */
   unbatchedParts(): number {
     return this.unbatched;
+  }
+
+  /**
+   * How many parts are glowing inside their batch rather than from an overlay.
+   *
+   * Answered for the reason `unbatchedParts` is, and it is the half of a large selection the
+   * scene graph cannot show: a flagged part adds no object to it, so counting overlays tells
+   * a caller nothing past MAX_OVERLAY_PARTS. The two together are every part that glows, and
+   * a whole-model selection reads MAX_OVERLAY_PARTS of one and the rest of the other.
+   */
+  flaggedParts(): number {
+    return this.flaggedCount;
   }
 
   get(id: string): PartHandle | null {
@@ -717,9 +778,14 @@ export class BatchedPartRegistry implements PartRegistry {
     return this.cullIndex.apply(
       this.cullEye,
       view.k,
-      // A part drawing from an overlay — a batched one — or from a swapped material — one
-      // batching left alone — is a part somebody is looking at, and is the one part that must
-      // not vanish for being small.
+      // A part drawing from an overlay, or a part batching left alone that is on its clone, is
+      // the one part somebody is examining and must not vanish for being small. A FLAGGED part
+      // is deliberately NOT in that list: a whole-model selection names every part of the
+      // assembly, and an exemption that covered flags would switch the cull off for the whole
+      // model — measured on the 10 000-part orbit as 7 ms becoming 17, because nothing is left
+      // small enough to drop. A flagged part is culled exactly as it was before the flag path
+      // existed, when it was selected and drawing normally, and comes back glowing with the
+      // rest of the model when the camera settles.
       (part) => this.records[part].overlay !== null || this.records[part].glowing,
       (part, culled) => this.writeCulled(this.records[part], culled),
     );
@@ -843,6 +909,15 @@ export class BatchedPartRegistry implements PartRegistry {
     for (const batch of this.batches) {
       for (const geometry of batch.overlays.values()) geometry.dispose();
       batch.overlays.clear();
+      // The flag path's two allocations, and neither is reachable from the graph afterwards:
+      // the texture is a uniform on a material that is about to be dropped with the batch, and
+      // the clone is not what `disposeGroup` would have found on the mesh even if the batch were
+      // still in it. Freed here rather than left to a garbage collector that cannot free either.
+      if (batch.glow) {
+        batch.glow.flags.texture.dispose();
+        batch.glow.material.dispose();
+        batch.glow = null;
+      }
       batch.partAtSlot.length = 0;
       // Out of the graph first, so a `disposeGroup` run afterwards does not find the batch and
       // free its merged buffer a second time.
@@ -861,6 +936,7 @@ export class BatchedPartRegistry implements PartRegistry {
       record.geometry = null;
     }
     this.overlayCount = 0;
+    this.flaggedCount = 0;
     this.overlayIndex.clear();
     // The spheres a cull build measured, which are keyed on the boxes those records carried.
     this.cullSpheres.clear();
@@ -955,7 +1031,7 @@ export class BatchedPartRegistry implements PartRegistry {
     mesh.receiveShadow = plan.receiveShadow;
     this.root.add(mesh);
 
-    const batch: Batch = { mesh, partAtSlot: [], overlays: new Map() };
+    const batch: Batch = { mesh, partAtSlot: [], overlays: new Map(), glow: null };
     this.batchOf.set(mesh, batch);
 
     const geometryIdOf = new Map<BufferGeometry, number>();
@@ -1077,6 +1153,10 @@ export class BatchedPartRegistry implements PartRegistry {
    * The overlay follows the tree alone and not the cull, and that is safe rather than a hole: a
    * part with an overlay is never culled, because raising one clears the flag and `motionCull`
    * refuses to set it again.
+   *
+   * A part on the FLAG path needs nothing from here at all, and that is the point of it: its
+   * glow is written into the material its own slot already draws with, so its slot stays on and
+   * the three flags above remain the whole of its state.
    */
   private applyPart(record: PartRecord): void {
     const drawn = record.visible && !record.culled;
@@ -1098,11 +1178,12 @@ export class BatchedPartRegistry implements PartRegistry {
   /**
    * Draw this part glowing, or give it back to its batch.
    *
-   * The overlay of the render audit's decision 1(c): a batch has one material between every
-   * part in it, so a glow cannot be written per part the way it used to be written per
-   * material. The part's slot is turned off and an un-batched Mesh is stood exactly on it
-   * carrying a clone of the file's own material with the emissive on — the same colour at the
-   * same intensity over the same textures, and because the clone is the PART's and not the
+   * Two ways to glow a batched part, and MAX_OVERLAY_PARTS is the line between them. The
+   * overlay of the render audit's decision 1(c): a batch has one material between every part
+   * in it, so a glow cannot be written per part the way it used to be written per material.
+   * The part's slot is turned off and an un-batched Mesh is stood exactly on it carrying a
+   * clone of the file's own material with the emissive on — the same colour at the same
+   * intensity over the same textures, and because the clone is the PART's and not the
    * material's the audit's D1 stays fixed: selecting one bolt of four hundred that share a
    * material lights one bolt.
    *
@@ -1110,6 +1191,11 @@ export class BatchedPartRegistry implements PartRegistry {
    * cannot be `skipRaycast`: the slot underneath is off, so a ray that looked through the
    * overlay would find nothing of this part at all, and the selected part — the one people
    * point the laser at and drop pins on — would be the one part nobody could hit.
+   *
+   * Past the cap an overlay per part would cost more draw calls than the batching saved, so
+   * the part glows inside its batch instead (see `raiseFlag`) and keeps its slot, which is
+   * why it needs none of the picking machinery above: a ray answers it the way it answered
+   * before it was selected.
    */
   writeHighlight(index: number, highlight: EmissiveHighlight | null): void {
     const record = this.records[index];
@@ -1132,7 +1218,10 @@ export class BatchedPartRegistry implements PartRegistry {
 
     const batch = record.batch!;
     if (highlight === null) {
-      if (!record.overlay) return;
+      if (!record.overlay) {
+        if (record.flagged) this.lowerFlag(record);
+        return;
+      }
       record.overlay.removeFromParent();
       this.overlayIndex.delete(record.overlay);
       record.overlay = null;
@@ -1144,10 +1233,13 @@ export class BatchedPartRegistry implements PartRegistry {
       return;
     }
 
-    if (record.overlay || record.source === null || Array.isArray(record.source)) return;
+    if (record.overlay || record.flagged || record.source === null || Array.isArray(record.source)) return;
     // The cap, and what happens at it: see MAX_OVERLAY_PARTS. Checked before the slice so a
     // selection that is over the budget does not pay for geometry it will not draw.
-    if (this.overlayCount >= MAX_OVERLAY_PARTS) return;
+    if (this.overlayCount >= MAX_OVERLAY_PARTS) {
+      this.raiseFlag(record, record.source, highlight);
+      return;
+    }
     let geometry = batch.overlays.get(record.geometryId);
     if (!geometry) {
       geometry = sliceGeometry(batch.mesh, record.geometryId) ?? undefined;
@@ -1169,6 +1261,62 @@ export class BatchedPartRegistry implements PartRegistry {
     // The slot goes off because the overlay is up. Through `applyPart` rather than a write of
     // its own so that this does not have to know what else is hiding the part.
     this.applyPart(record);
+  }
+
+  /**
+   * Glow this part where it already is: one byte of its batch's flag texture.
+   *
+   * The SLOT STAYS ON, and that is the difference from an overlay rather than a detail of it.
+   * Nothing moves and nothing is added to the graph, so picking (`partChainForHit` answers a
+   * batch hit from `partAtSlot`), the tree's visibility, the motion cull and a gizmo drag on a
+   * flagged part all keep working exactly as they did before the part was selected. An overlay
+   * has to be pickable in its own right precisely because it turns the slot off underneath.
+   *
+   * What a flagged part does NOT get is the overlay's immunity to the motion cull: it is still
+   * a part the cull may drop while the camera moves and give back when it settles, glowing,
+   * with the rest of the model. See `motionCull` for the measurement that decided that.
+   *
+   * The batch's material is replaced the first time this runs for it, and stays replaced for
+   * the rest of the registry's life: swapping it back when the last flag clears would put the
+   * next flag on the far side of a program compile again, for a material that is a clone of the
+   * one it swapped and draws the same picture. See BatchGlow for why it is a clone at all.
+   *
+   * Nothing here is undone by an overlay becoming free later. A part that landed past the cap
+   * stays on the flag path even when the selection above it shrinks and budget appears: both
+   * paths draw the same glow, and promoting would mean tearing a part's representation down
+   * and building it up again on every selection change anywhere above it.
+   */
+  private raiseFlag(record: PartRecord, source: Material, highlight: EmissiveHighlight): void {
+    const batch = record.batch!;
+    if (batch.glow) {
+      // Re-applied rather than assumed, for the reason HighlightMaterials.of gives: the app has
+      // one selection colour today, and a second caller with another would otherwise get the
+      // first caller's glow on every part of this batch.
+      setEmissiveHighlight(batch.glow.material, highlight);
+    } else {
+      const flags = partHighlightFlags(batch.mesh.instanceCount);
+      const material = partHighlightMaterial(source, highlight, flags);
+      // Nothing to glow with: a material with no emissive channel, or a shader family the patch
+      // has no anchor in. The texture is freed and the part is left drawing normally, which is
+      // what an overlay would have drawn for the same material — `setEmissiveHighlight` is a
+      // no-op on it too — so the two paths still agree on what a part like this looks like.
+      if (!material) {
+        flags.texture.dispose();
+        return;
+      }
+      batch.mesh.material = material;
+      batch.glow = { material, flags };
+    }
+    batch.glow.flags.write(record.slot, true);
+    record.flagged = true;
+    this.flaggedCount += 1;
+  }
+
+  /** Give one flagged part back to its batch's own emissive. The clone and its texture stay. */
+  private lowerFlag(record: PartRecord): void {
+    record.batch?.glow?.flags.write(record.slot, false);
+    record.flagged = false;
+    this.flaggedCount -= 1;
   }
 
   // ─── reads ────────────────────────────────────────────────────────────────────

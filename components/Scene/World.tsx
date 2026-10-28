@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import React, { useCallback, useRef } from 'react';
 import { useFrame } from '@react-three/fiber';
 import { Grid, ContactShadows } from '@react-three/drei';
 import type * as THREE from 'three';
@@ -8,6 +8,7 @@ import ImportedModel from './ImportedModel';
 import Agent from './Agent';
 import LightRig from './LightRig';
 import ThumbnailCapture from './ThumbnailCapture';
+import ViewToolsCut from './ViewToolsCut';
 import { useStore } from '../../store';
 import { useSceneModelLoader } from '../../lib/scene/useSceneModelLoader';
 
@@ -37,6 +38,25 @@ const World: React.FC<WorldProps> = ({ hideAgents: hideAgentsOverride, modelGrou
 
   // Ref to track throttle
   const lastTimeUpdate = useRef(0);
+
+  /**
+   * The group holding the models and nothing else, which is what the room's cut walks to
+   * find the materials it clips.
+   *
+   * A ref of this component's own rather than the `modelGroupRef` prop, because that prop
+   * belongs to the review-setup canvas and is null in a room — and a room is where the cut
+   * lives. One callback ref writes both, so the setup canvas keeps driving the group it has
+   * always driven and the cut gets the same object without either of them having to know
+   * about the other.
+   */
+  const modelsGroupRef = useRef<THREE.Group>(null);
+  const setModelsGroup = useCallback(
+    (group: THREE.Group | null) => {
+      modelsGroupRef.current = group;
+      if (modelGroupRef) modelGroupRef.current = group;
+    },
+    [modelGroupRef],
+  );
 
   // THE CLOCK MUST NOT ASK FOR A FRAME, and the room renders on demand
   // (`frameloop="demand"` in components/Scene/ViewpointCanvas.tsx), so that is a live constraint
@@ -98,7 +118,7 @@ const World: React.FC<WorldProps> = ({ hideAgents: hideAgentsOverride, modelGrou
         {/* Inner group applies the curator's transform — affects only the
             model itself, not contact shadows / heatmap / etc. */}
         <group
-          ref={modelGroupRef as React.RefObject<THREE.Group>}
+          ref={setModelsGroup}
           position={modelTransform.position}
           rotation={modelTransform.rotation}
           scale={modelTransform.scale}
@@ -112,6 +132,12 @@ const World: React.FC<WorldProps> = ({ hideAgents: hideAgentsOverride, modelGrou
               unconditionally next to the presets. */}
           <ImportedModel />
         </group>
+
+        {/* The room's cut plane. A SIBLING of the group above and not a child of it,
+            because it walks that group to find the materials to clip: mounted inside, it
+            would walk its own guide rectangle and hand the plane to the very material
+            that draws where the plane is. See components/Scene/ViewToolsCut.tsx. */}
+        <ViewToolsCut modelsRef={modelsGroupRef} />
 
         <ContactShadows
             opacity={0.4}

@@ -4,6 +4,9 @@ import { useFrame, useThree } from '@react-three/fiber';
 import { Vector3, Vector2, Raycaster, Group } from 'three';
 import { useStore, getCurrentSceneTree } from '../../store';
 import { hitParts, isPointableHit, partRegistries } from '../../lib/scene/partRegistry';
+// Both raycasts here go through the one cut filter, which is what stops a pin being dropped
+// on a face the meeting has just cut off — see lib/scene/cutPick.ts.
+import { uncutHits } from '../../lib/scene/cutPick';
 import { MessageSquare, Check, GripVertical, Link2, Minimize2, Pencil, MapPin } from 'lucide-react';
 import { SceneNode, SpatialComment } from '../../types';
 
@@ -261,7 +264,7 @@ const PlacementPreview: React.FC = () => {
 
         // Update raycaster
         raycaster.current.setFromCamera(state.pointer, camera);
-        const intersects = raycaster.current.intersectObjects(scene.children, true);
+        const intersects = uncutHits(raycaster.current.intersectObjects(scene.children, true));
 
         let hitPoint: Vector3 | null = null;
         const registries = partRegistries(useStore.getState().sceneEntries);
@@ -312,7 +315,7 @@ const PlacementPreview: React.FC = () => {
             );
 
             raycaster.current.setFromCamera(pointer, camera);
-            const intersects = raycaster.current.intersectObjects(scene.children, true);
+            const intersects = uncutHits(raycaster.current.intersectObjects(scene.children, true));
             const registries = partRegistries(useStore.getState().sceneEntries);
 
             for (const hit of intersects) {

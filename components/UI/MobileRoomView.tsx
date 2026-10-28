@@ -9,6 +9,7 @@ import ViewpointCanvas from '../Scene/ViewpointCanvas';
 import BoardroomCountdown from './BoardroomCountdown';
 import HumanParticipantTile from './Boardroom/HumanParticipantTile';
 import LobbyLink from './room/LobbyLink';
+import RoomViewTools from './room/RoomViewTools';
 import { mobileLaserRef } from '../../lib/mobileLaserRef';
 import { InsightCard, SpatialComment, LiveChatMessage, ChatTag } from '../../types';
 import { MonitorPlay, Radio, Mic, MicOff, Video, VideoOff, Power, Crosshair, Send, Volume2, VolumeX } from 'lucide-react';
@@ -455,6 +456,14 @@ const MobileRoomView: React.FC<Props> = ({ roomId, userName }) => {
               <span className="font-mono text-[9px]" style={{ color: 'rgba(255,255,255,0.18)' }}>pinch zoom · drag rotate</span>
             </div>
           </div>
+
+          {/* The room's view tools, on the right edge of the canvas and vertically centred:
+              the laser trackpad owns the bottom-left, the follow badge the top and the hint
+              the bottom-right, which leaves the middle of the right edge as the one place a
+              rail is neither under a thumb nor under a badge. Its popover opens to the left,
+              so it stays on a phone-sized screen. The same component the desktop room
+              renders — a cut is the room's, not the device's. */}
+          <RoomViewTools className="absolute right-3 top-1/2 -translate-y-1/2 z-30" />
         </div>
 
         {/* ── SESSION TAB ── */}

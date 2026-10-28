@@ -60,6 +60,7 @@ import {
 } from 'three';
 import type { SceneNode } from '../../types';
 import { highlightClone, setEmissiveHighlight, type EmissiveHighlight } from './materialHighlight';
+import { syncCut } from './cutPlane';
 import type { StoredLocalTransform } from './partTransforms';
 
 /**
@@ -501,11 +502,21 @@ export class HighlightMaterials {
     if (!clone) {
       clone = highlightClone(source, highlight);
       this.clones.set(source, clone);
+      // A clone made while the room is cutting has to be cut too, and it is made HERE
+      // rather than in a walk of the scene: this is the moment it exists, and the walk
+      // that put every other model material on the plane has already run. See
+      // lib/scene/cutPlane.ts — `syncCut` is idempotent and answers the room's current
+      // cut state whatever that is, so the cached path below is covered by the same call.
+      syncCut(clone);
       return clone;
     }
     // Re-applied rather than assumed: the app has one selection colour today, and a
     // second caller with another would otherwise get the first caller's glow.
     setEmissiveHighlight(clone, highlight);
+    // And re-applied to the cut for the same reason, with the same argument: a clone
+    // cached while the room was NOT cutting would otherwise be handed out cutting, and
+    // one cached while it was would keep cutting a model the room has put back together.
+    syncCut(clone);
     return clone;
   }
 

@@ -23,6 +23,15 @@ import {
   sceneFromLegacyReference,
   seededFromStorage,
 } from '../lib/scene/sceneWire';
+// The room's view tools — a cut plane, and the explode task 08b renders. The reader is the
+// same one the client uses, so the two cannot disagree about what a position means; see
+// lib/scene/viewTools.ts.
+import {
+  asViewTools,
+  DEFAULT_VIEW_TOOLS,
+  sameViewTools,
+  type ViewTools,
+} from '../lib/scene/viewTools';
 import { can, type Role } from '../lib/reviews/roles';
 import { reviewIdOfPartyRoom } from '../lib/reviews/partyRoom';
 import { ReviewFactsCache, roleFromFacts, type ReviewFactsSource } from './reviewRoles';
@@ -168,6 +177,12 @@ type RoomMessage =
   // browser that ends the meeting is usually not the one that stopped the recording.
   | { type: 'TRANSCRIPT_KEEP'; payload: { keep: boolean; includePointing: boolean; byName: string } }
   | { type: 'POINTING_SEGMENT'; payload: { userId: string; userName: string; partId: string; partName: string; source: 'laser' | 'finger' | 'hover'; fromMs: number; toMs: number } }
+  // The room's view tools — a cut plane, and the explode task 08b renders. ONE message for
+  // both because they are one panel and one decision: what this room is doing to its view.
+  // A cut that travelled without the explode beside it would have needed a second message
+  // type, a second relay and a second answer to "what does a joiner get" on the day 08b
+  // lands, and the two are never meaningfully out of step.
+  | { type: 'VIEW_TOOLS'; payload: ViewTools }
   | { type: 'ADMIT'; payload: { userId: string } }
   | { type: 'DECLINE'; payload: { userId: string } }
   | { type: 'SET_JOIN_POLICY'; payload: { policy: 'open' | 'ask' } }
@@ -361,6 +376,22 @@ export default class RoomServer implements Party.Server {
   // one browser's memory and dies with the page, so a room that came back holding
   // the choice would be a promise about a transcript nobody has any more.
   transcriptKeep: { keep: boolean; includePointing: boolean; byName: string } | null = null;
+  /**
+   * The room's view tools — a cut plane, and the explode task 08b renders.
+   *
+   * Held in memory exactly the way `recordingState` is, and for the same reason: it is a
+   * fact about the meeting in progress rather than about the review, so a room that
+   * hibernates comes back with the default and a cut nobody is looking at any more is not
+   * a cut anybody missed. Sent to a connection on admission — ALWAYS, including the
+   * default, which is where this differs from `recordingState` and `editing`: a browser
+   * that reconnects mid-meeting is holding the cut it had when the socket dropped, and an
+   * absent message would leave it cutting a model the room has put back together.
+   *
+   * Reset when the last person leaves. The next meeting in this room is a different
+   * meeting, and a section somebody left open at midnight is not the section the room
+   * wants at nine in the morning.
+   */
+  viewTools: ViewTools = DEFAULT_VIEW_TOOLS;
   // Per-link join policy. 'ask' (default) means new arrivals must be admitted
   // by the host; 'open' lets anyone through. NOT persisted to Supabase in
   // batch M2 — a PartyKit room that hibernates comes back at 'ask', which is
@@ -1025,6 +1056,15 @@ export default class RoomServer implements Party.Server {
         payload: this.transcriptKeep,
       } as RoomMessage));
     }
+    // The view tools, ALWAYS — including the default, and that is the difference from the
+    // two above. A browser that arrives fresh starts at the default anyway, so sending it
+    // costs one small message; a browser that RECONNECTS is holding the cut it had when
+    // its socket dropped, and no message at all would leave it cutting a model the room
+    // has already put back together.
+    conn.send(JSON.stringify({
+      type: 'VIEW_TOOLS',
+      payload: this.viewTools,
+    } as RoomMessage));
   }
 
   /**
@@ -1764,6 +1804,29 @@ export default class RoomServer implements Party.Server {
       }
       this.relay(JSON.stringify(msg), [sender.id]);
 
+    } else if (msg.type === 'VIEW_TOOLS') {
+      // Rebuilt by the same reader the client uses, and refused WHOLE rather than
+      // rescued field by field — the asymmetry asSceneModel uses for a model and
+      // asPartTransform for an override. This value is stored and then handed to
+      // every connection in the room, so a position that arrived as a string, or
+      // as a NaN computed from a model with no geometry in it, would be a cut
+      // nobody asked for on everybody's screen. See lib/scene/viewTools.ts.
+      const tools = asViewTools(msg.payload);
+      if (!tools) return;
+      // Compared before it is stored, so a drag that lands on the value the room
+      // already had costs the room nothing: nothing stored, nothing relayed, and
+      // no frame asked for by a browser that redraws on every message it gets.
+      if (sameViewTools(this.viewTools, tools)) return;
+      this.viewTools = tools;
+      // To everybody except the sender, who applied it locally the moment they
+      // moved the slider. Waiting for the echo would have put the section a round
+      // trip behind the hand dragging it, and the room's answer to "is this the
+      // value" is the value the sender already has.
+      this.relay(
+        JSON.stringify({ type: 'VIEW_TOOLS', payload: tools } as RoomMessage),
+        [sender.id],
+      );
+
     } else if (
       msg.type === 'PRESENTER_CHANGE' ||
       msg.type === 'INSIGHT_CARD' ||
@@ -1803,6 +1866,19 @@ export default class RoomServer implements Party.Server {
 
     this.participants.delete(userId);
     this.joinOrder = this.joinOrder.filter(id => id !== userId);
+
+    // The last person out puts the view tools back.
+    //
+    // Nothing is relayed, because there is nobody left in the room to hear it: the next
+    // arrival is handed `viewTools` by sendRoomState, which now answers the default. The
+    // test is on participants and not on connections, so a room kept awake by somebody
+    // parked in the waiting room — connected, unadmitted, and not a participant — still
+    // answers "no cut" to whoever comes next. A section somebody left open at midnight is
+    // not the section the room wants at nine in the morning, and the cut is a fact about
+    // the meeting rather than about the review, so it does not outlive one.
+    if (this.participants.size === 0) {
+      this.viewTools = DEFAULT_VIEW_TOOLS;
+    }
 
     // An editor who leaves releases the lock, and the room is told at once.
     // Without this the banner "Robin is editing the review" would outlive Robin

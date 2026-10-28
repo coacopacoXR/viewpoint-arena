@@ -11,6 +11,10 @@ import { pointingSourceRef } from '../../lib/pointingSourceRef';
 import { getModelCenter } from '../../lib/orbitPivot';
 import { laserSelectionId } from '../../lib/scene/clickSelection';
 import { hitParts, isPointableHit, partRegistries, type HitParts, type PartRegistry } from '../../lib/scene/partRegistry';
+// Both raycasts here — the laser's and the dwell that arms it — go through the one cut
+// filter. Without it the laser names a part the room has cut off the screen, which is the
+// one thing a section view exists to stop happening — see lib/scene/cutPick.ts.
+import { uncutHits } from '../../lib/scene/cutPick';
 import { EDITING_HELPER_KEY } from '../../lib/scene/captureClean';
 
 /** The resolution of a ray that hit nothing this frame. */
@@ -322,7 +326,7 @@ const UserLaser: React.FC = () => {
                 // when there's something to point at. Skip remote avatars / lasers.
                 dwellVec.current.set(px, py);
                 dwellRaycaster.current.setFromCamera(dwellVec.current, camera);
-                const hits = dwellRaycaster.current.intersectObjects(scene.children, true);
+                const hits = uncutHits(dwellRaycaster.current.intersectObjects(scene.children, true));
                 for (const hit of hits) {
                     if (!isPointableHit(hit)) continue;
                     if (hitParts(hit, registries).modelId !== null) {
@@ -365,7 +369,7 @@ const UserLaser: React.FC = () => {
         fingerPointerVec.current.set(pointerX, pointerY);
         raycaster.current.setFromCamera(fingerPointerVec.current, camera);
 
-        const intersects = raycaster.current.intersectObjects(scene.children, true);
+        const intersects = uncutHits(raycaster.current.intersectObjects(scene.children, true));
 
         let foundId: string | null = null;
         let foundMeshName: string | null = null;

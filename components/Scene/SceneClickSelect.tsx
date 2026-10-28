@@ -31,6 +31,9 @@ import { useStore } from '../../store';
 import { usePresence } from '../../lib/PresenceContext';
 import { clickedNodeId, isClick, type ScreenPoint } from '../../lib/scene/clickSelection';
 import { partRegistries } from '../../lib/scene/partRegistry';
+// Clicking into a cut model has to select the part you see in the section, and three's
+// Raycaster reports the parts you do not as well — see lib/scene/cutPick.ts.
+import { uncutHits } from '../../lib/scene/cutPick';
 import { sceneModelForNode } from '../../lib/scene/roomScene';
 
 const SceneClickSelect: React.FC<{
@@ -105,7 +108,7 @@ const SceneClickSelect: React.FC<{
       );
       raycaster.current.setFromCamera(ndc.current, camera);
       scene.updateMatrixWorld();
-      const hits = raycaster.current.intersectObjects(scene.children, true);
+      const hits = uncutHits(raycaster.current.intersectObjects(scene.children, true));
 
       // The first hit that resolves, not the first hit: this scene holds invisible
       // things that are in front of the model — the mouse-tracking plane in World.tsx,

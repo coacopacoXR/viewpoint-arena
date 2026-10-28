@@ -19,6 +19,15 @@ import { useActiveReviewStore } from './lib/activeReviewStore';
 import { usePointingTimelineStore } from './lib/pointingTimelineStore';
 import type { ReviewLine } from './lib/reviews/lines';
 import type { SceneModelEntry } from './lib/scene/sceneEntries';
+// The room's view tools: one value shared by every browser, and the throttled send that
+// carries a local change out to the room. Both are dependency-free on purpose — see
+// lib/viewToolsSender.ts for why the send is not a call into lib/usePartyPresence.ts.
+import {
+  DEFAULT_VIEW_TOOLS,
+  sameViewTools,
+  type ViewTools,
+} from './lib/scene/viewTools';
+import { sendViewTools } from './lib/viewToolsSender';
 import {
   applySceneUpdate,
   emptyScene,
@@ -728,6 +737,22 @@ interface AppState {
   importError: string | null;
   importSuccess: string | null;
 
+  // --- VIEW TOOLS: the room's cut plane, and the explode 08b renders (task 08a) ---
+  /**
+   * What the room is doing to its view — a cut plane and an explode — as ONE value.
+   *
+   * Shared rather than local, and that is a decision about what a meeting is rather than
+   * a transport detail: somebody turns a cut on to show the flange inside a housing and
+   * everybody in the room is looking at the same section, including whoever joins three
+   * minutes later. Written from two places and read from one component
+   * (components/Scene/ViewToolsCut.tsx), which is what resolves it into three's renderer
+   * state — see lib/scene/cutPlane.ts for the plane this becomes.
+   *
+   * `explode` is carried here from the start and rendered by task 08b, so that adding the
+   * rendering is a renderer change and not a protocol one. See lib/scene/viewTools.ts.
+   */
+  viewTools: ViewTools;
+
   // Actions
   setViewMode: (mode: ViewMode) => void;
   setRepresentationMode: (mode: RepresentationMode) => void;
@@ -902,6 +927,23 @@ interface AppState {
   setImportStatus: (error: string | null, success: string | null) => void;
   clearImportStatus: () => void;
 
+  // --- VIEW TOOLS ACTIONS (task 08a) ---
+  /**
+   * Write the room's view tools, and say whether the room is to be told.
+   *
+   * `broadcast` defaults to true because the ordinary caller is the person dragging the
+   * slider, and a cut only one browser can see is not a cut. It is passed as false from
+   * exactly one place — the VIEW_TOOLS handler in lib/usePartyPresence.ts — where the
+   * value came FROM the room and sending it back would be an echo the room then relays to
+   * everybody else.
+   *
+   * The send is throttled rather than immediate: a range input fires per pointer-move, and
+   * sixty messages a second through the room server to every connection is sixty chances
+   * a second for a browser to be behind. ~15/s with a trailing send is what the value on
+   * the wire converges to the value on the slider in; see `flushViewTools`.
+   */
+  setViewTools: (next: ViewTools, options?: { broadcast?: boolean }) => void;
+
   // --- BOARDROOM MODE ---
   boardroomPendingEntry: boolean; // countdown is running, waiting to enter
   isBoardroomMode: boolean;
@@ -979,6 +1021,59 @@ interface AppState {
    */
   activeLine: ReviewLine | null;
   setActiveLine: (line: ReviewLine | null) => void;
+}
+
+
+/**
+ * How often a dragged view tool is allowed onto the wire, in ms — about 15 a second.
+ *
+ * A range input fires `onChange` per pointer-move, which on a 60 Hz screen is sixty
+ * writes a second. Each one the store would otherwise hand to the room server, which
+ * relays it to every other connection, which re-resolves a plane and asks for a frame.
+ * Fifteen is the rate at which a section sweeping across a model already looks continuous
+ * — the frames in between are the same picture the local browser draws from its own
+ * unthrottled store write — and it is close to the ten a second this app already spends
+ * on presence (components/Scene/ViewpointCanvas.tsx's `PresenceBroadcaster`), which is
+ * the only other per-frame-ish thing on this socket.
+ */
+export const VIEW_TOOLS_SEND_MS = 66;
+
+/** The latest value waiting for its slot on the wire, or null when nothing is waiting. */
+let viewToolsPending: ViewTools | null = null;
+let viewToolsTimer: ReturnType<typeof setTimeout> | null = null;
+let viewToolsLastSentAt = 0;
+
+/** Send what is waiting now, and stop waiting. Exported for the control's pointer-up. */
+export function flushViewTools(): void {
+  if (viewToolsTimer !== null) {
+    clearTimeout(viewToolsTimer);
+    viewToolsTimer = null;
+  }
+  if (viewToolsPending === null) return;
+  const value = viewToolsPending;
+  viewToolsPending = null;
+  viewToolsLastSentAt = Date.now();
+  sendViewTools(value);
+}
+
+/**
+ * Queue a value for the wire at VIEW_TOOLS_SEND_MS, with a trailing send.
+ *
+ * Leading edge immediate and trailing edge guaranteed, which is the pair a slider needs:
+ * the first move of a drag has to reach the room at once or the section lags behind the
+ * hand, and the LAST move has to reach it eventually or the room is left looking at a cut
+ * a fraction short of where the person who made it left it. Only the newest value is ever
+ * kept — an intermediate one nobody will see is not worth a message.
+ */
+function queueViewTools(value: ViewTools): void {
+  viewToolsPending = value;
+  if (viewToolsTimer !== null) return;
+  const wait = VIEW_TOOLS_SEND_MS - (Date.now() - viewToolsLastSentAt);
+  if (wait <= 0) {
+    flushViewTools();
+    return;
+  }
+  viewToolsTimer = setTimeout(flushViewTools, wait);
 }
 
 
@@ -1516,6 +1611,28 @@ export const useStore = create<AppState>((set, get) => ({
 
   // --- NEW: Import Status Actions ---
   clearImportStatus: () => set({ importError: null, importSuccess: null }),
+
+  // --- VIEW TOOLS (task 08a) ---
+  viewTools: DEFAULT_VIEW_TOOLS,
+  setViewTools: (next, options) => {
+    const broadcast = options?.broadcast !== false;
+    const current = get().viewTools;
+    // The same value is not a change, and under `frameloop="demand"` a store write is a
+    // frame asked for: components/Scene/MotionQuality.tsx's `StoreDrivenFrames` invalidates
+    // on every key that moved. The room relays to everybody, a drag lands on the value it
+    // already had, and a write here would redraw a picture that did not change. Compared
+    // field by field rather than by reference because every message builds a fresh object.
+    if (sameViewTools(current, next)) {
+      // Still queued when this browser asked for it: the send that carried this value may
+      // never have left (a socket that was closed at the time), and the release that
+      // follows a drag is the moment to try again. A value that arrived FROM the room is
+      // not queued, which is the same `broadcast` flag deciding both halves.
+      if (broadcast) queueViewTools(next);
+      return;
+    }
+    set({ viewTools: next });
+    if (broadcast) queueViewTools(next);
+  },
 
   // --- SESSION HOST ---
   sessionHostId: null,

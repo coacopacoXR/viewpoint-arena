@@ -15,6 +15,7 @@
 // materials and at most a handful are ever selected.
 
 import { DataTexture, RedFormat, UnsignedByteType, type Color, type Material, type MeshStandardMaterial } from 'three';
+import { syncCut } from './cutPlane';
 
 /** Where a material's own emissive is kept once a highlight has touched it. */
 export const ORIGINAL_KEY = 'originalEmissive';
@@ -333,6 +334,14 @@ export function partHighlightMaterial(
     }
   };
   clone.customProgramCacheKey = () => PART_HIGHLIGHT_CACHE_KEY;
+  // LAST, and after the patch above rather than before it. `syncCut` wraps whatever
+  // `onBeforeCompile` the material has at the moment it is called, so calling it before
+  // this assignment would have left the room's cut plane wrapping nothing and the
+  // per-instance glow replacing the wrapper — a batch that stops being cut the first time
+  // one of its parts is selected past the overlay cap. Called here rather than inside
+  // `highlightClone` for the same reason: this function is the last one to touch the clone.
+  // See lib/scene/cutPlane.ts.
+  syncCut(clone);
   return clone;
 }
 

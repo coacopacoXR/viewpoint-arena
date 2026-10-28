@@ -36,6 +36,7 @@ import JoinRequests from './JoinRequests';
 import FollowersBadge, { FollowingBadge } from './FollowersBadge';
 import TopBar from './room/TopBar';
 import CallBar from './room/CallBar';
+import RoomViewTools from './room/RoomViewTools';
 import ManageButton from './room/ManageButton';
 import EmptyScenePrompt from './room/EmptyScenePrompt';
 import LobbyLink from './room/LobbyLink';
@@ -1073,6 +1074,20 @@ const Interface: React.FC = () => {
       )}>
         <EmptyScenePrompt />
       </div>
+
+      {/* THE ROOM'S VIEW TOOLS: a cut plane, and the explode task 08b renders. On the right
+          edge of the free canvas and vertically centred, which is the one band nothing else
+          is in — the top bar and the notice stack are at the top, the call bar and the review
+          dock at the bottom, the Model Tree down the left and the side panel down the right.
+          `canvasRightClass` is what keeps it clear of that panel at all three of its widths,
+          the same job it does for the bars above. Above the bottom row's z-[30] so the
+          popover is never under it, and below the notice stack's z-[250] so a knock waiting
+          to be admitted is never under the popover. Outside Edit mode and outside the amber
+          strip on purpose: a cut is something the whole meeting looks at, so it cannot be
+          behind the one lock only one person holds. */}
+      <RoomViewTools
+        className={clsx("absolute top-1/2 -translate-y-1/2 z-[40]", canvasRightClass)}
+      />
 
       </> /* end !isBoardroomMode */}
 

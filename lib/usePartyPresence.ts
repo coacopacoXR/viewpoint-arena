@@ -26,6 +26,13 @@ import { useReviewRole } from './reviews/useReviewRole';
 import { reviewIdOfPartyRoom } from './reviews/partyRoom';
 import type { Role } from './reviews/roles';
 import { asSceneStatePayload, sceneFromLegacyReference } from './scene/sceneWire';
+// The room's view tools. The reader is the same module the room server uses, so the two
+// ends of the wire cannot disagree about what a cut's position means; see
+// lib/scene/viewTools.ts. The sender ref lives in lib/viewToolsSender.ts, which imports
+// nothing, because store.ts's setViewTools has to reach the socket and this module imports
+// the store — the same cycle lib/recordingState.ts exists to avoid.
+import { asViewTools, DEFAULT_VIEW_TOOLS, type ViewTools } from './scene/viewTools';
+import { setViewToolsSender } from './viewToolsSender';
 import { usePointingTimelineStore } from './pointingTimelineStore';
 import type { PointingSegment } from './pointingTimelineStore';
 import { supabase } from './supabase';
@@ -99,6 +106,9 @@ type RoomMessage =
   // server is what enforces that (batch BU).
   | { type: 'TRANSCRIPT_KEEP'; payload: TranscriptKeepPayload }
   | { type: 'POINTING_SEGMENT'; payload: import('./pointingTimelineStore').PointingSegment }
+  // The room's view tools: a cut plane, and the explode task 08b renders. One message for
+  // both, and one reader for it — see lib/scene/viewTools.ts.
+  | { type: 'VIEW_TOOLS'; payload: ViewTools }
   | { type: 'ADMIT'; payload: { userId: string } }
   | { type: 'DECLINE'; payload: { userId: string } }
   | { type: 'SET_JOIN_POLICY'; payload: { policy: 'open' | 'ask' } }
@@ -898,6 +908,18 @@ export function usePartyPresence(roomId: string | undefined): UsePartyPresenceRe
       } else if (msg.type === 'POINTING_SEGMENT') {
         const { addSegment } = usePointingTimelineStore.getState();
         addSegment(msg.payload);
+      } else if (msg.type === 'VIEW_TOOLS') {
+        // Applied WITHOUT broadcasting, which is the one thing that keeps this from being
+        // a loop: the room relays to everybody but the sender, and a receiver that sent
+        // the value back would have the room relay its own message around for as long as
+        // anybody kept touching the slider. Read through the same reader the room server
+        // used rather than trusted off the wire, so a payload this client's build does not
+        // understand answers the default instead of a plane with NaN in its constant —
+        // which would make every fragment of every model compare false and draw the room
+        // with no product in it.
+        useStore.getState().setViewTools(asViewTools(msg.payload) ?? DEFAULT_VIEW_TOOLS, {
+          broadcast: false,
+        });
       } else if (msg.type === 'XR_PRESENCE') {
         const { userId } = msg.payload;
         if (userId !== userRef.current.userId) {
@@ -1309,6 +1331,24 @@ export function broadcastPointingSegment(seg: PointingSegment): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   socket.send(JSON.stringify({ type: 'POINTING_SEGMENT', payload: seg }));
 }
+
+/**
+ * Tell the room what its view tools are.
+ *
+ * Module-level for the same reason as broadcastPointingSegment — the caller is store.ts's
+ * `setViewTools`, which is not a hook and cannot be — and no-op when this browser is not
+ * in a room, which is the lobby's preview canvas moving a cut of its own. Registered as
+ * the store's sender at module scope below, so the store reaches the socket through
+ * lib/viewToolsSender.ts rather than through an import of this module: this one imports
+ * the store, and the cycle would drag partysocket into every test that imports store.ts.
+ */
+export function broadcastViewTools(payload: ViewTools): void {
+  const socket = partySocketRef.current;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({ type: 'VIEW_TOOLS', payload }));
+}
+
+setViewToolsSender(broadcastViewTools);
 
 /** Host-only: admit a pending user. Module-level for the same reason as broadcastRecordingState. */
 export function broadcastAdmit(userId: string): void {

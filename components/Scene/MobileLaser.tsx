@@ -5,6 +5,10 @@ import { mobileLaserRef } from '../../lib/mobileLaserRef';
 import { usePresence } from '../../lib/PresenceContext';
 import { EDITING_HELPER_KEY } from '../../lib/scene/captureClean';
 import { hitParts, isPointableHit, partRegistries } from '../../lib/scene/partRegistry';
+// The room's cut takes a slice out of the picture but not out of a raycast: three's Raycaster
+// never looks at a material's clipping planes. Every pick path in the app drops the hits on
+// the clipped side through this one filter — see lib/scene/cutPick.ts.
+import { uncutHits } from '../../lib/scene/cutPick';
 import { useStore } from '../../store';
 import { setLaserEntry, clearLaserEntry } from '../../lib/laserTargetRef';
 
@@ -42,7 +46,7 @@ const MobileLaser: React.FC = () => {
 
     raycaster.current.setFromCamera(new Vector2(ndc[0], ndc[1]), camera);
 
-    const intersects = raycaster.current.intersectObjects(scene.children, true);
+    const intersects = uncutHits(raycaster.current.intersectObjects(scene.children, true));
     const registries = partRegistries(useStore.getState().sceneEntries);
     let foundId: string | null = null;
     let foundMeshName: string | null = null;

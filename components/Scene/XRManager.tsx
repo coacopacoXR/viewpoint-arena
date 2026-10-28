@@ -9,6 +9,9 @@ import { usePresence } from '../../lib/PresenceContext';
 import { participantLabel } from '../../lib/identity';
 import { remoteXRParticipants } from '../../lib/xrPresenceRef';
 import { mobileLaserRef } from '../../lib/mobileLaserRef';
+// A controller's ray reaches through a cut model exactly the way a mouse's does, so it goes
+// through the same filter — see lib/scene/cutPick.ts.
+import { uncutHits } from '../../lib/scene/cutPick';
 import type { XRParticipantData } from '../../types';
 
 // ─── CONTROLLER BUTTON GUIDE ─────────────────────────────────────────────────
@@ -110,7 +113,7 @@ function XRLaser({ rightState }: { rightState: XRControllerState | undefined }) 
     direction.applyQuaternion(controllerObj.getWorldQuaternion(new THREE.Quaternion()));
 
     raycaster.current.set(origin, direction);
-    const intersects = raycaster.current.intersectObjects(scene.children, true);
+    const intersects = uncutHits(raycaster.current.intersectObjects(scene.children, true));
     const hitPoint = new THREE.Vector3();
     let found = false;
 

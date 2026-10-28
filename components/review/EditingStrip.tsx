@@ -120,6 +120,9 @@ const EditingStrip: React.FC<{ onDone: () => void }> = ({ onDone }) => {
   const sceneEntries = useStore((s) => s.sceneEntries);
   const importedSceneTree = useStore((s) => s.importedSceneTree);
   const selection = useStore((s) => selectedNodeId(s.objectStates));
+  // The room's explode, shared with everybody in it and therefore not the editor's to ignore:
+  // a colleague can take the model apart while this person holds the edit lock.
+  const explode = useStore((s) => s.viewTools.explode);
   const viewpointCount = useActiveReviewStore((s) => s.config?.viewpoints.length ?? 0);
   const { broadcastSceneUpdate, broadcastReviewConfig } = usePresence();
   const applyLocalSceneUpdate = useStore((s) => s.applyLocalSceneUpdate);
@@ -228,14 +231,24 @@ const EditingStrip: React.FC<{ onDone: () => void }> = ({ onDone }) => {
   // A tool with nothing selected has nothing to act on. Disabled rather than
   // hidden, so the strip does not change shape as the tree's selection moves.
   const inPartMode = gizmoTarget === 'part';
-  const toolsEnabled = inPartMode ? partTarget !== null : activeSceneModelId !== null;
   // A model's own root is not a part, and the tools say so: selecting it in Part mode
   // behaves like Whole model, which is what the batch brief asks for and what the
   // gizmo does with it, so the strip must not promise a bolt and deliver a product.
   const onAPart = Boolean(partTarget?.nodeId);
-  const nothingToActOn = inPartMode
-    ? 'Click a part in the 3D view or in the model tree first'
-    : 'Select a model in the tree first';
+  // A PART may not be moved while the room has the model taken apart, and the reason goes
+  // on the button because a grey tool with nothing on it is the one state a person cannot
+  // diagnose. The room's explode draws every part somewhere other than where its own
+  // transform puts it, so the handles — which sit on the transform, because that is what a
+  // PartTransform means — would float in the gap the part used to fill. Whole model keeps
+  // working: the wrapper the tools drag is above the parts the explode moves.
+  const explodedOnAPart = onAPart && explode > 0;
+  const toolsEnabled =
+    (inPartMode ? partTarget !== null : activeSceneModelId !== null) && !explodedOnAPart;
+  const nothingToActOn = explodedOnAPart
+    ? 'Collapse the explode view to move parts'
+    : inPartMode
+      ? 'Click a part in the 3D view or in the model tree first'
+      : 'Select a model in the tree first';
 
   const boxRef = React.useRef<HTMLDivElement>(null);
   const barRef = React.useRef<HTMLDivElement>(null);

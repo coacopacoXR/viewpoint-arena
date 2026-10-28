@@ -17,6 +17,9 @@
 //   • A reset is a scene change like any other: sent to the room, predicted here, and
 //     remembered with the REVIEW — without that last step the override would come back
 //     the next time the review was opened.
+//   • The part tools go off while the ROOM has the model exploded (task 08b), with the way
+//     back on the tooltip, and Whole model does not — the wrapper the whole-model tools drag
+//     is above the parts the explode moves, so it is where it looks like it is.
 
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -34,6 +37,7 @@ import {
 } from '../../../lib/scene/roomScene';
 import type { SceneModelEntry } from '../../../lib/scene/sceneEntries';
 import { MeshPartRegistry } from '../../../lib/scene/partRegistry';
+import { DEFAULT_VIEW_TOOLS } from '../../../lib/scene/viewTools';
 import type { SceneNode, ObjectState } from '../../../types';
 
 const { presenceMock } = vi.hoisted(() => ({
@@ -144,6 +148,10 @@ function mountStrip(parts?: PartTransforms) {
     activeSceneModelId: MODEL_ID,
     reviewGizmoMode: null,
     reviewGizmoTarget: 'model',
+    // Reset rather than inherited: the store is the real one and persists across tests in a
+    // file, and a room left exploded by the block above would switch the part tools off for
+    // every test below it — which reads as a bug in the strip rather than as a stale fixture.
+    viewTools: DEFAULT_VIEW_TOOLS,
     _viewCapture: null,
   });
   useActiveReviewStore.setState({ config: createReviewDraft('rev-1', 'Landing gear review') });
@@ -295,6 +303,103 @@ describe('Part mode with a part selected', () => {
     select(BOLT);
 
     expect(screen.getByTestId('gizmo-part-name')).toHaveTextContent('M8 bolt');
+  });
+});
+
+describe('while the room has the model exploded', () => {
+  // The explode is the ROOM's, not the editor's: a colleague can take the model apart while
+  // this person holds the edit lock, so the strip has to read the shared value rather than
+  // anything it owns.
+  const EXPLODED = 'Collapse the explode view to move parts';
+
+  function explode(factor: number) {
+    mutate(() => useStore.setState({ viewTools: { cut: null, explode: factor } }));
+  }
+
+  it('switches the part tools off and says why, rather than leaving them to move nothing', () => {
+    mountStrip();
+    fireEvent.click(screen.getByTitle(PART));
+    select(FLANGE);
+    expect(screen.getByTitle(MOVE_PART)).toBeEnabled();
+
+    explode(0.6);
+
+    // A part is being drawn somewhere other than where its own transform puts it, so the
+    // handles — which sit on the transform, because that is what a PartTransform means —
+    // would float in the gap the part used to fill. Off, with the way back on the tooltip.
+    expect(screen.getAllByTitle(EXPLODED)).toHaveLength(3);
+    for (const tool of screen.getAllByTitle(EXPLODED)) expect(tool).toBeDisabled();
+    expect(screen.queryByTitle(MOVE_PART)).toBeNull();
+  });
+
+  it('keeps Whole model working, because the wrapper is above the parts that moved', () => {
+    mountStrip();
+    explode(0.6);
+
+    // Nothing about a whole-model drag is ambiguous while the model is apart: the group the
+    // tools attach to is the one the explode is inside, so it is exactly where it looks.
+    expect(screen.getByTitle(MOVE_MODEL)).toBeEnabled();
+    expect(screen.getByTitle('Rotate the selected model')).toBeEnabled();
+    expect(screen.getByTitle('Resize the selected model')).toBeEnabled();
+    expect(screen.queryByTitle(EXPLODED)).toBeNull();
+  });
+
+  it('keeps the tools on for a model\'s own root selected in Part mode, which is the whole model', () => {
+    mountStrip();
+    fireEvent.click(screen.getByTitle(PART));
+    select(ROOT);
+    explode(0.6);
+
+    // The root is not a part and the explode does not move it, so the reason above does not
+    // apply — and switching these off would have made Part mode unusable in an exploded room
+    // for the one selection that is really a model.
+    expect(screen.getByTitle(MOVE_MODEL)).toBeEnabled();
+    expect(screen.queryByTitle(EXPLODED)).toBeNull();
+  });
+
+  it('gives the part tools back when the room puts the model together again', () => {
+    mountStrip();
+    fireEvent.click(screen.getByTitle(PART));
+    select(FLANGE);
+    explode(0.6);
+    expect(screen.getAllByTitle(EXPLODED)).toHaveLength(3);
+
+    explode(0);
+
+    expect(screen.getByTitle(MOVE_PART)).toBeEnabled();
+    expect(screen.queryByTitle(EXPLODED)).toBeNull();
+  });
+
+  it('writes no part override, records no history and sends the room no scene change', () => {
+    // DISPLAY ONLY, asserted from the end a person can see. An explode that reached
+    // SceneModel.parts would come back with the review the next time it was opened; one that
+    // reached the history would put "took the model apart" between a person and their own
+    // undo; one that reached the scene socket would be a product moved by a camera.
+    mountStrip();
+    fireEvent.click(screen.getByTitle(PART));
+    select(FLANGE);
+
+    explode(0.6);
+
+    expect(partsInStore()).toBeUndefined();
+    expect(screen.getByTestId('undo-scene-edit')).toBeDisabled();
+    expect(presenceMock.broadcastSceneUpdate).not.toHaveBeenCalled();
+  });
+
+  it('leaves an override that was already there exactly as it was', () => {
+    mountStrip(PARTS);
+    fireEvent.click(screen.getByTitle(PART));
+    select(FLANGE);
+    expect(screen.getByTitle(RESET_PART)).toBeEnabled();
+
+    explode(0.6);
+    explode(0);
+
+    // A view is not an edit, so the part somebody had pulled out is still pulled out and
+    // still has a way back — and taking the model apart gave nobody a step to undo.
+    expect(partsInStore()).toEqual(PARTS);
+    expect(screen.getByTitle(RESET_PART)).toBeEnabled();
+    expect(screen.getByTestId('undo-scene-edit')).toBeDisabled();
   });
 });
 

@@ -1,4 +1,4 @@
-// The room's view-tools control — task 08a.
+// The room's view-tools control — tasks 08a (the cut) and 08b (the explode).
 //
 // What is asserted here is the half a rendering test cannot see: that the control is
 // reachable and honest about what it is doing.
@@ -10,11 +10,12 @@
 //     what is on this screen is what is on everybody else's;
 //   • the slider's release is what flushes the throttle, because that is the moment the
 //     person considers the value final;
-//   • the explode is rendered and disabled with the reason on it, rather than absent — a
-//     control that appears later is a control the room has to learn twice;
-//   • and when there is nothing to cut the control says SO, with which of the three reasons
-//     it is: no model, still loading, or every model hidden. "Disabled" on its own is the
-//     one state a person cannot diagnose.
+//   • the explode is the same shape of control as the cut — a switch and a slider on the one
+//     shared value — and switching it on says on screen that the part tools have gone grey,
+//     because a restriction nobody is told about is a bug the person has to find;
+//   • and when there is nothing to work on the control says SO, with which of the three
+//     reasons it is: no model, still loading, or every model hidden. "Disabled" on its own is
+//     the one state a person cannot diagnose.
 
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -194,28 +195,131 @@ describe('RoomViewTools', () => {
     expect(flush).toHaveBeenCalledTimes(1);
   });
 
-  it('renders the explode disabled, with the task that lands it named on it', () => {
-    setup({ viewTools: { cut: CUT, explode: 0 } });
-    render(<RoomViewTools />);
-    open();
+  describe('the explode', () => {
+    it('switches on at half spread, and keeps the cut the room already had', () => {
+      setup({ viewTools: { cut: CUT, explode: 0 } });
+      render(<RoomViewTools />);
+      open();
 
-    const explode = screen.getByTestId('view-tools-explode') as HTMLInputElement;
-    expect(explode.disabled).toBe(true);
-    expect(screen.getByTestId('view-tools-popover').textContent).toContain('08b');
+      fireEvent.click(screen.getByTestId('view-tools-explode-toggle'));
+      // One shared value carries both tools, so turning one on must not take the other off:
+      // the room is looking at a section AND at the parts pulled apart, and the two are
+      // independent questions about the same model. Half rather than full, because the first
+      // frame is the one that teaches what the tool does and at full spread the outer parts
+      // are outside the camera the room had settled on.
+      expect(lastWritten()).toEqual({ cut: CUT, explode: 0.5 });
+    });
+
+    it('switches off, and leaves the cut alone', () => {
+      setup({ viewTools: { cut: CUT, explode: 0.6 } });
+      render(<RoomViewTools />);
+      open();
+
+      fireEvent.click(screen.getByTestId('view-tools-explode-toggle'));
+      expect(lastWritten()).toEqual({ cut: CUT, explode: 0 });
+    });
+
+    it('has the slider live at the room’s value, and dead while the room is assembled', () => {
+      // A fresh mount per state rather than a click, because `setViewTools` is faked here: the
+      // component reads the room's value back from the store, and a fake store never answers
+      // what the click asked it to write. What a mount shows is what a browser joining the room
+      // shows, which is the state that matters.
+      setup({ viewTools: { cut: null, explode: 0 } });
+      render(<RoomViewTools />);
+      open();
+      // Off, and not merely at zero: a slider that moves and changes nothing is the one control
+      // state this popover exists to avoid, so the switch is what turns it on.
+      expect((screen.getByTestId('view-tools-explode') as HTMLInputElement).disabled).toBe(true);
+      expect(screen.queryByTestId('view-tools-explode-note')).toBeNull();
+
+      cleanup();
+      setup({ viewTools: { cut: null, explode: 0.6 } });
+      render(<RoomViewTools />);
+      open();
+      const slider = screen.getByTestId('view-tools-explode') as HTMLInputElement;
+      expect(slider.disabled).toBe(false);
+      expect(slider.value).toBe('60');
+      expect(screen.getByTestId('view-tools-explode-toggle').textContent).toContain('On');
+      expect(screen.getByTestId('view-tools-popover').textContent).toContain('60%');
+    });
+
+    it('writes the slider as a fraction of full spread, and flushes on release', () => {
+      setup({ viewTools: { cut: null, explode: 0.5 } });
+      render(<RoomViewTools />);
+      open();
+      const slider = screen.getByTestId('view-tools-explode');
+
+      expect((slider as HTMLInputElement).value).toBe('50');
+      fireEvent.change(slider, { target: { value: '80' } });
+      expect(lastWritten()).toEqual({ cut: null, explode: 0.8 });
+      // Not yet: the store throttles the wire, and the release is the moment the person
+      // considers the value final. Same contract as the cut's slider, and the same reason —
+      // a room that converges 66 ms late is a room that disagrees with the screen dragging it.
+      expect(flush).not.toHaveBeenCalled();
+
+      fireEvent.pointerUp(slider);
+      expect(flush).toHaveBeenCalledTimes(1);
+    });
+
+    it('flushes on a keyboard arrow too, which is a drag with no pointer in it', () => {
+      setup({ viewTools: { cut: null, explode: 0.5 } });
+      render(<RoomViewTools />);
+      open();
+
+      fireEvent.keyUp(screen.getByTestId('view-tools-explode'), { key: 'ArrowRight' });
+      expect(flush).toHaveBeenCalledTimes(1);
+    });
+
+    it('puts the parts back with its own reset, without touching the cut', () => {
+      setup({ viewTools: { cut: CUT, explode: 0.7 } });
+      render(<RoomViewTools />);
+      open();
+
+      fireEvent.click(screen.getByTestId('view-tools-explode-reset'));
+      expect(lastWritten()).toEqual({ cut: CUT, explode: 0 });
+    });
+
+    it('carries an explode the room already has, so a browser that joins sees what everybody sees', () => {
+      setup({ viewTools: { cut: null, explode: 0.4 } });
+      render(<RoomViewTools />);
+      open();
+
+      // Read off the shared value rather than from a local one: the room is exploded, so the
+      // control says so and the slider starts where the room is rather than where this browser
+      // last left it.
+      expect((screen.getByTestId('view-tools-explode') as HTMLInputElement).value).toBe('40');
+      expect(screen.getByTestId('view-tools-popover').textContent).toContain('40%');
+    });
+
+    it('says on screen that parts cannot be moved while the model is apart', () => {
+      setup({ viewTools: { cut: null, explode: 0.6 } });
+      const { container } = render(<RoomViewTools />);
+
+      open();
+      // The restriction is the amber strip's, and the strip is only on screen for whoever
+      // holds the edit lock — so the sentence explaining it has to be here, where everybody
+      // can see it, and not only in a tooltip on a button that may be shed for width.
+      expect(screen.getByTestId('view-tools-explode-note').textContent).toContain(
+        'Parts cannot be moved',
+      );
+      // And the rail says the room is exploded without the popover being open, which is the
+      // same job the cut's badge has always had: one screen has the popover, everybody has
+      // the model.
+      expect(container.textContent).toContain('e60');
+    });
+
+    it('leaves the cut’s own badge exactly as it was when the room is only cutting', () => {
+      // Two tools sharing one badge must not have changed what one of them reads as: a cut on
+      // its own has said `x50` on the rail since 08a, and a check that runs against the room
+      // server asserts on exactly that.
+      setup({ viewTools: { cut: CUT, explode: 0 } });
+      render(<RoomViewTools />);
+
+      expect(screen.getByTestId('view-tools-badge').textContent).toBe('x50');
+    });
   });
 
-  it('carries an explode the room already has, so the day 08b lands nothing has to be re-learned', () => {
-    setup({ viewTools: { cut: null, explode: 0.4 } });
-    render(<RoomViewTools />);
-    open();
-
-    // Read off the shared value rather than from a local one: the room is exploded, so the
-    // control says so even though this browser cannot render it yet.
-    expect((screen.getByTestId('view-tools-explode') as HTMLInputElement).value).toBe('40');
-    expect(screen.getByTestId('view-tools-popover').textContent).toContain('40%');
-  });
-
-  describe('when there is nothing to cut', () => {
+  describe('when there is nothing to work on', () => {
     it('disables the cut and says the room has no model', () => {
       setup({ activeModelType: 'none', scene: { models: [] }, sceneEntries: {} });
       render(<RoomViewTools />);
@@ -227,6 +331,18 @@ describe('RoomViewTools', () => {
       expect(screen.getByTestId('view-tools-unavailable').textContent).toContain('no model');
       // And nothing was written: a disabled control that still fires is worse than one that
       // does not say why.
+      fireEvent.click(toggle);
+      expect(setViewTools).not.toHaveBeenCalled();
+    });
+
+    it('disables the explode too, for the same reason', () => {
+      setup({ activeModelType: 'none', scene: { models: [] }, sceneEntries: {} });
+      render(<RoomViewTools />);
+      open();
+
+      const toggle = screen.getByTestId('view-tools-explode-toggle') as HTMLButtonElement;
+      expect(toggle.disabled).toBe(true);
+      expect(toggle.title).toContain('no model');
       fireEvent.click(toggle);
       expect(setViewTools).not.toHaveBeenCalled();
     });
@@ -247,13 +363,21 @@ describe('RoomViewTools', () => {
       expect(screen.getByTestId('view-tools-unavailable').textContent).toContain('hidden');
     });
 
-    it('is available for the bundled sample, which is a model too', () => {
+    it('cuts the bundled sample but does not offer to explode it, and says why', () => {
       setup({ activeModelType: 'synth', scene: { models: [] }, sceneEntries: {} });
       render(<RoomViewTools />);
       open();
 
+      // A cut is a plane handed to a material, so anything drawn can be cut — including the
+      // sample, whose parts are React components rather than a parse.
       expect(screen.queryByTestId('view-tools-unavailable')).toBeNull();
       expect((screen.getByTestId('view-tools-cut-toggle') as HTMLButtonElement).disabled).toBe(false);
+      // An explode pushes parts apart through their registry, and the sample has none: the
+      // slider would move and the model would not, which is the one control state this file
+      // exists to avoid. Off, with the reason on it.
+      const explode = screen.getByTestId('view-tools-explode-toggle') as HTMLButtonElement;
+      expect(explode.disabled).toBe(true);
+      expect(explode.title).toContain('no parts');
     });
   });
 

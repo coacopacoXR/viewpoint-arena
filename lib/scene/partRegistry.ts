@@ -47,6 +47,16 @@
 // "Reset part" put a part where the drag happened to end. `movedPartIds` is the index
 // that makes resetting O(moved) rather than O(parts), and `gizmoProxyFor` answers the
 // one Object3D drei's TransformControls still needs, in the frame a PartTransform is in.
+//
+// TASK 08b hangs the room's EXPLODE off the same seam, as `setExplode`. It is a
+// registry method and not a walk of the scene graph in a component for the reason every
+// other per-part property is one: a batched part has no Object3D to push, so an explode
+// written by walking the graph would silently do nothing to exactly the large assemblies
+// it is most useful on. It is also DISPLAY ONLY, and the invariant that keeps it so is
+// that a handle's transform reads and writes answer the part's LOGICAL pose — an explode
+// is folded in on the way out to the renderer and taken back off on the way in, so a bind
+// pose, an override on the wire and a gizmo drag can never see one. See
+// lib/scene/explode.ts for the vectors and MeshPartHandle.assembledAt for the fold.
 
 import {
   Box3,
@@ -61,6 +71,8 @@ import {
 import type { SceneNode } from '../../types';
 import { highlightClone, setEmissiveHighlight, type EmissiveHighlight } from './materialHighlight';
 import { syncCut } from './cutPlane';
+import { EXPLODE_SPREAD, explodeDirections, explodeObjectOffsets } from './explode';
+import { asUnit } from './viewTools';
 import type { StoredLocalTransform } from './partTransforms';
 
 /**
@@ -85,7 +97,13 @@ export interface PartHandle {
    * name, so the tree's name is the readable one and the object's is often empty.
    */
   readonly name: string;
-  /** This part's transform in its parent's space — the frame a PartTransform is in. */
+  /**
+   * This part's transform in its parent's space — the frame a PartTransform is in.
+   *
+   * The LOGICAL transform, which is the one the wire, the gizmo and the bind pose all speak:
+   * a room that has exploded the model draws its parts somewhere else and answers the same
+   * numbers here as it did assembled. See `PartRegistry.setExplode`.
+   */
   getMatrix(out: Matrix4): Matrix4;
   setMatrix(matrix: Matrix4): void;
   /** The three fields the gizmo writes to the wire, in the shape it writes them. */
@@ -158,14 +176,44 @@ export interface MotionCullView {
   readonly k: number;
 }
 
+/**
+ * Which of the two boxes a bounds call wants, when the room has exploded the model.
+ *
+ * An options object rather than a boolean because `bounds(out, true)` at a call site is a
+ * question the reader has to go and answer, and because the two boxes are not "raw and
+ * cooked" — one is what is on screen and the other is what the file says.
+ */
+export interface BoundsOptions {
+  /**
+   * Answer the box the parts occupy with the room's explode taken back off.
+   *
+   * The cut plane asks for this and nothing else does, and it has to: the value on the wire
+   * is a FRACTION of the models' extent (lib/scene/viewTools.ts), so resolving it against the
+   * exploded box would move the section every time somebody dragged the explode slider — a
+   * cut that slides through the product because a different view tool moved is a cut nobody
+   * can hold still. Everything that frames a picture wants the opposite answer and gets it by
+   * asking with no options at all.
+   */
+  assembled?: boolean;
+}
+
 /** One per parsed model, owned by the parse and disposed with it. */
 export interface PartRegistry {
   /** The part this id names, or null when the id is not this model's. */
   get(id: string): PartHandle | null;
   /** Every part, in tree order — the order buildSceneTree minted the ids in. */
   parts(): readonly PartHandle[];
-  /** The union box of the whole model. Replaces every `Box3().setFromObject(group)`. */
-  bounds(out: Box3): Box3;
+  /**
+   * The union box of the whole model. Replaces every `Box3().setFromObject(group)`.
+   *
+   * The box of the model AS IT IS DRAWN, so a room that has exploded it answers the bigger
+   * box the parts are now standing on — which is what framing wants, since a picture of an
+   * exploded assembly that was framed on the assembled one has the outer parts off the edge.
+   * Pass `{ assembled: true }` for the box the parts would occupy with the explode taken back
+   * off; the one caller that does is the cut plane, whose normalised position has to mean the
+   * same thing while a slider is being dragged as it did before (see `BoundsOptions`).
+   */
+  bounds(out: Box3, options?: BoundsOptions): Box3;
   /**
    * The box of the model as it is being DRAWN, which is `bounds` unless the model itself
    * has been turned off.
@@ -176,7 +224,7 @@ export interface PartRegistry {
    * would slide the visible ones off their own origin (components/Scene/ImportedModel's
    * `placeImportedGroup`, and the lobby's `measure`).
    */
-  visibleBounds(out: Box3): Box3;
+  visibleBounds(out: Box3, options?: BoundsOptions): Box3;
   /**
    * The part ids a raycast hit names in this registry, nearest first, or NULL when the
    * hit is not this registry's at all.
@@ -260,6 +308,29 @@ export interface PartRegistry {
    * the pins and the comments all keep naming the part whether or not it is being drawn.
    */
   motionCull(view: MotionCullView | null): number;
+  /**
+   * Push this model's parts apart by `factor` of the room's explode, and answer how many
+   * parts were written. 0 is assembled, 1 is the spread lib/scene/explode.ts calls full.
+   *
+   * DISPLAY ONLY, and that is a promise about every other method on this interface rather
+   * than a comment: exploding a model writes no `SceneModel.parts`, records no edit-history
+   * step, and is never what a handle answers for `getLocalTransform` or `bindPose`. A gizmo
+   * drag that landed while the room was exploded would otherwise stamp the exploded pose as
+   * the file's own and "Reset part" would put the part where the slider happened to be.
+   *
+   * The directions and the centre are measured ONCE, from the assembled pose, and cached:
+   * dragging the slider is then one write per part and no box is recomputed. The cache is
+   * thrown away when a part's own transform is written — an override changes the centre the
+   * part moves away from — and the next call rebuilds it, which is what makes an override
+   * landing from the room while the model is exploded converge instead of creeping.
+   *
+   * Idempotent: the same factor twice writes nothing the second time. That matters because
+   * the caller is a component effect and runs on every store write beside the explode's own.
+   *
+   * Called by components/Scene/ViewToolsExplode.tsx, which owns the room's value and asks
+   * for a frame afterwards.
+   */
+  setExplode(factor: number): number;
   /**
    * The ids of the parts this registry has written a transform to, in the order they were
    * first moved.
@@ -454,8 +525,9 @@ export function modelBox(
   group: Object3D,
   registry: PartRegistry | null | undefined,
   out: Box3,
+  options?: BoundsOptions,
 ): Box3 {
-  return registry ? registry.bounds(out) : out.setFromObject(group);
+  return registry ? registry.bounds(out, options) : out.setFromObject(group);
 }
 
 /**
@@ -563,6 +635,23 @@ class MeshPartHandle implements PartHandle {
   /** Whether a motion cull is hiding this part. Render-only: see PartRegistry.motionCull. */
   private motionCulled = false;
 
+  /**
+   * Where this part's own position stands with the room's explode taken back off, and the
+   * vector that was added to it. Both null while the room is assembled, which is nearly all
+   * of the time, so a model nobody has exploded allocates nothing for one.
+   *
+   * Two rather than one because the pair has to answer two different questions exactly.
+   * `assembledAt` is what a read answers — `getLocalTransform` and `bindPose` are about the
+   * part's LOGICAL pose and must never see the explode, or a gizmo drag landing while the room
+   * is exploded would stamp the pushed-out position as the file's own and "Reset part" would
+   * restore the slider instead of the solid. It is also what a write to factor 0 restores, and
+   * restoring from a copy rather than by subtracting `explodedBy` is what makes "back to 0"
+   * bit-exact: `(base + v) − v` is not `base` in floating point, and a model exploded and
+   * collapsed a hundred times would drift.
+   */
+  private assembledAt: Vector3 | null = null;
+  private explodedBy: Vector3 | null = null;
+
   constructor(
     readonly id: string,
     readonly name: string,
@@ -575,18 +664,21 @@ class MeshPartHandle implements PartHandle {
 
   // Composed from position/quaternion/scale rather than copied from `.matrix`, because
   // `.matrix` is only current after an updateMatrixWorld and a handle has to answer
-  // correctly in the middle of a gizmo drag, before the next render.
+  // correctly in the middle of a gizmo drag, before the next render. The POSITION is the
+  // assembled one, for the reason `assembledAt` gives: this is the part's logical transform.
   getMatrix(out: Matrix4): Matrix4 {
-    return out.compose(this.object.position, this.object.quaternion, this.object.scale);
+    return out.compose(this.assembledAt ?? this.object.position, this.object.quaternion, this.object.scale);
   }
 
   setMatrix(matrix: Matrix4): void {
     this.rememberBind();
     matrix.decompose(this.object.position, this.object.quaternion, this.object.scale);
+    this.keepExplode();
   }
 
   getLocalTransform(): StoredLocalTransform {
-    const { position, rotation, scale } = this.object;
+    const position = this.assembledAt ?? this.object.position;
+    const { rotation, scale } = this.object;
     return {
       position: [position.x, position.y, position.z],
       rotation: [rotation.x, rotation.y, rotation.z],
@@ -597,8 +689,48 @@ class MeshPartHandle implements PartHandle {
   setLocalTransform(transform: StoredLocalTransform): void {
     this.rememberBind();
     this.object.position.set(...transform.position);
+    this.keepExplode();
     this.object.rotation.set(...transform.rotation);
     this.object.scale.set(...transform.scale);
+  }
+
+  /**
+   * Remember the assembled position a write just put there, and push the part back out by the
+   * explode it was already carrying.
+   *
+   * The second half is what keeps a write that lands while the room is exploded from
+   * collapsing that one part — an override arriving from somebody else, an undo, a "Reset
+   * part" — and the first half is what keeps the next `applyExplode` from writing an offset
+   * onto a position that already has one in it. The offset itself is stale for this part now
+   * (the centre it was measured from has moved), which is why the registry drops the whole
+   * plan and rebuilds it: see `MeshPartRegistry.setExplode`.
+   */
+  private keepExplode(): void {
+    if (this.assembledAt === null) return;
+    this.assembledAt.copy(this.object.position);
+    if (this.explodedBy) this.object.position.add(this.explodedBy);
+  }
+
+  /**
+   * Stand this part where the room's explode puts it, at `scale` — `factor × EXPLODE_SPREAD`.
+   *
+   * Package-private, and the registry's explode pass is the only caller: it owns the plan the
+   * offset came from. A scale of 0 restores the assembled position EXACTLY, from the copy
+   * rather than by subtraction, which is the bit-equality the collapse is specified to have.
+   */
+  applyExplode(offset: Vector3, scale: number): void {
+    const position = this.object.position;
+    if (scale === 0) {
+      if (this.assembledAt) position.copy(this.assembledAt);
+      this.assembledAt = null;
+      this.explodedBy = null;
+      return;
+    }
+    if (this.assembledAt === null) this.assembledAt = position.clone();
+    else position.copy(this.assembledAt);
+    if (this.explodedBy === null) this.explodedBy = new Vector3();
+    this.explodedBy.copy(offset).multiplyScalar(scale);
+    position.add(this.explodedBy);
   }
 
   bindPose(): StoredLocalTransform {
@@ -650,6 +782,16 @@ class MeshPartHandle implements PartHandle {
    */
   get glowing(): boolean {
     return this.ownMaterial !== undefined;
+  }
+
+  /**
+   * Where this part's own transform puts it, whether or not the room has exploded it.
+   *
+   * Package-private, for the registry's gizmo proxy: the proxy carries the numbers a
+   * PartTransform means, and those are the logical ones — see `assembledAt`.
+   */
+  get logicalPosition(): Vector3 {
+    return this.assembledAt ?? this.object.position;
   }
 
   private applyVisibility(): void {
@@ -1197,6 +1339,36 @@ export class MeshPartRegistry implements PartRegistry {
   /** Built the first time a part is selected in Part mode, and reused for every one after. */
   private proxy: Object3D | null = null;
 
+  // ─── the room's explode ─────────────────────────────────────────────────────
+  //
+  // A plan and the state it was measured against, thrown away the moment a part moves. See
+  // lib/scene/explode.ts for what the vectors mean and why the one written to an Object3D is
+  // not the one measured in the root's space.
+
+  /** What is written to the parts right now. 0 while the room is assembled. */
+  private explodeFactor = 0;
+  /** `moved.version` when the plan was built, or -1 for "never". See `setExplode`. */
+  private explodeBuiltAt = -1;
+  /**
+   * How many times the applied explode has changed, added to `moved.version` to key the cull
+   * index.
+   *
+   * The cull's spheres are measured where the parts ARE, so an explode moves every one of them
+   * and an index built before it would cull the assembled model's specks while drawing the
+   * exploded one. Two counters rather than one because they answer different questions: a part
+   * moving stales the plan itself, and a plan rebuilt at every step of a drag would measure ten
+   * thousand bounding boxes per pointer-move — which is the cost the plan exists to avoid.
+   */
+  private explodeVersion = 0;
+  /** The parts the explode moves, and the offset each carries. Parallel, and root is in neither. */
+  private readonly explodeParts: MeshPartHandle[] = [];
+  /** Per moving part, in its PARENT's space, at factor 1. Parallel to `explodeParts`. */
+  private readonly explodeOffsets: Vector3[] = [];
+  /** The same vectors in the ROOT's space, which is what the plan build hands to the fold. */
+  private readonly explodeDirections: Vector3[] = [];
+  private readonly explodeDirectionOf = new Map<Object3D, Vector3>();
+  private readonly explodeBox = new Box3();
+
   constructor(root: Object3D, tree?: SceneNode | null) {
     this.root = root;
     const names = new Map<string, string>();
@@ -1246,8 +1418,12 @@ export class MeshPartRegistry implements PartRegistry {
   // of a model nobody is looking at yet. A cache here would have to be invalidated by
   // every transform write and every visibility change, which is more bookkeeping than
   // the measurement.
-  bounds(out: Box3): Box3 {
-    return out.setFromObject(this.root);
+  //
+  // An exploded model answers the box its parts are standing on, because the explode is in
+  // their positions and `setFromObject` walks geometry — which is what framing wants and
+  // what the cut plane must NOT have. See `withExplodeOff`.
+  bounds(out: Box3, options?: BoundsOptions): Box3 {
+    return this.withExplodeOff(options, () => out.setFromObject(this.root));
   }
 
   // The model's own `visible` and nothing finer, which is what
@@ -1259,8 +1435,8 @@ export class MeshPartRegistry implements PartRegistry {
   // answer per part, because a batch that swaps a hidden part out really is not drawing
   // it; until then, changing this would re-frame every thumbnail of a room somebody had
   // hidden a bolt in.
-  visibleBounds(out: Box3): Box3 {
-    return this.root.visible ? out.setFromObject(this.root) : out.makeEmpty();
+  visibleBounds(out: Box3, options?: BoundsOptions): Box3 {
+    return this.root.visible ? this.bounds(out, options) : out.makeEmpty();
   }
 
   partChainForHit(hit: PickHit): string[] | null {
@@ -1320,13 +1496,14 @@ export class MeshPartRegistry implements PartRegistry {
 
   // The spheres are in the ROOT's space and so is the eye, which is what makes a model that has
   // been placed, moved or scaled cost nothing here: only a part that MOVED stales a sphere, and
-  // a part moves through `rememberBind`, which is the one place `moved` grows. Comparing its size
-  // is therefore a complete dirtiness test with no bookkeeping at the write site.
+  // a part moves through `rememberBind`, which is the one place `moved` grows — or through the
+  // room's explode, which is the one place `explodeVersion` grows. Comparing the two added
+  // together is therefore a complete dirtiness test with no bookkeeping at either write site.
   motionCull(view: MotionCullView | null): number {
     if (view === null) {
       return this.cullIndex.restore((part) => this.handles[part].setCulled(false));
     }
-    if (this.cullBuiltAt !== this.moved.version) this.buildCullIndex();
+    if (this.cullBuiltAt !== this.poseVersion()) this.buildCullIndex();
     this.root.updateWorldMatrix(true, false);
     this.cullInverse.copy(this.root.matrixWorld).invert();
     this.cullEye.copy(view.eye).applyMatrix4(this.cullInverse);
@@ -1379,7 +1556,94 @@ export class MeshPartRegistry implements PartRegistry {
       );
     }
     this.cullIndex.finish();
-    this.cullBuiltAt = this.moved.version;
+    this.cullBuiltAt = this.poseVersion();
+  }
+
+  // ─── the room's explode ─────────────────────────────────────────────────────
+
+  setExplode(factor: number): number {
+    const next = asUnit(factor) ?? 0;
+    // A part moved since the plan was built, so both the centres it was measured from and the
+    // base positions it holds are wrong. Assembled first — the directions come off the pose the
+    // parts are standing in, and measuring an exploded model would push every part further out
+    // on the next step, so a slider held still would creep the product apart.
+    if (this.explodeBuiltAt !== this.moved.version) {
+      this.writeExplode(0);
+      this.buildExplode();
+    }
+    if (next === this.explodeFactor) return 0;
+    this.explodeVersion += 1;
+    return this.writeExplode(next);
+  }
+
+  /** The pose version the cull index is keyed on: a part moved, or the explode did. */
+  private poseVersion(): number {
+    return this.moved.version + this.explodeVersion;
+  }
+
+  /**
+   * Measure the plan: every part's direction in the root's space, and the offset that leaves
+   * it standing there once its ancestors' own offsets are folded in.
+   *
+   * Once per model and once per part that moves while the room is exploded, never per frame —
+   * this is the half that walks bounding boxes, and `writeExplode` is the half a slider drag
+   * pays for.
+   */
+  private buildExplode(): void {
+    explodeDirections(this.root, this.handles, this.bounds(this.explodeBox), this.explodeDirections);
+    this.explodeDirectionOf.clear();
+    for (let at = 0; at < this.handles.length; at += 1) {
+      this.explodeDirectionOf.set(this.handles[at].object, this.explodeDirections[at]);
+    }
+    // A fresh map per build rather than a cleared field, because `explodeObjectOffsets` owns
+    // the vectors in the one it fills and the plan build is once per model and not once per
+    // frame — the arrays beside it are the ones a drag reads.
+    const offsets = new Map<Object3D, Vector3>();
+    explodeObjectOffsets(this.root, this.explodeDirectionOf, offsets);
+    // Paired lists of what to write, built once so a slider step walks one short array. The
+    // model's own root is NOT in them: `explodeObjectOffsets` never answers for it, and that
+    // is the right answer rather than a convenient one — the root's transform is the placement
+    // components/Scene/ImportedModel.tsx writes onto it after this registry was built, so
+    // recording a "base position" for it would be recording a pose the room has since changed.
+    this.explodeParts.length = 0;
+    this.explodeOffsets.length = 0;
+    for (const handle of this.handles) {
+      const offset = offsets.get(handle.object);
+      if (!offset) continue;
+      this.explodeParts.push(handle);
+      this.explodeOffsets.push(offset);
+    }
+    this.explodeBuiltAt = this.moved.version;
+  }
+
+  /**
+   * Write the plan at `factor`: one position per part, and nothing measured.
+   *
+   * This is the whole cost of a slider step, which is why the plan is a plan.
+   */
+  private writeExplode(factor: number): number {
+    const scale = factor * EXPLODE_SPREAD;
+    for (let at = 0; at < this.explodeParts.length; at += 1) {
+      this.explodeParts[at].applyExplode(this.explodeOffsets[at], scale);
+    }
+    this.explodeFactor = factor;
+    return this.explodeParts.length;
+  }
+
+  /**
+   * Run a measurement with the explode taken back off, and put it back afterwards.
+   *
+   * Only ever the cut plane's, and only while the room is exploded — at factor 0 there is
+   * nothing to take off and the measurement runs as it always did, so the room's ordinary
+   * frames pay nothing for the option existing.
+   */
+  private withExplodeOff<T>(options: BoundsOptions | undefined, measure: () => T): T {
+    if (!options?.assembled || this.explodeFactor === 0) return measure();
+    const was = this.explodeFactor;
+    this.writeExplode(0);
+    const answer = measure();
+    this.writeExplode(was);
+    return answer;
   }
 
   movedPartIds(): readonly string[] {
@@ -1405,7 +1669,11 @@ export class MeshPartRegistry implements PartRegistry {
     // ones, which is the same mistake twice over.
     const parent = handle.object.parent ?? this.root;
     if (proxy.parent !== parent) parent.add(proxy);
-    proxy.position.copy(handle.object.position);
+    // The LOGICAL position and not the drawn one: the proxy stands in for the part's own
+    // transform, and a room that has exploded the model has the amber strip's per-part tools
+    // switched off (components/Scene/ReviewModelGizmo.tsx) precisely so that nothing reads
+    // the pushed-out pose as the part's.
+    proxy.position.copy(handle.logicalPosition);
     // The Euler and not the quaternion, and the order with it: `Euler.setFromQuaternion`
     // goes through a rotation matrix, and `atan2` on an identity matrix answers -0 for some
     // of its terms. Nothing could see the difference in a rendered frame — JSON serialises
@@ -1418,6 +1686,15 @@ export class MeshPartRegistry implements PartRegistry {
   }
 
   dispose(): void {
+    // Assembled first, and before the handles go: the parsed group outlives the registry when
+    // a lobby viewer disposes one and keeps drawing the other, and a group left standing where
+    // an explode put it would be a model nobody can put back together.
+    this.writeExplode(0);
+    this.explodeParts.length = 0;
+    this.explodeOffsets.length = 0;
+    this.explodeDirections.length = 0;
+    this.explodeDirectionOf.clear();
+    this.explodeBuiltAt = -1;
     this.handles.length = 0;
     this.byId.clear();
     this.idByObject.clear();

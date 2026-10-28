@@ -32,6 +32,7 @@ import * as THREE from 'three';
 import type { ReviewDraft } from '../../../lib/reviewSetupStore';
 import type { SceneUpdate } from '../../../lib/scene/roomScene';
 import { MeshPartRegistry } from '../../../lib/scene/partRegistry';
+import { DEFAULT_VIEW_TOOLS } from '../../../lib/scene/viewTools';
 
 const ME = 'me';
 const HASH = 'a1'.repeat(32);
@@ -110,7 +111,12 @@ function part(parent: THREE.Object3D, id: string, at: [number, number, number]):
   return mesh;
 }
 
-function mountGizmo(options: { target?: 'model' | 'part'; selected?: string | null } = {}) {
+function mountGizmo(options: {
+  target?: 'model' | 'part';
+  selected?: string | null;
+  /** How far apart the ROOM has this model, as the shared view-tools value carries it. */
+  explode?: number;
+} = {}) {
   const target = options.target ?? 'part';
   const selected = options.selected === undefined ? FLANGE : options.selected;
 
@@ -186,6 +192,9 @@ function mountGizmo(options: { target?: 'model' | 'part'; selected?: string | nu
     reviewEditing: { userId: ME, name: 'Me' },
     activeSceneModelId: MODEL_ID,
     sceneModelGroups: { [MODEL_ID]: wrapper },
+    // Reset rather than inherited: the store is the real one and outlives a test, and a room
+    // left exploded by the block below would switch every part gizmo in this file off.
+    viewTools: { ...DEFAULT_VIEW_TOOLS, explode: options.explode ?? 0 },
   });
   useActiveReviewStore.getState().setConfig(createReviewDraft('room-1', 'Landing gear review'));
   forgetLocalEdit();
@@ -386,6 +395,32 @@ describe('ReviewModelGizmo — Part mode', () => {
 
   it('renders no gizmo when nothing is selected', () => {
     expect(mountGizmo({ selected: null })).toBeNull();
+  });
+
+  // Task 08b. The strip switches the part tools off and says why; this is the half inside the
+  // canvas, and it is here because the strip is not the only way the store gets to a state
+  // where a part is selected and the room is exploded — a colleague can take the model apart
+  // while this person holds the edit lock with Move already latched on a bolt.
+  it('renders no part gizmo while the room has the model exploded', () => {
+    // The handles would sit on the part's LOGICAL pose, because that is the pose a
+    // PartTransform means, and the part is being drawn somewhere else — so they would float in
+    // the gap it used to fill and a drag would move something nobody can see being moved.
+    expect(mountGizmo({ explode: 0.6 })).toBeNull();
+  });
+
+  it('keeps the whole-model gizmo while the room has the model exploded', () => {
+    // The wrapper is above the parts the explode moves, so it is exactly where it looks.
+    const handles = mountGizmo({ target: 'model', selected: FLANGE, explode: 0.6 });
+    expect(handles?.object).toBe(wrapper);
+  });
+
+  it('keeps the gizmo for a model’s own root in Part mode, which is the whole model', () => {
+    const handles = mountGizmo({ selected: ROOT, explode: 0.6 });
+    expect(handles?.object).toBe(wrapper);
+  });
+
+  it('gets the part gizmo back when the room puts the model together', () => {
+    expect(mountGizmo({ explode: 0 })).not.toBeNull();
   });
 
   it('still moves the whole model in Whole model mode, with a part selected or not', () => {

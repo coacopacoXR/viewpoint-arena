@@ -30,7 +30,7 @@
 // registry owns it is skipped so nothing is measured twice.
 
 import * as THREE from 'three';
-import type { PartRegistry } from './partRegistry';
+import type { BoundsOptions, PartRegistry } from './partRegistry';
 
 /** The marker the room stamps on every part of the product under review. */
 export const MODEL_ID_KEY = 'modelId';
@@ -64,10 +64,17 @@ function isModelPart(object: THREE.Object3D): boolean {
  * @param registries the parsed models in the scene, from `partRegistries(store.sceneEntries)`.
  *        Empty for a scene holding only the bundled synth, which is the default so that
  *        a caller framing a sample has nothing to collect.
+ * @param options handed to each registry's `visibleBounds`. The one that matters is
+ *        `assembled`, and the one caller that asks for it is the room's cut plane: the value
+ *        on the wire is a FRACTION of the models' extent (lib/scene/viewTools.ts), so
+ *        resolving it against an exploded box would slide the section every time somebody
+ *        dragged the explode slider. Framing wants the opposite answer — the box the parts
+ *        are actually standing on — and asks for nothing.
  */
 export function reviewModelBounds(
   root: THREE.Object3D | null | undefined,
   registries: readonly PartRegistry[] = [],
+  options?: BoundsOptions,
 ): THREE.Box3 {
   const box = new THREE.Box3();
   if (!root || typeof root.traverseVisible !== 'function') return box;
@@ -83,7 +90,7 @@ export function reviewModelBounds(
     const owner =
       typeof id === 'string' ? registries.find((registry) => registry.get(id) !== null) : undefined;
     if (owner) {
-      box.union(owner.visibleBounds(one));
+      box.union(owner.visibleBounds(one, options));
       return;
     }
     box.expandByObject(object);

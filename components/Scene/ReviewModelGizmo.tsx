@@ -76,6 +76,8 @@ const ReviewModelGizmo: React.FC<{
   const models = useStore((state) => state.scene.models);
   const entries = useStore((state) => state.sceneEntries);
   const selection = useStore((state) => selectedNodeId(state.objectStates));
+  // The room's explode, read only to decide whether a PART may be dragged — see `object` below.
+  const explode = useStore((state) => state.viewTools.explode);
   const { localUserId, broadcastSceneUpdate, broadcastReviewConfig } = usePresence();
 
   /**
@@ -149,7 +151,19 @@ const ReviewModelGizmo: React.FC<{
   });
 
   let object: THREE.Object3D | undefined = wrapper;
-  if (partTarget && partTarget.nodeId !== null) object = part?.proxy;
+  // A PART gets no handles while the room has the model taken apart, and the strip says why
+  // on the buttons it has switched off. Two reasons and either would be enough. The handles
+  // sit on the part's LOGICAL pose, because that is the pose a PartTransform means, and an
+  // exploded part is being drawn somewhere else — so the gizmo would float in the gap the
+  // part used to fill and dragging it would move something nobody can see being moved. And
+  // the drag's own writes would land on a model whose plan the registry has already had to
+  // throw away, which converges but is a fight nobody asked for.
+  //
+  // NO gizmo rather than the wrapper: falling through to `object`'s initialiser would have
+  // quietly turned a bolt into the whole product, which is the mistake this component's own
+  // comment on `part` exists to prevent. WHOLE MODEL keeps its handles either way — the
+  // wrapper is above the parts the explode moves, so it is exactly where it looks like it is.
+  if (partTarget && partTarget.nodeId !== null) object = explode === 0 ? part?.proxy : undefined;
 
   // The gizmo is a tool of edit mode, and edit mode belongs to one person. A
   // participant who is watching somebody else edit sees the model move; they do

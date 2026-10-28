@@ -1,4 +1,4 @@
-// The room's view tools — a cut plane, and the explode task 08b renders.
+// The room's view tools — a cut plane, and an explode.
 //
 // ONE small rail at the edge of the free canvas, on screen whenever you are in a room and
 // whatever else is open. Not in the amber strip, and not behind the Edit switch: the strip
@@ -33,22 +33,55 @@ import { CUT_AXES, DEFAULT_VIEW_TOOLS, type CutAxis, type ViewTools } from '../.
 const FIRST_CUT = { axis: 'x' as CutAxis, position: 0.5, flip: false };
 
 /**
- * What there is to cut, or why there is not.
+ * Where a fresh explode starts, as a fraction of full spread.
  *
- * Three answers and not a boolean, because "disabled" on its own is the one state a person
- * cannot diagnose: a room with no model in it, a room whose model is still downloading, and
- * a room whose every model is hidden in the Model Tree all look identical from here and want
- * three different things done about them.
+ * Half rather than full, for the same reason the cut starts in the middle: the first frame of
+ * a view tool is the one that teaches what it does, and at full spread a 3 000-part assembly
+ * has its outer parts outside the camera the room had settled on. Half is unmistakably taken
+ * apart and still unmistakably the same product, and the slider is right there for the rest.
  */
-function useCutAvailability(): { available: boolean; reason: string | null } {
+const FIRST_EXPLODE = 0.5;
+
+/**
+ * What there is to work on, or why there is not.
+ *
+ * Three answers rather than a boolean, because "disabled" on its own is the one state a person
+ * cannot diagnose: a room with no model in it, a room whose model is still downloading, and a
+ * room whose every model is hidden in the Model Tree all look identical from here and want
+ * three different things done about them.
+ *
+ * And TWO questions rather than one, because the tools do not need the same thing. A cut is a
+ * plane handed to a material, so anything drawn can be cut — including the bundled sample, whose
+ * parts are React components rather than a parse. An explode pushes parts apart through their
+ * registry (`PartRegistry.setExplode`), and a sample with no registry has nothing to push: the
+ * control would move and the model would not. So the sample's explode is off with a reason on it,
+ * which is the difference between a tool that does nothing and a tool that says it cannot.
+ */
+function useViewToolAvailability(): {
+  available: boolean;
+  reason: string | null;
+  explodable: boolean;
+  explodeReason: string | null;
+} {
   const activeModelType = useStore((state) => state.activeModelType);
   const scene = useStore((state) => state.scene);
   const sceneEntries = useStore((state) => state.sceneEntries);
   const localModelVisibility = useStore((state) => state.localModelVisibility);
 
-  if (activeModelType === 'synth') return { available: true, reason: null };
   if (activeModelType !== 'imported' || scene.models.length === 0) {
-    return { available: false, reason: 'This room has no model to cut.' };
+    const reason =
+      activeModelType === 'synth'
+        ? null
+        : 'This room has no model to cut or explode.';
+    return {
+      available: activeModelType === 'synth',
+      reason,
+      explodable: false,
+      explodeReason:
+        activeModelType === 'synth'
+          ? 'The bundled sample has no parts to pull apart.'
+          : reason,
+    };
   }
   // The same test components/Scene/ImportedModel.tsx makes before it mounts a model: parsed
   // here, and not hidden in the Model Tree. A model still downloading is in the scene and not
@@ -57,13 +90,19 @@ function useCutAvailability(): { available: boolean; reason: string | null } {
   const shown = scene.models.filter(
     (model) => sceneEntries[model.id] !== undefined && sceneModelVisible(model, localModelVisibility),
   );
-  if (shown.length > 0) return { available: true, reason: null };
   const parsed = scene.models.some((model) => sceneEntries[model.id] !== undefined);
-  return {
-    available: false,
-    reason: parsed
+  const reason = shown.length > 0
+    ? null
+    : parsed
       ? 'Every model in this room is hidden in the Model Tree.'
-      : 'The model is still loading.',
+      : 'The model is still loading.';
+  return {
+    available: shown.length > 0,
+    reason,
+    // A parsed entry always carries a registry — it is a required field of SceneModelEntry —
+    // so "shown" and "there is something to push apart" are one question here.
+    explodable: shown.length > 0,
+    explodeReason: reason,
   };
 }
 
@@ -87,9 +126,10 @@ const Row: React.FC<{ label: string; children: React.ReactNode; hint?: string }>
 const RoomViewTools: React.FC<{ className?: string }> = ({ className }) => {
   const viewTools = useStore((state) => state.viewTools);
   const setViewTools = useStore((state) => state.setViewTools);
-  const { available, reason } = useCutAvailability();
+  const { available, reason, explodable, explodeReason } = useViewToolAvailability();
   const [open, setOpen] = useState(false);
   const cut = viewTools.cut;
+  const explode = viewTools.explode;
 
   /**
    * One write, and the write is the whole of the interaction.
@@ -111,6 +151,19 @@ const RoomViewTools: React.FC<{ className?: string }> = ({ className }) => {
     [cut, viewTools, write],
   );
 
+  /**
+   * The explode, as one field of the same value.
+   *
+   * Spread rather than rebuilt so the CUT keeps its own object reference: the component inside
+   * the canvas that resolves the plane subscribes to that reference, and a drag of this slider
+   * that produced a fresh one would re-run the plane's measurement on every step for a section
+   * that has not moved. See components/Scene/ViewToolsCut.tsx.
+   */
+  const setExplode = useCallback(
+    (next: number) => write({ ...viewTools, explode: next }),
+    [viewTools, write],
+  );
+
   // A slider fires per pointer-move and the store throttles the wire, so the last value of a
   // drag can still be waiting for its slot when the finger comes off. Flushed here rather
   // than left to the timer: the release is the moment the person considers the value final,
@@ -120,6 +173,10 @@ const RoomViewTools: React.FC<{ className?: string }> = ({ className }) => {
   const commit = useCallback(() => flushViewTools(), []);
 
   const cutOn = cut !== null;
+  // "Exploded" and not "the slider is not at zero", because a value of 0.004 rounds to 0% on
+  // the label and draws a model nobody could tell apart from an assembled one. The switch is
+  // about whether the room is LOOKING at the model in pieces, and that is a threshold.
+  const exploded = explode > 0;
 
   return (
     <div className={clsx('pointer-events-none flex items-center gap-2', className)}>
@@ -252,26 +309,84 @@ const RoomViewTools: React.FC<{ className?: string }> = ({ className }) => {
               />
             </Row>
 
-            {/* Rendered and disabled on purpose, with the reason on it. The value travels the
-                wire, the room server and the store from this task, so the day the renderer
-                lands this is one `disabled` and one component — and a control that appeared
-                later would be a control the room had to learn twice. */}
-            <Row label="Explode" hint={`${Math.round(viewTools.explode * 100)}%`}>
+            {/* The same shape as the cut above it — a switch and a slider — because it is the
+                same kind of thing: a way of looking at the model that the whole room shares.
+                The switch is what makes the first frame teach anything, and it is the reason
+                the slider starts at half rather than at zero: dragging from zero spends the
+                first few percent on a change nobody can see yet. */}
+            <Row label="Explode" hint={exploded ? `${Math.round(explode * 100)}%` : undefined}>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={!explodable}
+                  data-testid="view-tools-explode-toggle"
+                  onClick={() => setExplode(exploded ? 0 : FIRST_EXPLODE)}
+                  title={
+                    explodable
+                      ? exploded
+                        ? 'Put the model back together'
+                        : 'Pull the model’s parts apart, each away from the middle'
+                      : explodeReason ?? undefined
+                  }
+                  className={clsx(
+                    'h-7 flex-1 rounded-sm border px-2 font-mono text-[9px] font-bold uppercase tracking-widest transition-colors',
+                    !explodable && 'cursor-not-allowed border-gray-200 bg-gray-50 text-gray-300',
+                    explodable && exploded && 'border-black bg-black text-white',
+                    explodable && !exploded && 'border-gray-300 bg-white text-gray-600 hover:border-gray-500 hover:text-black',
+                  )}
+                >
+                  <span className="flex items-center justify-center gap-1">
+                    <Boxes size={10} />
+                    {exploded ? 'On' : 'Off'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  disabled={!exploded}
+                  title="Put the parts back where they were"
+                  aria-label="Reset the explode"
+                  data-testid="view-tools-explode-reset"
+                  onClick={() => setExplode(0)}
+                  className={clsx(
+                    'flex h-7 w-7 items-center justify-center rounded-sm border border-gray-300 bg-white text-gray-500 transition-colors hover:border-gray-500 hover:text-black',
+                    !exploded && 'cursor-not-allowed opacity-40',
+                  )}
+                >
+                  <RotateCcw size={12} />
+                </button>
+              </div>
               <input
                 type="range"
                 min={0}
                 max={100}
                 step={1}
-                disabled
-                value={Math.round(viewTools.explode * 100)}
+                // Off while the model is together, which is what the switch is for, and off
+                // where there is nothing to pull apart — a slider that moved and changed
+                // nothing would be the control this file's own comments warn about.
+                disabled={!exploded || !explodable}
+                value={Math.round(explode * 100)}
                 aria-label="Explode"
                 data-testid="view-tools-explode"
-                className="w-full cursor-not-allowed accent-black opacity-40"
+                onChange={(event) => setExplode(Number(event.target.value) / 100)}
+                onPointerUp={commit}
+                onKeyUp={commit}
+                onBlur={commit}
+                className={clsx(
+                  'w-full accent-black',
+                  (!exploded || !explodable) && 'cursor-not-allowed opacity-40',
+                )}
               />
-              <span className="flex items-center gap-1 font-mono text-[8px] uppercase tracking-wider text-gray-400">
-                <Boxes size={9} />
-                Arrives with task 08b — the room already carries it
-              </span>
+              {/* Why the tools in the amber strip have gone grey, said where the person who
+                  will notice is looking. Not shown while the model is together, because a
+                  sentence explaining a restriction that is not in force is noise. */}
+              {exploded && (
+                <span
+                  data-testid="view-tools-explode-note"
+                  className="font-mono text-[8px] uppercase leading-snug tracking-wider text-gray-400"
+                >
+                  Parts cannot be moved while the model is apart
+                </span>
+              )}
             </Row>
 
             <button
@@ -289,9 +404,9 @@ const RoomViewTools: React.FC<{ className?: string }> = ({ className }) => {
         </div>
       )}
 
-      {/* The rail itself. `active` while the room is cutting, so the state is legible from
-          the canvas without the popover being open — which matters because the popover is
-          open on one screen and the cut is on everybody's. */}
+      {/* The rail itself. `active` while the room is using either tool, so the state is
+          legible from the canvas without the popover being open — which matters because the
+          popover is open on one screen and the cut is on everybody's. */}
       <div className="pointer-events-auto flex flex-col gap-1.5">
         <button
           type="button"
@@ -301,25 +416,35 @@ const RoomViewTools: React.FC<{ className?: string }> = ({ className }) => {
           title={
             available
               ? 'Cut plane and explode — shared with the room'
-              : `View tools — ${reason ?? 'nothing to cut'}`
+              : `View tools — ${reason ?? 'nothing to work on'}`
           }
           onClick={() => setOpen((was) => !was)}
           className={clsx(
             'flex h-9 w-9 items-center justify-center rounded-sm border transition-all duration-200',
-            cutOn
+            cutOn || exploded
               ? 'border-black bg-black text-white shadow-inner'
               : 'border-gray-200 bg-white text-gray-600 hover:border-gray-400 hover:text-black hover:shadow-sm',
           )}
         >
           <Scissors size={15} />
         </button>
-        {cutOn && (
+        {/* What the room is doing, in the two-letter form the rail's own width allows. One
+            line per tool and one element for both, so the badge a cut on its own has always
+            produced is still exactly that cut: a room that has only exploded a model reads
+            `e60`, and the two together read down rather than across because `x50 e60` does
+            not fit in nine of Tailwind's width units at eight pixels of mono. */}
+        {(cutOn || exploded) && (
           <span
             data-testid="view-tools-badge"
-            className="w-9 text-center font-mono text-[8px] font-bold uppercase tracking-wider text-gray-500"
+            className="flex w-9 flex-col text-center font-mono text-[8px] font-bold uppercase leading-tight tracking-wider text-gray-500"
           >
-            {cut.axis}
-            {Math.round(cut.position * 100)}
+            {cutOn && (
+              <span>
+                {cut.axis}
+                {Math.round(cut.position * 100)}
+              </span>
+            )}
+            {exploded && <span>e{Math.round(explode * 100)}</span>}
           </span>
         )}
       </div>

@@ -9,6 +9,7 @@ import Agent from './Agent';
 import LightRig from './LightRig';
 import ThumbnailCapture from './ThumbnailCapture';
 import ViewToolsCut from './ViewToolsCut';
+import ViewToolsExplode from './ViewToolsExplode';
 import { useStore } from '../../store';
 import { useSceneModelLoader } from '../../lib/scene/useSceneModelLoader';
 
@@ -138,6 +139,14 @@ const World: React.FC<WorldProps> = ({ hideAgents: hideAgentsOverride, modelGrou
             would walk its own guide rectangle and hand the plane to the very material
             that draws where the plane is. See components/Scene/ViewToolsCut.tsx. */}
         <ViewToolsCut modelsRef={modelsGroupRef} />
+
+        {/* The room's explode, which renders nothing and writes only to the parsed models'
+            own registries — so it has no reason to be inside the group above and every
+            reason to be beside the other system that turns a shared view-tool value into
+            renderer state. Order against the cut does not matter: the cut resolves its
+            plane against the ASSEMBLED bounds and asks the registry for them.
+            See components/Scene/ViewToolsExplode.tsx. */}
+        <ViewToolsExplode />
 
         <ContactShadows
             opacity={0.4}

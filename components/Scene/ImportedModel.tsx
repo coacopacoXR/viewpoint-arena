@@ -7,7 +7,17 @@ import type { SceneModel } from '../../lib/scene/roomScene';
 import { sceneModelTransform } from '../../lib/scene/roomScene';
 import { applyPartTransforms } from '../../lib/scene/partTransforms';
 import { modelBox, type PartRegistry } from '../../lib/scene/partRegistry';
+import type { BoundsOptions } from '../../lib/scene/partRegistry';
 import { DEFAULT_MAX_COMPONENTS } from '../../lib/componentIndex';
+
+/**
+ * Measure the FILE rather than the view, for `placeImportedGroup` below.
+ *
+ * One constant rather than a literal at the call site: the placement effect runs on every
+ * change to a parsed entry, and an argument that is a fresh object each time is an allocation
+ * per run.
+ */
+const ASSEMBLED: BoundsOptions = { assembled: true };
 
 /**
  * The selection glow for an imported model, as one object rather than per-mesh values.
@@ -37,6 +47,12 @@ const SELECTION_HIGHLIGHT = { color: new THREE.Color(0x0044aa), intensity: 0.5 }
  * space, so measuring that would drop the model on a floor no part is standing on (the
  * render audit's R1). Null for a hand-built entry with no registry, which is a test
  * fixture and nothing in the app.
+ *
+ * The ASSEMBLED box, and that is a correctness requirement rather than a preference: the
+ * explode a room is showing lives in the parts' own positions, so a placement measured off
+ * the exploded model would put the product on a floor its parts had flown up from — and
+ * would do it by writing to the group's own position, which is a real transform and not a
+ * view. Placing is about the FILE, so it asks for the box the file has.
  */
 export function placeImportedGroup(
     group: THREE.Object3D,
@@ -47,7 +63,7 @@ export function placeImportedGroup(
     group.scale.setScalar(scale);
     if (basePosition) group.position.copy(basePosition).multiplyScalar(scale);
     group.updateMatrixWorld(true);
-    const box = modelBox(group, registry, new THREE.Box3());
+    const box = modelBox(group, registry, new THREE.Box3(), ASSEMBLED);
     group.position.y -= box.min.y;
 }
 

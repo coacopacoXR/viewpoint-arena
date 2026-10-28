@@ -1,0 +1,98 @@
+[
+  {
+    "size": 3200,
+    "config": "baseline",
+    "frames": 970,
+    "medianMs": 3.799999952316284,
+    "p95Ms": 6.700000047683716,
+    "maxMs": 21.59999990463257
+  },
+  {
+    "size": 3200,
+    "config": "cut-on hitch window",
+    "frames": 14,
+    "medianMs": 7,
+    "p95Ms": 296.2000000476837,
+    "maxMs": 296.2000000476837
+  },
+  {
+    "size": 3200,
+    "config": "cut on",
+    "frames": 979,
+    "medianMs": 3.799999952316284,
+    "p95Ms": 6.299999952316284,
+    "maxMs": 12.599999904632568
+  },
+  {
+    "size": 3200,
+    "config": "explode slider drag to 0.6",
+    "frames": 37,
+    "medianMs": 8.399999856948853,
+    "p95Ms": 83.79999995231628,
+    "maxMs": 85.20000004768372
+  },
+  {
+    "size": 3200,
+    "config": "explode 0.6",
+    "frames": 1118,
+    "medianMs": 3.4000000953674316,
+    "p95Ms": 5.300000190734863,
+    "maxMs": 9.5
+  },
+  {
+    "size": 3200,
+    "config": "cut on + explode 0.6",
+    "frames": 1107,
+    "medianMs": 3.4000000953674316,
+    "p95Ms": 5.599999904632568,
+    "maxMs": 8.200000047683716
+  },
+  {
+    "size": 10000,
+    "config": "baseline",
+    "frames": 594,
+    "medianMs": 6.6000001430511475,
+    "p95Ms": 10.700000047683716,
+    "maxMs": 27.299999952316284
+  },
+  {
+    "size": 10000,
+    "config": "cut-on hitch window",
+    "frames": 4,
+    "medianMs": 40.299999952316284,
+    "p95Ms": 114.5,
+    "maxMs": 114.5
+  },
+  {
+    "size": 10000,
+    "config": "cut on",
+    "frames": 539,
+    "medianMs": 7.200000047683716,
+    "p95Ms": 11,
+    "maxMs": 21
+  },
+  {
+    "size": 10000,
+    "config": "explode slider drag to 0.6",
+    "frames": 28,
+    "medianMs": 28.200000047683716,
+    "p95Ms": 87.20000004768372,
+    "maxMs": 89.30000019073486
+  },
+  {
+    "size": 10000,
+    "config": "explode 0.6",
+    "frames": 605,
+    "medianMs": 6.5,
+    "p95Ms": 9.700000047683716,
+    "maxMs": 24.600000143051147
+  },
+  {
+    "size": 10000,
+    "config": "cut on + explode 0.6",
+    "frames": 607,
+    "medianMs": 6.400000095367432,
+    "p95Ms": 9.299999952316284,
+    "maxMs": 16.299999952316284
+  }
+]

@@ -72,12 +72,15 @@ import {
   PartGraph,
   isIgnorable,
   treeNames,
+  type BoundsOptions,
   type MotionCullView,
   type PartHandle,
   type PartRegistry,
   type PartState,
   type PickHit,
 } from './partRegistry';
+import { EXPLODE_SPREAD, explodeDirections, explodeObjectOffsets } from './explode';
+import { asUnit } from './viewTools';
 import {
   partHighlightFlags,
   partHighlightMaterial,
@@ -183,6 +186,15 @@ const scratchQuaternion = new Quaternion();
 const scratchScale = new Vector3();
 const scratchEuler = new Euler();
 const IDENTITY = new Matrix4();
+/**
+ * Scratch for a part's DRAWN matrix, which is its logical one pushed out by the room's
+ * explode. Its own rather than `scratchMatrix` because `worldMatrixOf` is handed
+ * `scratchMatrix` by the callers that then read a box off it, and a helper that scribbled
+ * over its caller's scratch would answer a matrix from halfway through its own composition.
+ */
+const scratchDrawn = new Matrix4();
+/** The offset of a part the explode plan has nothing to say about, which stays where it is. */
+const ZERO_OFFSET = new Vector3();
 
 /** One BatchedMesh, and the private bookkeeping that says which part is in which slot. */
 interface Batch {
@@ -208,6 +220,15 @@ interface Batch {
    * a program compile, and a model whose selections are a part or two never pays either.
    */
   glow: BatchGlow | null;
+  /**
+   * The batch's own sphere as three measured it over the ASSEMBLED model, taken the first time
+   * an explode needs one. `BatchedMesh.boundingSphere` is what the renderer frustum-culls by on
+   * every frame and it is derived from the instances' matrices, so a model whose instances move
+   * every slider step either rebuilds it every step — a walk of every instance, inside the
+   * frame the drag is trying to keep — or keeps a sphere that no longer contains them and
+   * culls the outer parts away. `writeExplode` grows this one instead: see there.
+   */
+  assembledSphere: Sphere | null;
 }
 
 /**
@@ -541,6 +562,32 @@ export class BatchedPartRegistry implements PartRegistry {
   private proxy: Object3D | null = null;
   private anchor: Object3D | null = null;
 
+  // ─── the room's explode ─────────────────────────────────────────────────────
+  //
+  // Two vectors per part rather than one, because this registry draws parts two ways. A
+  // slot's matrix is already in the ROOT's space and takes the direction as it stands — a
+  // translation added to its last column — while a part batching refused kept its Object3D and
+  // with it a place in a real hierarchy, so its offset has to be the parent-space one that
+  // leaves it standing at its own direction once its ancestors' offsets are folded in. See
+  // lib/scene/explode.ts for the second of those, and MeshPartRegistry for a registry where
+  // every part needs it.
+
+  /** What is written to the parts right now. 0 while the room is assembled. */
+  private explodeFactor = 0;
+  /** `moved.version` when the plan was built, or -1 for "never". See `setExplode`. */
+  private explodeBuiltAt = -1;
+  /** How many times the applied explode changed, added to `moved.version` to key the cull index. */
+  private explodeVersion = 0;
+  /** Per part, in the ROOT's space, at factor 1. Parallel to `records`. */
+  private readonly explodeDirections: Vector3[] = [];
+  /** The longest of those, which is what growing a batch's culling sphere by needs. */
+  private explodeReach = 0;
+  /** The same, keyed by object, for the parts batching left in the graph. */
+  private readonly explodeDirectionOf = new Map<Object3D, Vector3>();
+  /** Per object batching left in the graph, in its PARENT's space, at factor 1. */
+  private readonly explodeOffsetOf = new Map<Object3D, Vector3>();
+  private readonly explodeBox = new Box3();
+
   constructor(root: Object3D, tree?: SceneNode | null) {
     this.root = root;
     // Current before anything is measured off it: every matrix below is relative to the
@@ -672,7 +719,12 @@ export class BatchedPartRegistry implements PartRegistry {
    * LineSegments or Points a loader left behind in a branch buildSceneTree pruned. Leaving
    * those out would shrink the box under a model that has them.
    */
-  bounds(out: Box3): Box3 {
+  bounds(out: Box3, options?: BoundsOptions): Box3 {
+    return this.withExplodeOff(options, () => this.measureBounds(out));
+  }
+
+  /** What `bounds` measures. Split out so the assembled variant can wrap it. */
+  private measureBounds(out: Box3): Box3 {
     out.makeEmpty();
     for (const record of this.records) {
       if (record.slot < 0 || !record.localBox) continue;
@@ -692,8 +744,8 @@ export class BatchedPartRegistry implements PartRegistry {
   // off really is not drawn — and deliberately does not, because then the two registries
   // would frame a thumbnail differently and the difference would depend on nothing but how
   // many parts the file happened to have.
-  visibleBounds(out: Box3): Box3 {
-    return this.root.visible ? this.bounds(out) : out.makeEmpty();
+  visibleBounds(out: Box3, options?: BoundsOptions): Box3 {
+    return this.root.visible ? this.bounds(out, options) : out.makeEmpty();
   }
 
   partChainForHit(hit: PickHit): string[] | null {
@@ -765,13 +817,14 @@ export class BatchedPartRegistry implements PartRegistry {
   // The spheres are in the ROOT's space and so is the eye, which is what makes a model that has
   // been placed, dragged or scaled cost nothing here: `record.matrix` is already the root-relative
   // matrix every box and slot reads. Only a part that MOVED stales a sphere, and a part moves
-  // through `writeTransform`, which is the one place `moved` grows — so comparing its size is a
-  // complete dirtiness test with no bookkeeping at the write site.
+  // through `writeTransform` — which is the one place `moved` grows — or through the room's
+  // explode, which moves every one of them at once and is the one place `explodeVersion` grows.
+  // The two added together are a complete dirtiness test with no bookkeeping at either site.
   motionCull(view: MotionCullView | null): number {
     if (view === null) {
       return this.cullIndex.restore((part) => this.writeCulled(this.records[part], false));
     }
-    if (this.cullBuiltAt !== this.moved.version) this.buildCullIndex();
+    if (this.cullBuiltAt !== this.poseVersion()) this.buildCullIndex();
     this.root.updateWorldMatrix(true, false);
     this.cullInverse.copy(this.root.matrixWorld).invert();
     this.cullEye.copy(view.eye).applyMatrix4(this.cullInverse);
@@ -818,7 +871,7 @@ export class BatchedPartRegistry implements PartRegistry {
         sphere = record.localBox.getBoundingSphere(new Sphere());
         this.cullSpheres.set(record.localBox, sphere);
       }
-      scratchPosition.copy(sphere.center).applyMatrix4(record.matrix);
+      scratchPosition.copy(sphere.center).applyMatrix4(this.drawnMatrixOf(record, scratchDrawn));
       // The part's own scale, which is the only thing between its geometry's space and the
       // root's. Largest axis, so a non-uniform one under-culls rather than hides something big.
       scratchScale.setFromMatrixScale(record.matrix);
@@ -832,7 +885,137 @@ export class BatchedPartRegistry implements PartRegistry {
       );
     }
     this.cullIndex.finish();
-    this.cullBuiltAt = this.moved.version;
+    this.cullBuiltAt = this.poseVersion();
+  }
+
+  // ─── the room's explode ─────────────────────────────────────────────────────
+
+  setExplode(factor: number): number {
+    const next = asUnit(factor) ?? 0;
+    // A part moved since the plan was built, so both the centres it was measured from and the
+    // logical matrices it was folded into are wrong. Assembled first: the directions come off
+    // the pose the parts are standing in, and measuring an exploded model would push every
+    // part further out on the next step, so a slider held still would creep the product apart.
+    if (this.explodeBuiltAt !== this.moved.version) {
+      this.writeExplode(0);
+      this.buildExplode();
+    }
+    if (next === this.explodeFactor) return 0;
+    this.explodeVersion += 1;
+    return this.writeExplode(next);
+  }
+
+  /** The pose version the cull index is keyed on: a part moved, or the explode did. */
+  private poseVersion(): number {
+    return this.moved.version + this.explodeVersion;
+  }
+
+  /**
+   * Measure the plan. Once per model and once per part that moves while the room is exploded,
+   * never per frame: this is the half that walks bounding boxes, and `writeExplode` is the
+   * half a slider step pays for.
+   */
+  private buildExplode(): void {
+    // `bounds` with the explode off by construction: `writeExplode(0)` ran first, so what it
+    // measures is the assembled model, which is the model the directions mean.
+    explodeDirections(this.root, this.handles, this.bounds(this.explodeBox), this.explodeDirections);
+    this.explodeReach = 0;
+    for (const direction of this.explodeDirections) {
+      this.explodeReach = Math.max(this.explodeReach, direction.length());
+    }
+    this.explodeDirectionOf.clear();
+    for (const record of this.records) {
+      // Only the parts still drawn through an Object3D need the parent-space offset. A slot's
+      // matrix is in the root's space already and takes its direction as it stands, and the
+      // record is the thing the plan indexes by — `explodeDirections[record.index]` is the
+      // same vector the handle was measured from.
+      if (record.object !== null && record.slot < 0) {
+        this.explodeDirectionOf.set(record.object, this.explodeDirections[record.index]);
+      }
+    }
+    explodeObjectOffsets(this.root, this.explodeDirectionOf, this.explodeOffsetOf);
+    this.explodeBuiltAt = this.moved.version;
+  }
+
+  /**
+   * Write the plan at `factor`: one matrix per slot, one position per part batching left in
+   * the graph, and nothing measured. This is the whole cost of a slider step.
+   *
+   * The batch's own sphere goes with it, because three frustum-culls a BatchedMesh by a sphere
+   * it derives from its instances' matrices and geometries — and a sphere that still bounds the
+   * assembled model does not bound the exploded one, so a camera looking at the outer parts
+   * would drop the whole batch and the model would blink out at the edge of the frame.
+   */
+  private writeExplode(factor: number): number {
+    this.explodeFactor = factor;
+    const reach = this.explodeReach * factor * EXPLODE_SPREAD;
+    for (const batch of this.batches) {
+      // The sphere is GROWN by the furthest any part moved rather than thrown away and
+      // rebuilt on the next cull: deriving it is a walk of every instance, which inside a
+      // slider step is a walk of ten thousand instances per frame drawn. A translation of at
+      // most `reach` cannot put a point outside the assembled sphere's radius plus `reach`,
+      // so the grown sphere contains every part at every factor — conservative, never culls
+      // a part that is on screen, and costs three numbers per batch per step.
+      if (batch.assembledSphere === null) {
+        if (batch.mesh.boundingSphere === null) batch.mesh.computeBoundingSphere();
+        batch.assembledSphere = batch.mesh.boundingSphere?.clone() ?? null;
+      }
+      const grown = batch.mesh.boundingSphere;
+      if (grown && batch.assembledSphere) {
+        grown.center.copy(batch.assembledSphere.center);
+        grown.radius = batch.assembledSphere.radius + reach;
+      }
+    }
+    let written = 0;
+    for (const record of this.records) {
+      if (record.batch && record.slot >= 0) {
+        record.batch.mesh.setMatrixAt(record.slot, this.drawnMatrixOf(record, scratchDrawn));
+        if (record.overlay) record.overlay.matrix.copy(scratchDrawn);
+        written += 1;
+      } else if (record.object !== null) {
+        this.writeDrawnObject(record);
+        written += 1;
+      }
+    }
+    return written;
+  }
+
+  /**
+   * The matrix this part is DRAWN with: its logical one, pushed out along its own direction by
+   * the room's explode.
+   *
+   * A translation added to the last column rather than a matrix multiply, because pushing a
+   * part along a line in the ROOT's space is exactly that when the matrix is already in the
+   * root's space — and it is, which is the property that makes a batched part's explode three
+   * additions and nothing else.
+   */
+  private drawnMatrixOf(record: PartRecord, out: Matrix4): Matrix4 {
+    out.copy(record.matrix);
+    if (this.explodeFactor === 0) return out;
+    const offset = this.explodeDirections[record.index] ?? ZERO_OFFSET;
+    if (offset.x === 0 && offset.y === 0 && offset.z === 0) return out;
+    const scale = this.explodeFactor * EXPLODE_SPREAD;
+    const e = out.elements;
+    e[12] += offset.x * scale;
+    e[13] += offset.y * scale;
+    e[14] += offset.z * scale;
+    return out;
+  }
+
+  /**
+   * Run a measurement with the explode taken back off, and put it back afterwards.
+   *
+   * Only ever the cut plane's, and only while the room is exploded — at factor 0 there is
+   * nothing to take off and the measurement runs as it always did, so the room's ordinary
+   * frames pay nothing for the option existing.
+   */
+  private withExplodeOff<T>(options: BoundsOptions | undefined, measure: () => T): T {
+    if (!options?.assembled || this.explodeFactor === 0) return measure();
+    const was = this.explodeFactor;
+    this.writeExplode(0);
+    const answer = measure();
+    this.writeExplode(was);
+    return answer;
   }
 
   movedPartIds(): readonly string[] {
@@ -906,6 +1089,14 @@ export class BatchedPartRegistry implements PartRegistry {
   }
 
   dispose(): void {
+    // Assembled first, while the records and the objects they name still exist: a part batching
+    // left in the graph keeps its Object3D, and one left standing where an explode put it would
+    // be a model nobody can put back together.
+    this.writeExplode(0);
+    this.explodeDirections.length = 0;
+    this.explodeDirectionOf.clear();
+    this.explodeOffsetOf.clear();
+    this.explodeBuiltAt = -1;
     for (const batch of this.batches) {
       for (const geometry of batch.overlays.values()) geometry.dispose();
       batch.overlays.clear();
@@ -1031,7 +1222,7 @@ export class BatchedPartRegistry implements PartRegistry {
     mesh.receiveShadow = plan.receiveShadow;
     this.root.add(mesh);
 
-    const batch: Batch = { mesh, partAtSlot: [], overlays: new Map(), glow: null };
+    const batch: Batch = { mesh, partAtSlot: [], overlays: new Map(), glow: null, assembledSphere: null };
     this.batchOf.set(mesh, batch);
 
     const geometryIdOf = new Map<BufferGeometry, number>();
@@ -1118,20 +1309,49 @@ export class BatchedPartRegistry implements PartRegistry {
     record.matrix.multiply(scratchCompose);
 
     if (record.batch && record.slot >= 0) {
-      record.batch.mesh.setMatrixAt(record.slot, record.matrix);
+      record.batch.mesh.setMatrixAt(record.slot, this.drawnMatrixOf(record, scratchDrawn));
       // The batch's own bounding sphere is cached over its instances and `setMatrixAt` does
       // not invalidate it. Left stale, a part dragged well outside the model would be frustum
       // culled along with the whole batch and vanish out of somebody's hand mid-drag.
       record.batch.mesh.boundingSphere = null;
       record.batch.mesh.boundingBox = null;
-      if (record.overlay) record.overlay.matrix.copy(record.matrix);
+      // The sphere an explode grows is measured over the pose the batch was standing in, and
+      // a part that just moved has left that pose — so the next explode measures a new one
+      // rather than growing a sphere that no longer contains the assembled model.
+      record.batch.assembledSphere = null;
+      if (record.overlay) record.overlay.matrix.copy(scratchDrawn);
     }
-    if (record.object) writeLocal(record.object, record.local);
+    // The part batching left in the graph, standing where the room's explode puts it — a write
+    // landing while the model is exploded (an override from somebody else, an undo) would
+    // otherwise collapse that one part and leave it inside an assembly that had been taken apart.
+    this.writeDrawnObject(record);
 
     for (const childId of this.graph.childrenOf.get(record.id) ?? []) {
       const child = this.indexOf.get(childId);
       if (child !== undefined) this.refreshFrom(child, record.matrix);
     }
+  }
+
+  /**
+   * Stand a part batching left in the graph where the room's explode puts it.
+   *
+   * The logical transform first and the offset on top of it, rather than an offset added to
+   * wherever the object happened to be: `record.local` is the part's own pose and never carries
+   * an explode, so a factor of 0 writes it back exactly.
+   */
+  private writeDrawnObject(record: PartRecord): void {
+    const object = record.object;
+    // Not the model's own root, ever. Its transform is the PLACEMENT — the centring and scale
+    // components/Scene/ImportedModel.tsx writes onto it after this record was built, and the
+    // wrapper the amber strip's whole-model Move drags is above it — so writing `record.local`
+    // back would put the product where the parse found it rather than where the room put it.
+    // It is also the one part with nothing to move: its box IS the model's box, so its centre
+    // is the centre every other part moves away from and its direction is the zero vector.
+    if (!object || object === this.root) return;
+    writeLocal(object, record.local);
+    if (this.explodeFactor === 0) return;
+    const offset = this.explodeOffsetOf.get(object);
+    if (offset) object.position.addScaledVector(offset, this.explodeFactor * EXPLODE_SPREAD);
   }
 
   /** This part alone, which is what a descent writes; the subtree is the descent's own job. */
@@ -1251,9 +1471,11 @@ export class BatchedPartRegistry implements PartRegistry {
     overlay.castShadow = batch.mesh.castShadow;
     overlay.receiveShadow = batch.mesh.receiveShadow;
     // Positioned by an explicit matrix rather than by position/rotation/scale, for the same
-    // reason the gizmo's anchor is: the instance matrix is a chain and may be a shear.
+    // reason the gizmo's anchor is: the instance matrix is a chain and may be a shear. The
+    // DRAWN matrix, because the overlay IS the part being drawn and a glow that stayed where
+    // the assembled model had it would sit in empty space beside the part it belongs to.
     overlay.matrixAutoUpdate = false;
-    overlay.matrix.copy(record.matrix);
+    overlay.matrix.copy(this.drawnMatrixOf(record, scratchDrawn));
     batch.mesh.add(overlay);
     record.overlay = overlay;
     this.overlayIndex.set(overlay, index);
@@ -1360,12 +1582,19 @@ export class BatchedPartRegistry implements PartRegistry {
     out.union(scratchBox.copy(record.localBox).applyMatrix4(record.object.matrixWorld));
   }
 
-  /** The part's matrix in WORLD space, which is its root-relative one under the root's. */
+  /**
+   * The part's matrix in WORLD space, which is its root-relative one under the root's.
+   *
+   * The DRAWN one and not the logical one, so every measurement that goes through here —
+   * `bounds`, `getBoundingBox`, `boxOfSubtree` — answers where the part is on screen. A room
+   * that has exploded a model frames the box its parts are standing on, and a handle asked for
+   * a part's centre answers the centre of the part somebody can see.
+   */
   private worldMatrixOf(record: PartRecord, out: Matrix4): Matrix4 {
     const batch = record.batch;
-    if (!batch) return out.copy(record.matrix);
+    if (!batch) return out.copy(this.drawnMatrixOf(record, scratchDrawn));
     batch.mesh.updateWorldMatrix(true, false);
-    return out.multiplyMatrices(batch.mesh.matrixWorld, record.matrix);
+    return out.multiplyMatrices(batch.mesh.matrixWorld, this.drawnMatrixOf(record, scratchDrawn));
   }
 
   /** This part, then each of its ancestors that has an id. Nearest first. */

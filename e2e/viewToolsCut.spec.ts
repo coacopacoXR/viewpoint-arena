@@ -1,11 +1,13 @@
-// The room's cut plane, in two browsers in one room — task 08a.
+// The room's cut plane and its explode view, in two browsers in one room — tasks 08a and 08b.
 //
 // WHAT THIS CHECKS THAT A UNIT TEST CANNOT. lib/scene/__tests__/cutPlane.test.ts asserts,
 // against a real Raycaster and real materials, that the plane is resolved correctly and that
-// every material a model can be drawn with ends up holding it. What it cannot assert is that
-// a shader compiled with the cap in it actually DRAWS a section, and it cannot assert that the
-// section one browser drags arrives on another browser's screen. Both are claims about a GPU
-// and a websocket, and both are the reason this task exists.
+// every material a model can be drawn with ends up holding it. lib/scene/__tests__/explode.test.ts
+// asserts, against both registries, that every part lands where the rule puts it. What neither
+// can assert is that a shader compiled with the cap in it actually DRAWS a section, that ten
+// thousand instance matrices written from a slider actually move on screen, or that a value one
+// browser drags arrives on another browser's screen. Those are claims about a GPU and a
+// websocket, and they are the reason this file exists.
 //
 // So the assertions here are about pixels and about two contexts agreeing:
 //
@@ -15,7 +17,11 @@
 //     independent cameras settling and nothing else;
 //   • moving the slider in one moves the section in the other, and the other's own control
 //     says the new value without anybody touching it;
-//   • turning the cut off gives both of them the whole model back.
+//   • turning the cut off gives both of them the whole model back;
+//   • and the explode does the same three things for a model with parts in it: it changes both
+//     screens from one drag, it leaves the cut where it was, and putting it back to zero gives
+//     both screens the picture they had — pixel for pixel, which is the claim that a view tool
+//     left nothing behind it.
 //
 // NOT PART OF `npm run test:e2e`. That suite runs against a built preview on 4173 talking to
 // whatever room server is on 1999, and this check needs a `partykit dev` of the WORKING TREE
@@ -24,17 +30,39 @@
 // opt-in, and the header says how to run it:
 //
 //     npx partykit dev --port 1998
-//     VITE_PARTYKIT_HOST=localhost:1998 npx vite --port 5199 --strictPort
+//     VIEWPOINT_CONFIG=$(node e2e/viewtools-model-config.mjs) \
+//       VP_E2E_TURN_SECRET=x VP_E2E_DB_URL=http://127.0.0.1:9/ VP_E2E_DB_ANON_KEY=x \
+//       VITE_PARTYKIT_HOST=localhost:1998 npx vite --port 5199 --strictPort
 //     VP_VIEWTOOLS_E2E=1 npx playwright test e2e/viewToolsCut.spec.ts --project=chromium
 //
 // Both servers are started by hand rather than by a `webServer` entry because the repo's
 // playwright.config.ts already owns 4173 and 1999, and 1999 is a developer's own room server:
 // a check that restarted it would be a check that closed somebody's meeting.
+//
+// `VIEWPOINT_CONFIG` and its three dummy variables are only needed by the EXPLODE test, and
+// only on a machine with no viewpoint.config.ts of its own: that test imports a model through
+// the real file input, which goes to POST /api/models, which needs somewhere to put the bytes.
+// Without a config the route answers 503 storage_unavailable and the import stops before it
+// parses anything, which looks like a bug in the explode and is not. The little script prints
+// the same config scripts/perf/serve.mjs builds for the benchmark — every block set to the
+// variant that needs nothing from the machine, and model storage pointed at a scratch
+// directory under the already-gitignored perf/fixtures/.
 
 import { test, expect, type Browser, type Page } from "@playwright/test";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 /** Where the app under test is. A dev server of the working tree, not the built preview. */
 const APP = process.env.VP_VIEWTOOLS_APP ?? "http://localhost:5199";
+
+/** The repo, which is Playwright's working directory — the same answer the perf spec uses. */
+const REPO_ROOT = process.cwd();
+/** Where `scripts/perf/make-assembly.mjs` writes, and where this spec reads from. */
+const FIXTURE_DIR = join(REPO_ROOT, "perf", "fixtures");
+const GENERATOR = join(REPO_ROOT, "scripts", "perf", "make-assembly.mjs");
+/** The explode test's screenshots, beside the cut test's in the gitignored test-results. */
+const EXPLODE_SHOT_DIR = join(REPO_ROOT, "test-results", "viewtools-explode");
 
 /**
  * How far apart two browsers' colour counts may be, as a fraction of the larger.
@@ -414,3 +442,356 @@ async function openTools(session: Session) {
 async function shot(session: Session, name: string) {
   await session.page.screenshot({ path: `test-results/viewtools-${name}.png` });
 }
+
+// ─── the explode view ────────────────────────────────────────────────────────
+//
+// Everything below serves the second test in this file. It measures pictures rather than
+// colours because the model it measures is a generated assembly in six finishes of grey, and
+// the `palette` above counts the saturated colours the bundled sample happens to be painted
+// in — a predicate set that has nothing to say about this one. What a picture-to-picture
+// comparison can say is the three things the task asks for: that a drag in one browser
+// changed the picture in BOTH, that the section survived it, and that putting the value back
+// to zero gave both screens the picture they had. The last of those is the strongest, because
+// it is exact: a view tool that left anything behind would not come back to the same pixels.
+
+/** How long an import is given to reach the screen. The 800-part fixture is 85 MB. */
+const IMPORT_TIMEOUT_MS = 10 * 60_000;
+/**
+ * How much of the picture has to change for "the model arrived", "the cut drew" and "the
+ * explode moved", as a fraction of the canvas.
+ *
+ * Small because the model is small: an assembly normalised to two scene units is a few percent
+ * of a 1440x900 canvas even zoomed in, and these are the fractions of the WHOLE canvas. What
+ * they are not is arbitrary — a section through the middle of the product and an explode at 0.6
+ * each move a good part of the model's own pixels, which is comfortably above the antialiasing
+ * noise floor of two shots of an unchanged scene (measured at under 0.0005 by
+ * `waitForCameraAtRest`).
+ */
+const ARRIVED = 0.002;
+/**
+ * How much the picture may differ from the one it had before the explode, once the explode is
+ * back at zero. Tighter than ARRIVED on purpose: "the view came back" is the claim that a view
+ * tool left nothing behind, and a tolerance wide enough to forgive a part left pushed out would
+ * forgive exactly the bug this is for.
+ */
+const RESTORED = 0.0015;
+
+/** A picture of the moment, in the report's own directory rather than the suite's scratch. */
+async function shotTo(dir: string, session: Session, name: string) {
+  mkdirSync(dir, { recursive: true });
+  await session.page.screenshot({ path: join(dir, `viewtools-${name}.png`) });
+}
+
+/**
+ * The assembly the explode is checked on, generated if it is not there.
+ *
+ * The same fixture the benchmark imports, at its smallest size, and for the same reason: it is
+ * built by a seeded generator so it is the same assembly on every machine, it is never
+ * committed because a binary nobody can diff does not belong in a repo, and at 800 parts it is
+ * over lib/scene/batchedParts.ts's BATCH_MIN_PARTS — so the picture this test looks at is the
+ * batched one, where a part has no Object3D of its own and the explode is ten thousand
+ * instance matrices rather than ten thousand positions. `VP_VIEWTOOLS_FIXTURE` points it at
+ * any other GLB, which is how a person checks the spread against a real product.
+ */
+function fixtureFile(): string {
+  const chosen = process.env.VP_VIEWTOOLS_FIXTURE;
+  if (chosen) {
+    const file = resolve(chosen);
+    expect(existsSync(file), `VP_VIEWTOOLS_FIXTURE points at ${file}, which is not there`).toBe(true);
+    return file;
+  }
+  const parts = 800;
+  const file = join(FIXTURE_DIR, `assembly-${parts}.glb`);
+  if (existsSync(file)) return file;
+  mkdirSync(FIXTURE_DIR, { recursive: true });
+  execFileSync(process.execPath, [GENERATOR, "--parts", String(parts)], {
+    cwd: REPO_ROOT,
+    stdio: "inherit",
+  });
+  expect(existsSync(file), "make-assembly.mjs did not write the fixture").toBe(true);
+  return file;
+}
+
+/**
+ * Shut the popover before a picture is taken of the canvas.
+ *
+ * It is a white panel full of black buttons over the thing being measured, and it is open on
+ * whichever browser made the drag and shut on the other — so leaving it to the caller would
+ * compare one screen's model against the other's control panel. `palette` above does the same
+ * for the same reason.
+ */
+async function closeTools(session: Session) {
+  const popover = session.page.locator('[data-testid="view-tools-popover"]');
+  if (!(await popover.isVisible().catch(() => false))) return;
+  await session.page.locator('[data-testid="view-tools-toggle"]').click();
+  await popover.waitFor({ state: "detached", timeout: 5_000 }).catch(() => {});
+}
+
+/** Open the popover if `closeTools` shut it. The mirror of the cut test's `openTools`. */
+async function openToolsAgain(session: Session) {
+  const popover = session.page.locator('[data-testid="view-tools-popover"]');
+  if (await popover.isVisible().catch(() => false)) return;
+  await session.page.locator('[data-testid="view-tools-toggle"]').click();
+  await popover.waitFor({ state: "visible", timeout: 5_000 });
+}
+
+/** The canvas as a PNG, at its own resolution, with the popover out of the way. */
+async function canvasShot(session: Session): Promise<string> {
+  await closeTools(session);
+  const url = await session.page.evaluate(() => {
+    // The three.js canvas and not just any canvas: R3F stamps `data-engine` on the one it made,
+    // and the room also mounts a drawing canvas and a marker canvas that would answer a bare
+    // `querySelector('canvas')` depending on what is open.
+    const source = document.querySelector<HTMLCanvasElement>("canvas[data-engine]");
+    return source ? source.toDataURL("image/png") : "";
+  });
+  expect(url, "the room has no three.js canvas on it").not.toBe("");
+  return url;
+}
+
+/**
+ * How much of two pictures differs, as a fraction of their pixels.
+ *
+ * Run in a page rather than in Node because decoding a PNG needs one, and adding a decoder to
+ * answer a question the browser already answers would be a dependency for nothing. A pixel
+ * counts as changed when its three channels differ by more than about eight each, which is
+ * above antialiasing and dithering and below anything a part moving would do.
+ *
+ * Compared at the smaller of the two sizes because the room drops its resolution while the
+ * camera moves and restores it at rest (components/Scene/MotionQuality.tsx) — two shots of an
+ * unchanged scene can come from buffers of different sizes, and calling that a difference
+ * would make every assertion in this file about the resolution rather than the model.
+ */
+async function diffFraction(session: Session, a: string, b: string): Promise<number> {
+  return session.page.evaluate(async ([left, right]) => {
+    const load = (url: string) =>
+      new Promise<HTMLImageElement>((done, fail) => {
+        const image = new Image();
+        image.onload = () => done(image);
+        image.onerror = () => fail(new Error("a canvas shot could not be decoded"));
+        image.src = url;
+      });
+    const [one, two] = await Promise.all([load(left), load(right)]);
+    const width = Math.min(one.naturalWidth, two.naturalWidth);
+    const height = Math.min(one.naturalHeight, two.naturalHeight);
+    if (width === 0 || height === 0) return 1;
+    const scratch = document.createElement("canvas");
+    scratch.width = width;
+    scratch.height = height;
+    const ctx = scratch.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return 1;
+    ctx.drawImage(one, 0, 0, width, height);
+    const before = ctx.getImageData(0, 0, width, height).data;
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(two, 0, 0, width, height);
+    const after = ctx.getImageData(0, 0, width, height).data;
+    let changed = 0;
+    for (let i = 0; i < before.length; i += 4) {
+      const spread =
+        Math.abs(before[i] - after[i]) +
+        Math.abs(before[i + 1] - after[i + 1]) +
+        Math.abs(before[i + 2] - after[i + 2]);
+      if (spread > 24) changed += 1;
+    }
+    return changed / (width * height);
+  }, [a, b]);
+}
+
+/** Wait until a screen is drawing something it was not, which is how an import is detected. */
+async function waitForChangeFrom(session: Session, reference: string, what: string, ms: number) {
+  const deadline = Date.now() + ms;
+  let last = 0;
+  while (Date.now() < deadline) {
+    last = await diffFraction(session, reference, await canvasShot(session));
+    if (last > ARRIVED) return last;
+    await session.page.waitForTimeout(500);
+  }
+  throw new Error(`${what} never reached the canvas (last difference ${last.toFixed(4)})`);
+}
+
+/**
+ * Wait until two consecutive pictures are the same, which is what "the camera has landed"
+ * means here.
+ *
+ * The room flies the camera in to frame a model it has just mounted and drops its resolution
+ * while that happens, so a picture taken mid-flight is of a model that is still growing. Every
+ * comparison below is between two pictures of a settled room, and this is what makes them so.
+ */
+async function waitForCameraAtRest(session: Session, what: string) {
+  let previous = await canvasShot(session);
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    await session.page.waitForTimeout(600);
+    const now = await canvasShot(session);
+    if ((await diffFraction(session, previous, now)) < 0.001) return now;
+    previous = now;
+  }
+  throw new Error(`${what} never settled`);
+}
+
+/**
+ * Bring the camera in on the model, the way a person would before looking at a section.
+ *
+ * The room mounts a model at the default camera distance, which for an assembly normalised to
+ * two scene units is a product a hundred pixels tall in a 1440x900 canvas — and a picture-to-
+ * picture comparison of a model that size is a comparison of antialiasing. The same wheel
+ * input on both browsers, from the same default camera, is also what makes the two screens
+ * comparable at all: independent cameras are the one thing this file cannot control, and a
+ * shared zoom is the closest thing to controlling them.
+ */
+async function zoomIn(session: Session) {
+  await session.page.mouse.move(700, 450);
+  for (let step = 0; step < 6; step += 1) {
+    await session.page.mouse.wheel(0, -240);
+    await session.page.waitForTimeout(120);
+  }
+  await waitForCameraAtRest(session, "the zoomed camera");
+}
+
+/** Import a model the way a person does, through the room's own file input. */
+async function putAModelInRoom(host: Session, empty: string, file: string) {
+  await host.page.waitForSelector('[data-testid="empty-scene-prompt"]', { timeout: 90_000 });
+  await host.page.setInputFiles('input[type="file"]', file);
+  // The prompt goes when the scene stops being empty, which is when the room has accepted the
+  // file — not when the parse has finished, and certainly not when the first frame is on
+  // screen. The two waits below are for those.
+  await host.page.waitForFunction(
+    () => document.querySelector('[data-testid="empty-scene-prompt"]') === null,
+    undefined,
+    { timeout: IMPORT_TIMEOUT_MS },
+  );
+  await waitForChangeFrom(host, empty, "the imported assembly", IMPORT_TIMEOUT_MS);
+}
+
+test.describe("the room's explode view, in two browsers", () => {
+  test.skip(
+    process.env.VP_VIEWTOOLS_E2E !== "1",
+    "needs a partykit dev of the working tree and a dev server on 5199 — see the header of this file",
+  );
+  // An 85 MB import twice over, a websocket round trip and a shader compile. The suite default
+  // is sized for a lobby page that loads and says its name.
+  test.setTimeout(20 * 60_000);
+
+  test("an explode one browser drags is the explode the other browser sees", async ({ browser }) => {
+    const file = fixtureFile();
+    const room = `viewtools-explode-${Date.now()}`;
+    const host = await enterRoom(browser, room, "Olga Host");
+    const guest = await enterRoom(browser, room, "Ben Participant");
+
+    try {
+      // ── a model with parts in it, and a picture of the room before either tool ───
+      // Taken before the import so that "the model arrived" is a comparison against a known
+      // empty room rather than a guess about how long a parse takes.
+      const emptyRoom = await canvasShot(host);
+      await putAModelInRoom(host, emptyRoom, file);
+      await waitForCameraAtRest(host, "the host's camera");
+      await hostGetsSomebodyIn(guest, host);
+      await waitForChangeFrom(guest, emptyRoom, "the guest's copy of the assembly", IMPORT_TIMEOUT_MS);
+      await waitForCameraAtRest(guest, "the guest's camera");
+
+      await zoomIn(host);
+      await zoomIn(guest);
+      const assembledHost = await canvasShot(host);
+      const assembledGuest = await canvasShot(guest);
+      await shotTo(EXPLODE_SHOT_DIR, host, "assembled-host");
+      await shotTo(EXPLODE_SHOT_DIR, guest, "assembled-guest");
+
+      // ── the cut first, so the explode is dragged on top of a section ────────────
+      await openToolsAgain(host);
+      await host.page.locator('[data-testid="view-tools-cut-toggle"]').click();
+      await expect(guest.page.locator('[data-testid="view-tools-badge"]')).toHaveText(/^x50$/, {
+        timeout: 15_000,
+      });
+      await settle(host, guest);
+      await waitForCameraAtRest(host, "the host's camera under the cut");
+      await waitForCameraAtRest(guest, "the guest's camera under the cut");
+      const cutHost = await canvasShot(host);
+      const cutGuest = await canvasShot(guest);
+      // The section removed something on both screens, which is 08a's claim and the premise
+      // of everything below: an explode dragged over a cut that never drew would prove
+      // nothing about either.
+      const cutChangedHost = await diffFraction(host, assembledHost, cutHost);
+      const cutChangedGuest = await diffFraction(guest, assembledGuest, cutGuest);
+      expect(cutChangedHost).toBeGreaterThan(ARRIVED);
+      expect(cutChangedGuest).toBeGreaterThan(ARRIVED);
+
+      await shotTo(EXPLODE_SHOT_DIR, host, "cut-on-host");
+      await shotTo(EXPLODE_SHOT_DIR, guest, "cut-on-guest");
+
+      // ── the explode, dragged in one browser ────────────────────────────────────
+      await openToolsAgain(host);
+      await host.page.locator('[data-testid="view-tools-explode-toggle"]').click();
+      // The switch starts a fresh explode at half, and the badge is the relay: the guest was
+      // not touched and its own control says the room has the model apart. This is the
+      // assertion that fails first if the room server does not carry the value.
+      await expect(guest.page.locator('[data-testid="view-tools-badge"]')).toContainText("e50", {
+        timeout: 15_000,
+      });
+      await openToolsAgain(host);
+      const slider = host.page.locator('[data-testid="view-tools-explode"]');
+      await slider.fill("60");
+      // The release, which is what flushes the throttled send: store.ts's `setViewTools` puts
+      // ~15 values a second on the wire and always the last one.
+      await slider.dispatchEvent("pointerup");
+      await expect(guest.page.locator('[data-testid="view-tools-badge"]')).toContainText("e60", {
+        timeout: 15_000,
+      });
+      // And the cut is still exactly where it was: the value on the wire is a FRACTION of the
+      // models' extent, so had the plane been resolved against the exploded box the badge
+      // would still read 50 and the section would have slid through the product. The badge is
+      // the half of that a picture cannot show; lib/scene/__tests__/explode.test.ts asserts the
+      // other half, that the resolved plane is bit for bit the same one.
+      await expect(guest.page.locator('[data-testid="view-tools-badge"]')).toContainText("x50");
+      await expect(host.page.locator('[data-testid="view-tools-badge"]')).toHaveText(/^x50e60$/);
+
+      await settle(host, guest);
+      await shotTo(EXPLODE_SHOT_DIR, host, "explode-60-host");
+      await shotTo(EXPLODE_SHOT_DIR, guest, "explode-60-guest");
+      await waitForCameraAtRest(host, "the host's camera under the explode");
+      await waitForCameraAtRest(guest, "the guest's camera under the explode");
+      const explodedHost = await canvasShot(host);
+      const explodedGuest = await canvasShot(guest);
+
+      // The picture moved on BOTH screens, from one drag on one of them — and by much the same
+      // amount, which is the two-context claim. Each screen is compared against itself rather
+      // than against the other, because the two cameras settle independently and a
+      // pixel-to-pixel comparison across browsers would be measuring that instead.
+      const changedOnHost = await diffFraction(host, cutHost, explodedHost);
+      const changedOnGuest = await diffFraction(guest, cutGuest, explodedGuest);
+      expect(changedOnHost, "the host's canvas did not move when its own slider did").toBeGreaterThan(ARRIVED);
+      expect(changedOnGuest, "the guest's canvas did not move for a drag it did not make").toBeGreaterThan(ARRIVED);
+      agree(changedOnGuest, changedOnHost, "how much of the picture the explode moved");
+
+      // ── and back to zero, which has to give the picture back ───────────────────
+      await openToolsAgain(host);
+      await host.page.locator('[data-testid="view-tools-explode-toggle"]').click();
+      await expect(guest.page.locator('[data-testid="view-tools-badge"]')).toHaveText(/^x50$/, {
+        timeout: 15_000,
+      });
+      await settle(host, guest);
+      await waitForCameraAtRest(host, "the host's camera put back together");
+      await waitForCameraAtRest(guest, "the guest's camera put back together");
+      await shotTo(EXPLODE_SHOT_DIR, host, "explode-off-host");
+      await shotTo(EXPLODE_SHOT_DIR, guest, "explode-off-guest");
+      const backHost = await canvasShot(host);
+      const backGuest = await canvasShot(guest);
+
+      // EXACT, to within antialiasing: an explode is a view, so putting it back has to leave
+      // the room with the picture it had. This is the assertion that would catch a part left
+      // pushed out, a bounding sphere left stale, a cull index left holding the exploded
+      // positions, or a placement written through — all of which are things a "some ink came
+      // back" assertion would wave through.
+      const backOnHost = await diffFraction(host, cutHost, backHost);
+      const backOnGuest = await diffFraction(guest, cutGuest, backGuest);
+      expect(backOnHost, "the host's picture did not come back").toBeLessThan(RESTORED);
+      expect(backOnGuest, "the guest's picture did not come back").toBeLessThan(RESTORED);
+      // The cut is still on, and still a cut: collapsing the model did not take the section
+      // with it, which is the other half of the two tools being independent.
+      await expect(host.page.locator('[data-testid="view-tools-badge"]')).toHaveText(/^x50$/);
+    } finally {
+      await host.context.close();
+      await guest.context.close();
+    }
+  });
+});
+

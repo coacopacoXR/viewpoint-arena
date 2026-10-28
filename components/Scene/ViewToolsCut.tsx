@@ -39,6 +39,7 @@ import {
 } from 'three';
 import { useStore } from '../../store';
 import { partRegistries } from '../../lib/scene/partRegistry';
+import type { BoundsOptions } from '../../lib/scene/partRegistry';
 import { reviewModelBounds } from '../../lib/scene/modelBounds';
 import {
   applyCut,
@@ -57,6 +58,15 @@ import type { CutPlane } from '../../lib/scene/viewTools';
  * corner of the plane past the corner of the product and not enough to look like furniture.
  */
 const HELPER_PAD = 1.06;
+
+/**
+ * The box the cut resolves against: the models as the FILE and their overrides have them.
+ *
+ * One constant rather than an object literal at the call site because the effect below runs on
+ * every step of a cut drag and an argument that is a fresh object each time is an allocation
+ * per step — small, and also the kind of small that adds up to nothing anybody can find later.
+ */
+const ASSEMBLED: BoundsOptions = { assembled: true };
 
 /**
  * A raycast that answers nothing, ever.
@@ -97,7 +107,12 @@ const ViewToolsCut: React.FC<ViewToolsCutProps> = ({ modelsRef }) => {
   const gl = useThree((state) => state.gl);
   const scene = useThree((state) => state.scene);
   const invalidate = useThree((state) => state.invalidate);
-  const viewTools = useStore((state) => state.viewTools);
+  // The CUT and not the whole of the room's view tools. Subscribing to `viewTools` would
+  // re-run the effect below on every step of an EXPLODE drag, and each run walks the models'
+  // bounds again to resolve a plane whose value has not moved — which on a 10 000-part
+  // assembly is a hundred thousand measurements a second for a section standing still. The
+  // explode writes `{ ...viewTools, explode }`, so this reference survives one.
+  const cut = useStore((state) => state.viewTools.cut);
   const sceneEntries = useStore((state) => state.sceneEntries);
   const roomScene = useStore((state) => state.scene);
   const localModelVisibility = useStore((state) => state.localModelVisibility);
@@ -161,8 +176,14 @@ const ViewToolsCut: React.FC<ViewToolsCutProps> = ({ modelsRef }) => {
    * laser does every frame beside it.
    */
   useEffect(() => {
-    const bounds = reviewModelBounds(scene, registries);
-    const cutting = writeCutPlane(viewTools.cut, bounds);
+    // The ASSEMBLED bounds, which is the whole of why this component does not simply read the
+    // box the models are drawn in. The value on the wire is a FRACTION of the models' extent,
+    // so resolving it against an exploded box would slide the section every time somebody
+    // dragged the explode slider — a cut that moves because a different view tool moved is a
+    // cut nobody can hold still, and the guide rectangle would walk away from the section it
+    // is supposed to be showing.
+    const bounds = reviewModelBounds(scene, registries, ASSEMBLED);
+    const cutting = writeCutPlane(cut, bounds);
     setCutEnabled(cutting);
     // The mounted models, and then every parsed model whether it is mounted or not.
     //
@@ -173,13 +194,13 @@ const ViewToolsCut: React.FC<ViewToolsCutProps> = ({ modelsRef }) => {
     // `syncCut` is idempotent, so walking the mounted ones twice costs a property compare.
     applyCut(modelsRef.current);
     for (const id of Object.keys(sceneEntries)) applyCut(sceneEntries[id]?.group);
-    placeGuide(guideRef.current, cutting ? viewTools.cut : null, bounds);
+    placeGuide(guideRef.current, cutting ? cut : null, bounds);
     invalidate();
     // `roomScene` and `localModelVisibility` are in the list even though the effect body
     // never reads them: each moves the box the position resolves against — a model dragged
     // by the gizmo, a model hidden in the tree — without changing the value on the wire, and
     // a cut that stayed where the models used to be would be cutting air.
-  }, [viewTools, registries, sceneEntries, roomScene, localModelVisibility, scene, modelsRef, invalidate]);
+  }, [cut, registries, sceneEntries, roomScene, localModelVisibility, scene, modelsRef, invalidate]);
 
   /**
    * Take the cut off everything on the way out.
@@ -200,7 +221,7 @@ const ViewToolsCut: React.FC<ViewToolsCutProps> = ({ modelsRef }) => {
     [modelsRef, invalidate],
   );
 
-  const cutting = viewTools.cut !== null;
+  const cutting = cut !== null;
 
   return (
     <group

@@ -48,6 +48,7 @@ import {
   setCapturePausedBy,
 } from './capture/captureGate';
 import { buildTranscript } from './capture/transcript';
+import { useKeptRecordingStore } from './capture/keptRecordingStore';
 import {
   downloadTranscript,
   formatTranscriptDate,
@@ -258,8 +259,40 @@ export const RecordingProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const [summarising, setSummarising] = useState(false);
   const [outcome, setOutcome] = useState<SummaryOutcome | null>(null);
-  const [recording, setRecording] = useState<Blob | null>(null);
+  /**
+   * The recording that just stopped, and which recording it is.
+   *
+   * A bare `Blob` until task 09b. The start is kept beside it now because a card's "play
+   * this span" has to know WHICH recording its spans are offsets into: this slot only ever
+   * holds the latest one, so a card from an earlier recording in the same room would
+   * otherwise be offered a ▶ that plays the wrong minute of audio.
+   */
+  const [kept, setKept] = useState<{ blob: Blob; startedAt: number } | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
+
+  // ─── The kept recording's playable address ─────────────────────────────────
+  // Task 09b. The Blob above was already kept for Retry, and a decision card's "Linked
+  // components" row can play back the span it was read from — but that row is mounted per
+  // card in the Capture deck and once in a detail modal that three of its four hosts open
+  // with no RecordingProvider above them, so it cannot read this context. It reads
+  // lib/capture/keptRecordingStore instead, and this effect is the store's only writer.
+  //
+  // The object URL's lifetime belongs here because the Blob's does: created when the
+  // recording is kept, revoked when a second recording replaces it, when this provider
+  // unmounts, and — as the cleanup below — never left behind for a page that is still open.
+  const setKeptRecording = useKeptRecordingStore((s) => s.setKeptRecording);
+  useEffect(() => {
+    if (kept === null) {
+      setKeptRecording(null);
+      return;
+    }
+    const url = URL.createObjectURL(kept.blob);
+    setKeptRecording({ startedAt: kept.startedAt, url });
+    return () => {
+      URL.revokeObjectURL(url);
+      setKeptRecording(null);
+    };
+  }, [kept, setKeptRecording]);
 
   // ─── The stopped recording, and the three things that can be done with it ─────
   // Batch BU. Stopping used to be one act with one consequence — the audio went
@@ -448,7 +481,7 @@ export const RecordingProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     try {
       const audio = await stop();
       finishLiveTranscript();
-      setRecording(audio);
+      setKept({ blob: audio, startedAt });
       broadcastRecordingState({
         recording: false,
         startedAt,
@@ -471,10 +504,10 @@ export const RecordingProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, [stop, finishLiveTranscript, localUserId, localName, recordingState, elapsedMs]);
 
   const handleRetry = useCallback(async (): Promise<void> => {
-    if (recording !== null) {
-      await summarise(recording);
+    if (kept !== null) {
+      await summarise(kept.blob);
     }
-  }, [recording, summarise]);
+  }, [kept, summarise]);
 
   /**
    * Choice 2: store this meeting's transcript on its session row, or stop storing it.

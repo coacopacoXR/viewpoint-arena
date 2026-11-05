@@ -16,6 +16,7 @@ import ManualCardForm, {
     buildManualCard, newManualCardId, pointedPartFor,
     type ManualCardInput, type PointedPart
 } from './ManualCardForm';
+import CardAudioLinks from './CardAudioLinks';
 import RecordingControls from './RecordingControls';
 import RecordingIndicator from './RecordingIndicator';
 import { usePointingTimelineStore } from '../../lib/pointingTimelineStore';
@@ -86,7 +87,8 @@ const ConversationPanel: React.FC = () => {
     objectStates,
     activeModelType,
     importedSceneTree,
-    sessionHostId
+    sessionHostId,
+    selectNode
   } = useStore();
 
   const { remoteParticipantList, localUserId, broadcastInsightCard } = usePresence();
@@ -134,6 +136,15 @@ const ConversationPanel: React.FC = () => {
     () => sceneComponents(activeModelType, importedSceneTree),
     [activeModelType, importedSceneTree]
   );
+
+  // The same list as an id → name map, for the "Linked components" row a card draws: a part
+  // the model named in `componentReference` but nobody pointed at has no name anywhere else
+  // (a pointing segment carries its own). Built once per scene rather than per card.
+  const partNames = useMemo(() => {
+    const names: Record<string, string> = {};
+    for (const component of flatComponents) names[component.id] = component.name;
+    return names;
+  }, [flatComponents]);
 
   // Read imperatively, not from a store: the laser target lives in the module
   // maps lib/laserTargetRef keeps (written every frame by the laser, and by the
@@ -247,7 +258,12 @@ const ConversationPanel: React.FC = () => {
   }, [chatHistory, isSticky, activeTab]);
 
   // Robust Manual Scroll to specific message
-  const scrollToMessage = (msgId: string) => {
+  //
+  // A useCallback rather than the plain function it was, because it is now also a prop of
+  // the memoised "Linked components" row a card draws (components/UI/CardAudioLinks) — and
+  // a fresh function per render would defeat the memo on every one of the ten renders a
+  // second this panel does while components/Scene/World.tsx writes the clock to the store.
+  const scrollToMessage = useCallback((msgId: string) => {
       if (!chatContainerRef.current || activeTab !== 'LIVE') return;
       
       // Disable sticky mode when manually targeting a message
@@ -273,7 +289,7 @@ const ConversationPanel: React.FC = () => {
               el.style.backgroundColor = "";
           }, 1500);
       }
-  };
+  }, [activeTab]);
 
   // Handle user scrolling
   const handleScroll = () => {
@@ -314,6 +330,15 @@ const ConversationPanel: React.FC = () => {
                     onClose={() => setSelectedCard(null)}
                     agentColor={agents.find(a => a.id === selectedCard.agentId)?.color}
                     canEdit={mayEditCard}
+                    // The modal covers the transcript it would scroll, and the flash it
+                    // triggers lasts 1.5s — so a timestamp pressed in the modal closes it
+                    // first and then scrolls, which is what makes the click land somewhere
+                    // the person can see. The panel behind stays mounted, so the scroll
+                    // finds its line whether the modal is up or not.
+                    onScrollToMessage={(msgId) => {
+                        setSelectedCard(null);
+                        scrollToMessage(msgId);
+                    }}
                 />
             </div>
         )}
@@ -472,6 +497,21 @@ const ConversationPanel: React.FC = () => {
                                     <div className="text-[10px] text-gray-500 leading-relaxed line-clamp-2">
                                         {card.description}
                                     </div>
+
+                                    {/* Which part of the model this card's audio was about: the
+                                        spans it was read from, and who was pointing at what while
+                                        they were said. Renders nothing at all for a card with no
+                                        link, so a card about the meeting rather than about a mesh
+                                        looks exactly as it did before. */}
+                                    <CardAudioLinks
+                                        card={card}
+                                        messages={chatHistory}
+                                        segments={pointingSegments}
+                                        partNames={partNames}
+                                        knownParts={objectStates}
+                                        onSelectPart={selectNode}
+                                        onScrollToMessage={scrollToMessage}
+                                    />
 
                                     {/* Author + Accept/Reject Footer */}
                                     <div className="flex items-center justify-between pt-2 border-t border-gray-100 mt-1">

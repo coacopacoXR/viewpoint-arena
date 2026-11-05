@@ -1,6 +1,6 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { useStore } from '../../store';
+import { useStore, sceneComponents } from '../../store';
 import {
     AlertTriangle, CheckCircle2, Lightbulb, X, Calendar, User, Flag, Activity, Box,
     Scale, BrainCircuit
@@ -8,6 +8,13 @@ import {
 import { clsx } from 'clsx';
 import { InsightCard, InsightDetails } from '../../types';
 import AssigneeComboBox from './AssigneeComboBox';
+import CardAudioLinks from './CardAudioLinks';
+import { cardHasLinks } from '../../lib/capture/cardComponents';
+import { usePointingTimelineStore } from '../../lib/pointingTimelineStore';
+
+/** Stable empties, so a selector that falls back to one does not re-render on every read. */
+const NO_MESSAGES: never[] = [];
+const NO_PART_NAMES: Record<string, string> = {};
 
 const InsightDetailModal: React.FC<{
     card: InsightCard,
@@ -22,11 +29,39 @@ const InsightDetailModal: React.FC<{
      * "everyone can meet, point and comment; everyone except guests can add and
      * edit cards" is a rule about editing, not about looking.
      */
-    canEdit?: boolean
-}> = ({ card, onClose, canEdit }) => {
+    canEdit?: boolean,
+    /**
+     * Scroll a transcript to one of the lines this card came from. Only the room's Capture
+     * panel has one on screen, and only it passes this; the other three hosts open the same
+     * modal over a boardroom, a workspace and a summary, where a card's spans are timestamps
+     * to read and not links to follow.
+     */
+    onScrollToMessage?: (messageId: string) => void
+}> = ({ card, onClose, canEdit, onScrollToMessage }) => {
     const requirements = useStore(state => state.requirements);
     const updateInsight = useStore(state => state.updateInsight);
     
+    // For the "Linked components" row below. Each with a fallback because this modal is
+    // mounted from four places and only some of them are a room with a transcript in it.
+    const chatHistory = useStore(state => state.chatHistory ?? NO_MESSAGES);
+    const objectStates = useStore(state => state.objectStates);
+    const selectNode = useStore(state => state.selectNode);
+    const activeModelType = useStore(state => state.activeModelType);
+    const importedSceneTree = useStore(state => state.importedSceneTree);
+    const pointingSegments = usePointingTimelineStore(state => state.segments);
+
+    // Flattening the scene tree is work a card about the meeting rather than about a mesh
+    // has no reason to pay, and it would be paid on every render of the modal.
+    const hasLinks = cardHasLinks(card);
+    const partNames = useMemo(() => {
+        if (!hasLinks) return NO_PART_NAMES;
+        const names: Record<string, string> = {};
+        for (const component of sceneComponents(activeModelType, importedSceneTree)) {
+            names[component.id] = component.name;
+        }
+        return names;
+    }, [hasLinks, activeModelType, importedSceneTree]);
+
     const { details, affectedRequirementIds, kbRecommendations } = card;
 
     // Helper to update fields in the store
@@ -284,6 +319,42 @@ const InsightDetailModal: React.FC<{
                     )}
 
                 </fieldset>
+
+                {/* Which part of the model this card's audio was about.
+                    OUTSIDE the <fieldset> above, and that is load-bearing rather than
+                    layout: the fieldset's `disabled` makes every control in the form
+                    read-only for a person who may not edit, and selecting a part in the 3D
+                    view, following a timestamp back to the transcript line and playing the
+                    clip are all looking, not editing. A guest gets the same row an editor
+                    does.
+                    Both clicks close the modal first, because both do something on the
+                    screen behind it — the part highlights in the scene and the line flashes
+                    in the transcript — and a modal that stays up would hide the answer to
+                    the click it just took. */}
+                {hasLinks && (
+                    <div className="px-6 pb-4 shrink-0">
+                        <CardAudioLinks
+                            card={card}
+                            variant="full"
+                            messages={chatHistory}
+                            segments={pointingSegments}
+                            partNames={partNames}
+                            knownParts={objectStates}
+                            onSelectPart={(partId) => {
+                                onClose();
+                                selectNode(partId);
+                            }}
+                            onScrollToMessage={
+                                onScrollToMessage
+                                    ? (messageId) => {
+                                        onClose();
+                                        onScrollToMessage(messageId);
+                                    }
+                                    : undefined
+                            }
+                        />
+                    </div>
+                )}
 
                 {/* Footer */}
                 <div className="p-3 border-t border-gray-100 bg-gray-50 flex justify-end gap-2 shrink-0">

@@ -732,6 +732,28 @@ interface AppState {
 
   // --- NEW: Comments Display State ---
   commentsExpandedInScene: boolean; // Toggle all comments expanded in 3D
+  /**
+   * Whether THIS BROWSER is hiding every comment bubble and every review pin in the 3D view
+   * (task 09a).
+   *
+   * Local rather than shared, and that is the opposite of the decision `viewTools` above
+   * makes — deliberately. A cut is a claim about the model that everybody in the meeting has
+   * to be looking at the same way for the conversation to work. "I cannot read this screen
+   * with forty bubbles on it" is a claim about one person's screen, and broadcasting it would
+   * take the room's annotations off everybody else's because one of them wanted a clean
+   * picture. So it never goes on the wire, never reaches the scene reducer, and is not part
+   * of what a joiner is handed.
+   *
+   * Kept in localStorage per browser, which is what makes it a preference rather than a
+   * per-meeting decision: somebody who turns the bubbles off to present is still someone who
+   * wants them off next time.
+   *
+   * It hides the MARKERS and nothing else. The Comments tab still lists every comment, the
+   * placement preview still follows the pointer while a comment or a pin is being dropped,
+   * and a hidden marker is not mounted at all rather than mounted invisible — so it costs no
+   * `<Html>`, no raycast and no click target.
+   */
+  sceneMarkersHidden: boolean;
 
   // --- NEW: Import Status Messages ---
   importError: string | null;
@@ -921,6 +943,12 @@ interface AppState {
   toggleCommentsExpandedInScene: () => void;
   setCommentScreenOffset: (id: string, offset: { x: number; y: number }) => void;
   toggleCommentExpanded: (id: string) => void;
+  /**
+   * Hide or show every comment bubble and review pin in the 3D view, for this browser only
+   * (task 09a). Writes the preference to localStorage; sends nothing.
+   */
+  setSceneMarkersHidden: (hidden: boolean) => void;
+  toggleSceneMarkersHidden: () => void;
 
   // --- NEW: Import Status Actions ---
   /** What the model tree's status area says: a failure, or what just succeeded. */
@@ -1076,6 +1104,35 @@ function queueViewTools(value: ViewTools): void {
   viewToolsTimer = setTimeout(flushViewTools, wait);
 }
 
+// ─── the marker-visibility preference (task 09a) ─────────────────────────────
+//
+// Its own key and its own two functions rather than an inline IIFE at the initial state,
+// because unlike `vp_user` above it is written as well as read, and a read and a write that
+// spelled the key differently would be a preference that silently reset on every reload.
+//
+// Wrapped in try/catch for the reason the two reads above are: localStorage throws in a
+// private window in some browsers and in every jsdom run that has not been given a storage
+// quota, and a display preference is not worth failing to open a room over.
+
+const MARKERS_HIDDEN_KEY = 'vp_markers_hidden';
+
+function readMarkersHidden(): boolean {
+  try {
+    return localStorage.getItem(MARKERS_HIDDEN_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeMarkersHidden(hidden: boolean): void {
+  try {
+    if (hidden) localStorage.setItem(MARKERS_HIDDEN_KEY, '1');
+    else localStorage.removeItem(MARKERS_HIDDEN_KEY);
+  } catch {
+    // Not stored, then. The flag still works for this page's lifetime.
+  }
+}
+
 
 export const useStore = create<AppState>((set, get) => ({
   viewMode: ViewMode.FREE,
@@ -1167,6 +1224,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   // --- NEW: Comments Display State ---
   commentsExpandedInScene: false,
+  sceneMarkersHidden: readMarkersHidden(),
 
   // --- NEW: Import Status Messages ---
   importError: null,
@@ -1597,9 +1655,29 @@ export const useStore = create<AppState>((set, get) => ({
   setReviewGizmoTarget: (target) => set({ reviewGizmoTarget: target }),
 
   // --- NEW: Comments Display Actions ---
-  toggleCommentsExpandedInScene: () => set((state) => ({
-      commentsExpandedInScene: !state.commentsExpandedInScene
-  })),
+  toggleCommentsExpandedInScene: () => set((state) => {
+      const expanding = !state.commentsExpandedInScene;
+      // Expanding every card in the scene is a request to SEE the markers, so it also undoes
+      // the switch that hides them — the one place the two meet. A button that opened every
+      // card onto a canvas this browser had emptied of them would be the control
+      // components/UI/room/RoomViewTools.tsx's own comments warn about: one that moves and
+      // changes nothing. Collapsing leaves the flag alone, because hiding the cards is not a
+      // request to hide the bubbles.
+      return expanding
+          ? { commentsExpandedInScene: true, sceneMarkersHidden: false }
+          : { commentsExpandedInScene: false };
+  }),
+
+  setSceneMarkersHidden: (hidden) => {
+      writeMarkersHidden(hidden);
+      // Not written when it did not move: components/Scene/MotionQuality.tsx's
+      // `StoreDrivenFrames` asks for a frame on every key that changed, and a marker that is
+      // already hidden owes the room no redraw.
+      if (get().sceneMarkersHidden === hidden) return;
+      set({ sceneMarkersHidden: hidden });
+  },
+
+  toggleSceneMarkersHidden: () => get().setSceneMarkersHidden(!get().sceneMarkersHidden),
 
   setCommentScreenOffset: (id, offset) => set((state) => ({
       comments: state.comments.map(c => c.id === id ? { ...c, screenOffset: offset } : c)

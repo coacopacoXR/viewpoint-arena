@@ -84,6 +84,21 @@ describe('every raycast in the app goes through the one cut filter', () => {
     expect(source).toContain('intersectObjects');
     expect(source).not.toContain('uncutHits');
   });
+
+  it('covers the marker occlusion raycast, which lives in lib/scene rather than components', () => {
+    // Task 09a's seventh pick path, and the reason this file's scan of `components/` is not
+    // enough on its own: "is the model hiding this comment?" is a raycast too, and a marker
+    // that stayed faded behind a section the meeting had just cut away would be exactly the
+    // drift the guard above exists to catch — it would just be caught by nobody.
+    //
+    // Named rather than folded into the scan because `sources('lib')` would also pick up
+    // every fixture in lib/**/__tests__ that raycasts on purpose without the filter.
+    const source = readFileSync(join(REPO_ROOT, 'lib/scene/markerOcclusion.ts'), 'utf8');
+    const at = source.indexOf('.intersectObjects(');
+    expect(at, 'markerOcclusion no longer raycasts — this guard has nothing left to guard').toBeGreaterThan(-1);
+    expect(source.slice(Math.max(0, at - 80), at)).toMatch(/uncutHits\(\s*[A-Za-z_$][\w$.]*\s*$/);
+    expect(source.indexOf('.intersectObjects(', at + 1), 'a second, unfiltered raycast appeared').toBe(-1);
+  });
 });
 
 describe('uncutHits', () => {

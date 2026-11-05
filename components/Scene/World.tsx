@@ -10,6 +10,7 @@ import LightRig from './LightRig';
 import ThumbnailCapture from './ThumbnailCapture';
 import ViewToolsCut from './ViewToolsCut';
 import ViewToolsExplode from './ViewToolsExplode';
+import MarkerOcclusion from './MarkerOcclusion';
 import { useStore } from '../../store';
 import { useSceneModelLoader } from '../../lib/scene/useSceneModelLoader';
 
@@ -147,6 +148,13 @@ const World: React.FC<WorldProps> = ({ hideAgents: hideAgentsOverride, modelGrou
             plane against the ASSEMBLED bounds and asks the registry for them.
             See components/Scene/ViewToolsExplode.tsx. */}
         <ViewToolsExplode />
+
+        {/* Which comment bubbles and review pins the model is hiding, and when that is worth
+            asking again. Mounted here rather than beside the markers because the question is
+            a raycast against THIS group — the one whose children are exactly the models — and
+            this is the only component holding a ref to it. Renders nothing.
+            See components/Scene/MarkerOcclusion.tsx. */}
+        <MarkerOcclusion modelsRef={modelsGroupRef} />
 
         <ContactShadows
             opacity={0.4}

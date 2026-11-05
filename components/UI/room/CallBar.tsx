@@ -10,7 +10,7 @@ import React from 'react';
 import {
   Mic, MicOff, Volume2, VolumeX, Home,
   Activity, Users, Sparkles, SplitSquareHorizontal,
-  Power, LogOut,
+  Power, LogOut, MapPin, MapPinOff,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useStore } from '../../../store';
@@ -38,6 +38,8 @@ const CallBar: React.FC<CallBarProps> = ({ isHost, onFreeView, onLeaderToggle, o
   const setActiveAgent = useStore((s) => s.setActiveAgent);
   const leaderId = useStore((s) => s.leaderId);
   const endMeeting = useStore((s) => s.endMeeting);
+  const sceneMarkersHidden = useStore((s) => s.sceneMarkersHidden);
+  const toggleSceneMarkersHidden = useStore((s) => s.toggleSceneMarkersHidden);
   const { remoteParticipantList, broadcastMeetingEnd } = usePresence();
   const { isMicOn, toggleMic, isSpeakerOn, toggleSpeaker, isSameRoom, toggleSameRoom, micPermissionState } =
     useWebRTCContext();
@@ -85,6 +87,28 @@ const CallBar: React.FC<CallBarProps> = ({ isHost, onFreeView, onLeaderToggle, o
       >
         <Home size={16} />
       </button>
+
+      {/* Hide every comment bubble and review pin in the 3D view — task 09a.
+          In THIS group and not with the view modes beside it, because the four controls to
+          its left are the ones that are about MY screen rather than about the meeting: the
+          mic is mine, the speaker is mine, "same room" is a fact about where I am sitting,
+          and so is this. Everything past the divider is shared — a view mode changes what
+          everybody's camera does, and store.ts's `sceneMarkersHidden` deliberately never
+          goes on the wire, because one person wanting a clean picture is not a reason to
+          take the room's annotations off everybody else's.
+          It is here rather than in the Comments tab for reach: the tab is the right place
+          semantically and the wrong one physically, since the side panel that holds it is
+          collapsible, is swapped wholesale for the review's own tabs while this person
+          holds Edit, and is not rendered at all in the host's split-screen Manager mode.
+          This bar is on screen in every one of those. */}
+      <BarButton
+        active={!!sceneMarkersHidden}
+        onClick={toggleSceneMarkersHidden}
+        data-testid="toggle-scene-markers"
+        title={sceneMarkersHidden ? 'Show comments and pins in 3D' : 'Hide comments and pins in 3D'}
+      >
+        {sceneMarkersHidden ? <MapPinOff size={16} /> : <MapPin size={16} />}
+      </BarButton>
 
       <div className="w-px h-7 bg-gray-200 mx-0.5 shrink-0" />
 

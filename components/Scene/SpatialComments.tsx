@@ -1,4 +1,4 @@
-import React, { useRef, useState, useCallback } from 'react';
+import React, { useRef, useState, useCallback, useMemo } from 'react';
 import { Html } from '@react-three/drei';
 import { useFrame, useThree } from '@react-three/fiber';
 import { Vector3, Vector2, Raycaster, Group } from 'three';
@@ -7,6 +7,18 @@ import { hitParts, isPointableHit, partRegistries } from '../../lib/scene/partRe
 // Both raycasts here go through the one cut filter, which is what stops a pin being dropped
 // on a face the meeting has just cut off — see lib/scene/cutPick.ts.
 import { uncutHits } from '../../lib/scene/cutPick';
+// The bubble is DOM, so nothing about it is depth-tested against the model: a comment on the
+// back face of a housing used to float over the geometry that was hiding it. The answer is a
+// raycast the driver in components/Scene/MarkerOcclusion.tsx runs for every marker at once,
+// and `useMarkerOccluded` is this component's end of it. The layers are a separate file
+// because "under every panel" is a claim about pages/RoomPage.tsx and components/UI/Interface.tsx
+// that neither of them imports — see lib/scene/markerLayers.ts.
+import { useMarkerOccluded } from '../../lib/scene/markerOcclusion';
+import {
+  MARKER_OCCLUDED_OPACITY,
+  MARKER_Z_RANGE,
+  MARKER_Z_RANGE_EXPANDED,
+} from '../../lib/scene/markerLayers';
 import { MessageSquare, Check, GripVertical, Link2, Minimize2, Pencil, MapPin } from 'lucide-react';
 import { SceneNode, SpatialComment } from '../../types';
 
@@ -35,6 +47,24 @@ const CommentMarker: React.FC<{
     const [localOffset, setLocalOffset] = useState(comment.screenOffset || { x: 0, y: 0 });
 
     const isExpanded = isGlobalExpanded || comment.expanded;
+
+    /**
+     * The point the comment was dropped on, which is the point the occlusion pass aims at.
+     *
+     * The ANCHOR and not the group's own position, which is 0.15 above it: the bubble floats
+     * off the surface so that it is not half-buried in the part it belongs to, but "can I see
+     * the place this comment is about" is a question about the place, and a bubble lifted off
+     * a face could clear a wall that the face itself is behind. It is also the point the
+     * placement raycast answered, so it is exactly on a surface — which is what makes the
+     * epsilon in lib/scene/markerOcclusion.ts load-bearing rather than a safety margin.
+     */
+    const anchor = useMemo(
+        () => new Vector3(comment.position.x, comment.position.y, comment.position.z),
+        [comment.position]
+    );
+    // The part the comment is attached to, so that its own surface cannot hide it from a
+    // grazing angle. Empty for a comment placed before attachments existed.
+    const occluded = useMarkerOccluded(comment.id, anchor, comment.attachedToNodeId || null);
 
     const handleMouseDown = useCallback((e: React.MouseEvent) => {
         if (!isExpanded) return;
@@ -80,18 +110,44 @@ const CommentMarker: React.FC<{
         <group ref={groupRef} position={[comment.position.x, comment.position.y + 0.15, comment.position.z]}>
             <Html
                 center
+                // Remounted when the card opens. drei writes the element's z-index and its
+                // `distanceFactor` scale inside a frame callback that only runs when the
+                // projected position has MOVED, so a prop change on a camera standing still —
+                // which is what clicking a bubble is — would leave both at the value the
+                // collapsed bubble had until somebody orbited. A fresh element starts with no
+                // previous position and is therefore written on the next frame, which
+                // `StoreDrivenFrames` has already asked for.
+                key={isExpanded ? 'open' : 'shut'}
                 distanceFactor={isExpanded ? 2.5 : 3}
+                // Under the room's UI rather than over it, and an open card above the bubbles
+                // it covers. Both numbers and the reason for them are in
+                // lib/scene/markerLayers.ts.
+                zIndexRange={isExpanded ? MARKER_Z_RANGE_EXPANDED : MARKER_Z_RANGE}
                 style={{
                     transition: 'all 0.2s',
-                    opacity: comment.resolved ? 0.5 : 1,
-                    pointerEvents: 'auto',
+                    // Faded rather than removed when the model is in front of it: 0 is an
+                    // answer to "is there a comment back there?" and 0.15 is still one. See
+                    // MARKER_OCCLUDED_OPACITY.
+                    opacity: occluded ? MARKER_OCCLUDED_OPACITY : comment.resolved ? 0.5 : 1,
+                    // And not clickable, or the fade is a bubble you can open through the
+                    // part that is hiding it — which is the original complaint, one click on.
+                    pointerEvents: occluded ? 'none' : 'auto',
                     transform: isExpanded ? `translate(${localOffset.x}px, ${localOffset.y}px)` : 'none'
                 }}
                 onMouseMove={handleMouseMove}
                 onMouseUp={handleMouseUp}
                 onMouseLeave={handleMouseUp}
             >
-                <div className={`transition-all duration-300 ${comment.resolved ? 'opacity-60' : ''}`}>
+                {/* `data-occluded` and the testid are here rather than on the element that
+                    carries the fade because that element is drei's, built imperatively and
+                    not reachable from a prop: e2e/pinsOcclusion.spec.ts walks up from this
+                    div to read the opacity and z-index the room actually painted. */}
+                <div
+                    data-testid="comment-marker"
+                    data-comment-id={comment.id}
+                    data-occluded={occluded ? '1' : '0'}
+                    className={`transition-all duration-300 ${comment.resolved ? 'opacity-60' : ''}`}
+                >
                     {/* Collapsed View - Just the Pin */}
                     {!isExpanded && (
                         <div
@@ -362,7 +418,12 @@ const PlacementPreview: React.FC = () => {
 
     return (
         <group ref={previewRef}>
-            <Html center distanceFactor={3}>
+            {/* The preview is a marker, so it is on the markers' layer: over the model, under
+                the panels. It is deliberately NOT occluded and NOT hidden by the marker
+                switch — it is the crosshair of a click that is about to happen, and a
+                placement preview that faded out behind the part you are aiming at would be
+                aiming at nothing. See lib/scene/markerLayers.ts. */}
+            <Html center distanceFactor={3} zIndexRange={MARKER_Z_RANGE}>
                 <div className={`w-10 h-10 rounded-full border-4 border-dashed flex items-center justify-center animate-pulse ${marker.ring}`}>
                     {marker.icon}
                 </div>
@@ -378,6 +439,9 @@ const SpatialComments: React.FC = () => {
     const commentsExpandedInScene = useStore(state => state.commentsExpandedInScene);
     const toggleCommentExpanded = useStore(state => state.toggleCommentExpanded);
     const setCommentScreenOffset = useStore(state => state.setCommentScreenOffset);
+    // This browser's own "hide them all" — see store.ts's `sceneMarkersHidden`, which is
+    // local and never goes on the wire.
+    const markersHidden = useStore(state => state.sceneMarkersHidden);
 
     // Register GL capture here (always mounted) so handleSave can grab the
     // current frame even after commentMode transitions away from placing-drawing.
@@ -391,8 +455,14 @@ const SpatialComments: React.FC = () => {
         <group>
             {/* Render all live comments. Pre-review comments are already
                 rendered as dedicated markers by ReviewArtifacts, so skip them
-                here to avoid duplicate 3D markers. */}
-            {comments.filter(c => !c.preReview).map(comment => (
+                here to avoid duplicate 3D markers.
+
+                Not rendered at all when they are hidden, rather than rendered invisible:
+                a mounted CommentMarker is a DOM subtree, a click target and an entry in the
+                occlusion registry that the driver raycasts ten times a second. Hiding forty
+                of them has to cost nothing, and `visible={false}` on the group would cost
+                all three. */}
+            {!markersHidden && comments.filter(c => !c.preReview).map(comment => (
                 <CommentMarker
                     key={comment.id}
                     comment={comment}
@@ -402,7 +472,9 @@ const SpatialComments: React.FC = () => {
                 />
             ))}
 
-            {/* Placement preview */}
+            {/* Placement preview. Outside the switch on purpose: arming "Comment" while the
+                bubbles are hidden is a person about to drop one, and the crosshair that says
+                where it will land is the only feedback the drop has. */}
             <PlacementPreview />
         </group>
     );

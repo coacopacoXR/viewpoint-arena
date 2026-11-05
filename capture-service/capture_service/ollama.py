@@ -42,6 +42,13 @@ CHAT_PATH = "/api/chat"
 # capture_output_truncated rather than parsed as broken JSON.
 MAX_OUTPUT_TOKENS = 4096
 
+# Context window asked of Ollama per request. Left unset, Ollama falls back to
+# its server default (2–4k) and silently truncates the prompt from the middle:
+# the ~6k-token extraction system prompt lost its instructions and the model
+# answered with no cards. 16k holds the prompt, a long meeting window and the
+# full MAX_OUTPUT_TOKENS reply. Same value as ollamaDirect.ts (NUM_CTX).
+NUM_CTX = 16384
+
 
 class LlmClient(Protocol):
     """Anything that can turn a system+user prompt into raw model text."""
@@ -119,7 +126,11 @@ class OllamaClient:
             # Non-negotiable: a streaming reply would have to be reassembled
             # before it could be parsed, and there is nothing to stream to.
             "stream": False,
-            "options": {"temperature": 0, "num_predict": MAX_OUTPUT_TOKENS},
+            "options": {
+                "temperature": 0,
+                "num_predict": MAX_OUTPUT_TOKENS,
+                "num_ctx": NUM_CTX,
+            },
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},

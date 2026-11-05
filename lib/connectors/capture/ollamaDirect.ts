@@ -46,6 +46,13 @@ const DEFAULT_TIMEOUT_MS = 600_000;
  */
 const HEALTH_TIMEOUT_MS = 10_000;
 const MAX_OUTPUT_TOKENS = 4096;
+/**
+ * Context window asked of Ollama. Unset, Ollama uses its server default (2–4k)
+ * and truncates the ~6k-token extraction prompt from the middle, dropping the
+ * instructions: the model then answers with no cards. Same value as
+ * capture-service (NUM_CTX in capture_service/ollama.py).
+ */
+const NUM_CTX = 16384;
 /** Ollama's error bodies are short; cap what gets repeated to the user. */
 const MAX_BODY_EXCERPT = 300;
 
@@ -139,7 +146,11 @@ export class OllamaDirectCaptureProvider implements TranscriptCaptureProvider {
       // flattened onto the card, and the strict parser rightly refused the lot.
       // parseInsightCards is still the authority on the shape.
       format: EXTRACTION_JSON_SCHEMA,
-      options: { temperature: 0, num_predict: MAX_OUTPUT_TOKENS },
+      options: {
+        temperature: 0,
+        num_predict: MAX_OUTPUT_TOKENS,
+        num_ctx: NUM_CTX,
+      },
       messages: [
         { role: 'system', content: EXTRACTION_SYSTEM_PROMPT },
         {

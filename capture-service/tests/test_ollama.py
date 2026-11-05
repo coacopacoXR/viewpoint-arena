@@ -25,7 +25,7 @@ from capture_service.errors import (
     LlmTimeout,
     LlmUnreachable,
 )
-from capture_service.ollama import CHAT_PATH, MAX_OUTPUT_TOKENS, OllamaClient
+from capture_service.ollama import CHAT_PATH, MAX_OUTPUT_TOKENS, NUM_CTX, OllamaClient
 from capture_service.prompt import EXTRACTION_JSON_SCHEMA
 
 BASE_URL = "http://ollama.internal:11434"
@@ -82,7 +82,7 @@ def test_the_request_is_a_non_streaming_json_mode_chat_completion() -> None:
         "model": MODEL,
         "stream": False,
         "format": EXTRACTION_JSON_SCHEMA,
-        "options": {"temperature": 0, "num_predict": MAX_OUTPUT_TOKENS},
+        "options": {"temperature": 0, "num_predict": MAX_OUTPUT_TOKENS, "num_ctx": NUM_CTX},
         "messages": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": USER},
@@ -107,7 +107,11 @@ def test_a_schema_less_call_omits_the_format_key_entirely() -> None:
     assert "format" not in seen[0]
     # Everything else is unchanged: one knob differs between the two jobs.
     assert seen[0]["stream"] is False
-    assert seen[0]["options"] == {"temperature": 0, "num_predict": MAX_OUTPUT_TOKENS}
+    assert seen[0]["options"] == {
+        "temperature": 0,
+        "num_predict": MAX_OUTPUT_TOKENS,
+        "num_ctx": NUM_CTX,
+    }
 
 
 def test_the_prompt_is_passed_through_verbatim() -> None:
